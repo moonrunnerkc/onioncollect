@@ -67,13 +67,11 @@ class CrawlerTest(unittest.IsolatedAsyncioTestCase):
             f"INFO:onioncrawl.crawler:{AHMIA} status=200 bytes={len(PAGE)} links=1 onions=1 changed=yes elapsed=1.5s"
         ])
 
-    async def test_listed_host_is_never_saved(self):
-        task = await self.claim(f"http://{DUCKDUCKGO}/")
-        with self.assertLogs("onioncrawl.crawler") as logs:
-            await self.crawler.handle_success(task, ok(task.url))
-        self.assertEqual(self.stored_files(), [])
+    async def test_listed_host_is_excluded_and_never_queued(self):
+        self.assertIn(DUCKDUCKGO, self.crawler.exclusions)
         self.assertEqual(await self.rows("SELECT state FROM hosts WHERE host = ?", DUCKDUCKGO), [("excluded",)])
-        self.assertEqual(logs.output, [f"WARNING:onioncrawl.crawler:{DUCKDUCKGO} excluded: listed"])
+        await self.crawler.frontier.seed([f"http://{DUCKDUCKGO}/"])
+        self.assertEqual(await self.rows("SELECT COUNT(*) FROM urls WHERE host = ?", DUCKDUCKGO), [(0,)])
 
     async def test_body_trigger_excludes_host_and_keeps_links(self):
         await self.crawler.frontier.seed([f"http://{AHMIA}/other"])
@@ -132,7 +130,7 @@ class CrawlerTest(unittest.IsolatedAsyncioTestCase):
         result = FetchResult(url=task.url, final_url=task.url, error="timeout", elapsed=45.0)
         with self.assertLogs("onioncrawl.crawler") as logs:
             await self.crawler.handle_failure(task, result, mock.Mock(tor=FakeTor()))
-        self.assertEqual(await self.rows("SELECT state FROM hosts"), [("dead",)])
+        self.assertEqual(await self.rows("SELECT state FROM hosts WHERE host = ?", AHMIA), [("dead",)])
         self.assertEqual(await self.rows("SELECT status FROM urls"), [("parked",)])
         self.assertIn(f"INFO:onioncrawl.crawler:{AHMIA} marked dead", logs.output)
 
@@ -140,7 +138,7 @@ class CrawlerTest(unittest.IsolatedAsyncioTestCase):
         task = await self.claim(f"http://{AHMIA}/file.pdf")
         result = FetchResult(url=task.url, final_url=task.url, status=200, error="not_text", elapsed=2.0)
         await self.crawler.handle_failure(task, result, mock.Mock(tor=FakeTor()))
-        self.assertEqual(await self.rows("SELECT state, consecutive_failures FROM hosts"), [("up", 0)])
+        self.assertEqual(await self.rows("SELECT state, consecutive_failures FROM hosts WHERE host = ?", AHMIA), [("up", 0)])
         self.assertEqual(await self.rows("SELECT status FROM urls"), [("parked",)])
 
     async def test_logs_never_carry_paths_queries_or_titles(self):

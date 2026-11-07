@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from onioncrawl.db import Frontier, PageInfo, signed64, stamp, unstamp
-from tests.fixtures import throwaway_settings
+from tests.fixtures import LISTED, throwaway_settings
 from tests.test_onion import build_address
 
 HOSTS = [build_address(bytes([n] * 32), 3) for n in range(1, 6)]
@@ -141,9 +141,9 @@ class CompleteTest(FrontierTestCase):
         for _ in range(3):
             await self.frontier.complete(task, page(), self.clock.now, "p")
             task.last_hash = "a" * 64
-        self.assertEqual(await self.rows("SELECT unchanged_streak FROM hosts"), [(2,)])
+        self.assertEqual(await self.rows("SELECT unchanged_streak FROM hosts WHERE host = ?", A), [(2,)])
         await self.frontier.complete(task, page(sha="b" * 64), self.clock.now, "p")
-        self.assertEqual(await self.rows("SELECT unchanged_streak FROM hosts"), [(0,)])
+        self.assertEqual(await self.rows("SELECT unchanged_streak FROM hosts WHERE host = ?", A), [(0,)])
 
     async def test_claim_carries_streak(self):
         task = await self.claimed(f"http://{A}/")
@@ -156,7 +156,7 @@ class CompleteTest(FrontierTestCase):
     async def test_title_only_from_root(self):
         task = await self.claimed(f"http://{A}/about")
         await self.frontier.complete(task, page(title="inner"), self.clock.now, "p")
-        self.assertEqual(await self.rows("SELECT title FROM hosts"), [(None,)])
+        self.assertEqual(await self.rows("SELECT title FROM hosts WHERE host = ?", A), [(None,)])
 
     async def test_max_depth_and_high_simhash(self):
         await self.frontier.seed([f"http://{A}/"])
@@ -182,7 +182,7 @@ class FailTest(FrontierTestCase):
         (task,) = await self.frontier.claim(1)
         await self.frontier.fail(task, 1, self.clock.now + timedelta(minutes=2), host_answered=False)
         self.assertEqual(await self.rows("SELECT status, retries FROM urls"), [("queued", 1)])
-        self.assertEqual(await self.rows("SELECT consecutive_failures, last_down FROM hosts"), [(1, stamp(self.clock.now))])
+        self.assertEqual(await self.rows("SELECT consecutive_failures, last_down FROM hosts WHERE host = ?", A), [(1, stamp(self.clock.now))])
         await self.frontier.fail(task, 3, None, host_answered=False)
         self.assertEqual(await self.rows("SELECT status, retries FROM urls"), [("parked", 3)])
         self.assertEqual(await self.rows("SELECT up FROM uptime"), [(0,), (0,)])
@@ -192,7 +192,7 @@ class FailTest(FrontierTestCase):
         (task,) = await self.frontier.claim(1)
         await self.frontier.fail(task, 0, None, host_answered=True)
         self.assertEqual(await self.host_state(A), "up")
-        self.assertEqual(await self.rows("SELECT consecutive_failures FROM hosts"), [(0,)])
+        self.assertEqual(await self.rows("SELECT consecutive_failures FROM hosts WHERE host = ?", A), [(0,)])
         self.assertEqual(await self.rows("SELECT up FROM uptime"), [(1,)])
 
     async def test_recent_failures_since_last_up(self):
@@ -227,7 +227,7 @@ class ExcludeTest(FrontierTestCase):
         self.assertEqual(await self.status_of(task.url), "parked")
         self.assertEqual(await self.rows("SELECT COUNT(*) FROM pages"), [(0,)])
         self.assertEqual(await self.rows("SELECT COUNT(*) FROM urls WHERE host IN (?, ?)", B, C), [(2,)])
-        self.assertEqual(await self.frontier.excluded_hosts(), {A})
+        self.assertEqual(await self.frontier.excluded_hosts(), {A, LISTED})
 
     async def test_excluded_host_never_returns_to_up(self):
         await self.frontier.seed([f"http://{A}/", f"http://{A}/2"])
@@ -238,6 +238,44 @@ class ExcludeTest(FrontierTestCase):
         self.assertEqual(await self.host_state(A), "excluded")
         await self.frontier.seed([f"http://{A}/new"])
         self.assertEqual(await self.rows("SELECT COUNT(*) FROM urls WHERE url = ?", f"http://{A}/new"), [(0,)])
+
+
+class ListedHostTest(FrontierTestCase):
+    async def reopen(self, **overrides) -> None:
+        await self.frontier.close()
+        self.frontier = Frontier(throwaway_settings(**overrides), clock=self.clock)
+        await self.frontier.open(self.path)
+
+    async def test_open_excludes_listed_hosts_and_parks_every_row(self):
+        await self.frontier.seed([f"http://{A}/", f"http://{A}/2", f"http://{A}/3"])
+        done, leased = await self.frontier.claim(2)
+        await self.frontier.complete(done, page(title="kept until listed"), self.clock.now, "p")
+        await self.reopen(exclusions=frozenset({LISTED, A}))
+        self.assertEqual(await self.rows("SELECT state, title FROM hosts WHERE host = ?", A), [("excluded", None)])
+        self.assertEqual(await self.rows("SELECT DISTINCT status FROM urls WHERE host = ?", A), [("parked",)])
+        self.assertEqual(await self.frontier.claim(5), [])
+
+    async def test_listed_host_is_never_seeded_or_discovered(self):
+        self.assertEqual(await self.host_state(LISTED), "excluded")
+        await self.frontier.seed([f"http://{LISTED}/", f"http://{A}/"])
+        (task,) = await self.frontier.claim(5)
+        await self.frontier.complete(task, page(links=[f"http://{LISTED}/x"], text_onions=[LISTED]), self.clock.now, "p")
+        self.assertEqual(await self.rows("SELECT COUNT(*) FROM urls WHERE host = ?", LISTED), [(0,)])
+
+    async def test_row_in_flight_when_its_host_was_excluded_is_parked_on_failure(self):
+        await self.frontier.seed([f"http://{A}/", f"http://{A}/2"])
+        first, second = await self.frontier.claim(2)
+        await self.frontier.exclude(first, page())
+        await self.frontier.fail(second, 1, self.clock.now + timedelta(minutes=2), host_answered=False)
+        self.assertEqual(await self.status_of(second.url), "parked")
+
+    async def test_reopen_parks_a_crashed_runs_row_of_an_excluded_host(self):
+        await self.frontier.seed([f"http://{A}/", f"http://{A}/2"])
+        first, second = await self.frontier.claim(2)
+        await self.frontier.exclude(first, page())
+        self.clock.advance(minutes=11)
+        await self.reopen()
+        self.assertEqual(await self.status_of(second.url), "parked")
 
 
 class LeaseRecoveryTest(FrontierTestCase):
@@ -274,7 +312,7 @@ class StatsTest(FrontierTestCase):
         await self.frontier.complete(task, page(), self.clock.now, "p")
         stats = await self.frontier.stats()
         self.assertEqual(stats["urls"], {"done": 1, "leased": 1})
-        self.assertEqual(stats["hosts"], {"up": 1, "unknown": 1})
+        self.assertEqual(stats["hosts"], {"up": 1, "unknown": 1, "excluded": 1})
         self.assertEqual((stats["pages"], stats["fetches_last_hour"], stats["up_last_hour"]), (1, 1, 1))
 
     def test_stamp_round_trip(self):

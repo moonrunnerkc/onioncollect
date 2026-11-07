@@ -102,6 +102,7 @@ class Frontier:
         await self.db.execute("PRAGMA busy_timeout=5000")
         await self.db.executescript(schema.TABLES + schema.INDEXES)
         await self.db.commit()
+        await self._exclude_listed()
         await self.release_stale_leases()
 
     async def close(self) -> None:
@@ -116,6 +117,20 @@ class Frontier:
                 await self.db.rollback()
                 raise
             await self.db.commit()
+
+    async def _exclude_listed(self) -> None:
+        now = stamp(self.clock())
+        async with self._write() as db:
+            await db.executemany(
+                "INSERT INTO hosts (host, first_seen, state) VALUES (?, ?, 'excluded') ON CONFLICT(host)"
+                " DO UPDATE SET state = 'excluded', title = NULL, simhash = NULL",
+                [(host, now) for host in self.settings.exclusions],
+            )
+            # Also catches a row a crashed run had in flight when its host was excluded.
+            await db.execute(
+                "UPDATE urls SET status = 'parked', lease_until = NULL WHERE status != 'parked'"
+                " AND host IN (SELECT host FROM hosts WHERE state = 'excluded')"
+            )
 
     async def seed(self, urls: list[str]) -> tuple[int, int]:
         valid = [url for url in map(onion.normalize, urls) if url]
@@ -182,12 +197,14 @@ class Frontier:
 
     async def fail(self, task: Task, retries: int, next_due: datetime | None, host_answered: bool) -> None:
         now = stamp(self.clock())
+        due = None if next_due is None else stamp(next_due)
         async with self._write() as db:
             await db.execute(
-                "UPDATE urls SET status = ?, retries = ?, next_due = COALESCE(?, next_due), lease_until = NULL,"
+                # A row in flight when another worker excluded its host must not come back to the queue.
+                "UPDATE urls SET status = CASE WHEN ? IS NULL OR host IN (SELECT host FROM hosts WHERE state = 'excluded')"
+                " THEN 'parked' ELSE 'queued' END, retries = ?, next_due = COALESCE(?, next_due), lease_until = NULL,"
                 " last_fetched = ? WHERE url = ?",
-                ("parked" if next_due is None else "queued", retries,
-                 None if next_due is None else stamp(next_due), now, task.url),
+                (due, retries, due, now, task.url),
             )
             if host_answered:
                 await db.execute(
