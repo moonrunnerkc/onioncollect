@@ -31,9 +31,9 @@ One job per file. Nothing imports from a file below it in this list except crawl
 
 ```
 onioncrawl/
-  config.py      frozen Settings dataclass, loaded once
   onion.py       v3 validation, URL normalization (pure)
   safety.py      host exclusions, body content checks (pure)
+  config.py      frozen Settings dataclass, loaded once
   tor_pool.py    the Tor instances, circuit rotation
   db.py          schema, Frontier class, Task and PageInfo dataclasses
   fetcher.py     one request through Tor, all in-code anonymity controls

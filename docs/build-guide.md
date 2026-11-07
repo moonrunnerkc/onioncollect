@@ -122,13 +122,13 @@ When you later need to update packages, insert a temporary rule at the top (`sud
 
 ## 4. Project layout
 
-Eleven files, one job each. Nothing imports from a file below it in this list except `crawler.py` and `cli.py`, which tie everything together.
+Eleven files, one job each. Nothing imports from a file below it in this list except `crawler.py` and `cli.py`, which tie everything together. `onion.py` and `safety.py` come first because they are pure and import nothing else from the package, and `config.py` uses `safety.py` to parse the two safety files.
 
 ```text
 onioncrawl/
-  config.py       settings, loaded once, never mutated
   onion.py        v3 address validation, URL normalization
   safety.py       host exclusions, body content checks (pure)
+  config.py       settings, loaded once, never mutated
   tor_pool.py     talks to the six Tor instances, rotates circuits
   db.py           SQLite schema and the Frontier class
   fetcher.py      one HTTP request through Tor, safely
@@ -164,6 +164,8 @@ One frozen dataclass called `Settings`, built once in `cli.py` and passed down. 
 | --- | --- | --- |
 | `tor_instances` | 6 | List of `(socks_port, control_port)` pairs: `(10051, 11051)` through `(10056, 11056)`. One worker per instance. |
 | `control_password` | required | The plaintext you hashed in section 3.2. Read from a file with mode 600, never from argv. |
+| `exclusions` | required | Hosts whose content is never fetched or saved. Parsed from the operator's exclusion list. |
+| `safety_patterns` | required | Compiled body checks, one per pattern line, in category order. Parsed from the operator's pattern list. |
 | `workers_per_instance` | 3 | 6 instances x 3 = 18 requests in flight. Tor handles this fine; onion sites are the slow part. |
 | `per_host_concurrency` | 2 | More than this looks like an attack and gets you banned or rate-limited. |
 | `request_timeout` | 45 s | Total budget: connect + read. Onion sites that take longer are effectively down. |
@@ -178,7 +180,17 @@ One frozen dataclass called `Settings`, built once in `cli.py` and passed down. 
 | `data_dir` | `./data` | Holds `crawl.db` and `pages/`. On the encrypted disk. |
 | `user_agent` | Tor Browser's current UA | Check the Tor Browser release notes and update it when they bump the Firefox ESR version. |
 
-The only logic in this file is `Settings.load(path)`, which reads a small TOML file, reads the control password from the file it names, and raises if any Tor port in the list is not listening on 127.0.0.1. Fail at startup, not three hours in.
+The only logic in this file is `Settings.load(path)`, which reads a small TOML file, reads the three files it names, and raises if any Tor port in the list is not listening on 127.0.0.1. Fail at startup, not three hours in.
+
+The TOML names its files with three required keys:
+
+```toml
+control_password_file = "/home/crawler/control-password"
+exclusions_file = "/home/crawler/exclusions.txt"
+safety_patterns_file = "/home/crawler/safety-patterns.txt"
+```
+
+The two safety files are operator-supplied config. The repository never contains them, not in a commit, a README, or a test fixture; `.gitignore` keeps both out, and tests use their own throwaway patterns. `exclusions.txt` holds one v3 onion host per line, `#` starting a comment. `safety-patterns.txt` holds one `<category> <regex>` per line, with category `child_exploitation`, `credential_dump`, or `card_number`, matched case-insensitively against the decoded body; a `card_number` hit counts only if its digits pass the Luhn check. `safety.parse_exclusions(text)` and `safety.parse_patterns(text)` turn the text into the frozenset and the tuple of compiled patterns that `Settings` carries; safety.py itself never touches the disk. `Settings.load` raises if either file is missing, has a bad line, or parses to empty, so a fresh checkout can never run unfiltered.
 
 ## 6. onion.py
 

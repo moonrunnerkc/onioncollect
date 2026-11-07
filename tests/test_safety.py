@@ -1,8 +1,8 @@
-import tempfile
 import unittest
-from pathlib import Path
 
-from onioncrawl.safety import body_triggers_exclusion, is_excluded, load_exclusions, load_patterns, luhn_valid
+from onioncrawl.safety import (
+    body_triggers_exclusion, category_of, is_excluded, luhn_valid, parse_exclusions, parse_patterns,
+)
 from tests.test_onion import AHMIA, DUCKDUCKGO
 
 # Throwaway patterns. The operator's list is never committed or copied into a fixture.
@@ -15,52 +15,49 @@ card_number \b\d{4}(?:-\d{4}){3}\b
 COMBO = "zza:pw1\nzzb:pw2\nzzc:pw3\n"
 
 
-class TempFiles(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def write(self, text: str) -> Path:
-        path = Path(self.tmp.name) / "file.txt"
-        path.write_text(text)
-        return path
-
-
-class ExclusionsTest(TempFiles):
-    def test_load_skips_comments_and_lowercases(self):
-        hosts = load_exclusions(self.write(f"# header\n\n{AHMIA.upper()}  # trailing\n  {DUCKDUCKGO}\n"))
-        self.assertEqual(hosts, {AHMIA, DUCKDUCKGO})
+class ExclusionsTest(unittest.TestCase):
+    def test_parse_skips_comments_and_lowercases(self):
+        hosts = parse_exclusions(f"# header\n\n{AHMIA.upper()}  # trailing\n  {DUCKDUCKGO}\n")
+        self.assertEqual(hosts, frozenset({AHMIA, DUCKDUCKGO}))
 
     def test_invalid_entry_is_an_error_not_a_silent_miss(self):
-        with self.assertRaisesRegex(ValueError, ":2:"):
-            load_exclusions(self.write(f"{AHMIA}\nexample.com\n"))
+        with self.assertRaisesRegex(ValueError, "line 2"):
+            parse_exclusions(f"{AHMIA}\nexample.com\n")
+
+    def test_comments_only_parse_to_empty(self):
+        self.assertEqual(parse_exclusions("# nothing listed\n"), frozenset())
 
     def test_is_excluded(self):
-        self.assertTrue(is_excluded(AHMIA.upper(), {AHMIA}))
-        self.assertFalse(is_excluded(DUCKDUCKGO, {AHMIA}))
+        self.assertTrue(is_excluded(AHMIA.upper(), frozenset({AHMIA})))
+        self.assertFalse(is_excluded(DUCKDUCKGO, frozenset({AHMIA})))
 
 
-class PatternFileTest(TempFiles):
+class PatternParseTest(unittest.TestCase):
     def test_categories_sorted_into_check_order(self):
-        reordered = "card_number \\d{16}\ncredential_dump x\nchild_exploitation y\n"
-        self.assertEqual([c for c, _ in load_patterns(self.write(reordered))],
-                         ["child_exploitation", "credential_dump", "card_number"])
+        patterns = parse_patterns("card_number \\d{16}\ncredential_dump x\nchild_exploitation y\n")
+        self.assertIsInstance(patterns, tuple)
+        self.assertEqual([category_of(p) for p in patterns], ["child_exploitation", "credential_dump", "card_number"])
+
+    def test_category_survives_named_groups_in_the_expression(self):
+        patterns = parse_patterns("child_exploitation (?P<word>y)\ncredential_dump (?P<user>x)\ncard_number \\d{16}\n")
+        self.assertEqual([category_of(p) for p in patterns], ["child_exploitation", "credential_dump", "card_number"])
+        self.assertEqual(body_triggers_exclusion("x", patterns), "credential_dump")
 
     def test_unknown_category(self):
-        with self.assertRaisesRegex(ValueError, ":1:"):
-            load_patterns(self.write("weapons \\bx\\b\n"))
+        with self.assertRaisesRegex(ValueError, "line 1"):
+            parse_patterns("weapons \\bx\\b\n")
+
+    def test_bad_regex_names_its_line(self):
+        with self.assertRaisesRegex(ValueError, "line 2"):
+            parse_patterns("child_exploitation y\ncredential_dump (x\ncard_number z\n")
 
     def test_every_category_required(self):
         with self.assertRaisesRegex(ValueError, "card_number"):
-            load_patterns(self.write("child_exploitation x\ncredential_dump y\n"))
+            parse_patterns("child_exploitation x\ncredential_dump y\n")
 
 
-class BodyTest(TempFiles):
-    def setUp(self):
-        super().setUp()
-        self.patterns = load_patterns(self.write(PATTERNS))
+class BodyTest(unittest.TestCase):
+    patterns = parse_patterns(PATTERNS)
 
     def verdict(self, text: str) -> str | None:
         return body_triggers_exclusion(text, self.patterns)

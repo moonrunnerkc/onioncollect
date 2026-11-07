@@ -4,6 +4,9 @@ import unittest
 from pathlib import Path
 
 from onioncrawl.config import Settings
+from tests.test_onion import AHMIA
+
+PATTERNS = "child_exploitation \\bforbiddenterm\\b\ncredential_dump zzcredzz\ncard_number \\d{16}\n"
 
 
 def always_listening(port: int) -> bool:
@@ -17,13 +20,21 @@ class SettingsLoadTest(unittest.TestCase):
         self.password = self.dir / "control-password"
         self.password.write_text("correct horse battery staple\n")
         self.password.chmod(0o600)
+        self.exclusions = self.dir / "exclusions.txt"
+        self.exclusions.write_text(f"# listed\n{AHMIA}\n")
+        self.patterns = self.dir / "safety-patterns.txt"
+        self.patterns.write_text(PATTERNS)
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def write_settings(self, body: str = "") -> Path:
         path = self.dir / "settings.toml"
-        path.write_text(f'control_password_file = "{self.password}"\n{body}')
+        path.write_text(
+            f'control_password_file = "{self.password}"\n'
+            f'exclusions_file = "{self.exclusions}"\n'
+            f'safety_patterns_file = "{self.patterns}"\n{body}'
+        )
         return path
 
     def test_minimal_file_gives_guide_defaults(self):
@@ -41,16 +52,12 @@ class SettingsLoadTest(unittest.TestCase):
             'tor_instances = [[10051, 11051], [10052, 11052]]\n'
             'jitter_seconds = [2, 5]\n'
             'data_dir = "/home/crawler/data"\n'
-            'exclusions_file = "/home/crawler/exclusions.txt"\n'
-            'safety_patterns_file = "/home/crawler/safety-patterns.txt"\n'
             'max_depth = 4\n'
         )
         settings = Settings.load(path, port_check=always_listening)
         self.assertEqual(settings.tor_instances, ((10051, 11051), (10052, 11052)))
         self.assertEqual(settings.jitter_seconds, (2.0, 5.0))
         self.assertEqual(settings.data_dir, Path("/home/crawler/data"))
-        self.assertEqual(settings.exclusions_file, Path("/home/crawler/exclusions.txt"))
-        self.assertEqual(settings.safety_patterns_file, Path("/home/crawler/safety-patterns.txt"))
         self.assertEqual(settings.max_depth, 4)
 
     def test_every_port_is_checked_and_dead_ones_named(self):
@@ -66,11 +73,40 @@ class SettingsLoadTest(unittest.TestCase):
         self.assertIn("11051", str(ctx.exception))
         self.assertNotIn("10051", str(ctx.exception))
 
-    def test_password_file_required(self):
+    def test_every_file_key_required(self):
         path = self.dir / "settings.toml"
-        path.write_text("max_depth = 4\n")
-        with self.assertRaises(ValueError):
+        path.write_text(f'control_password_file = "{self.password}"\nmax_depth = 4\n')
+        with self.assertRaisesRegex(ValueError, "exclusions_file, safety_patterns_file required"):
             Settings.load(path, port_check=always_listening)
+
+    def test_safety_files_are_parsed_into_settings(self):
+        settings = Settings.load(self.write_settings(), port_check=always_listening)
+        self.assertEqual(settings.exclusions, frozenset({AHMIA}))
+        self.assertEqual(len(settings.safety_patterns), 3)
+        self.assertEqual(settings.safety_patterns[0].search("x forbiddenterm y").lastgroup, "child_exploitation")
+
+    def test_missing_safety_file_stops_startup(self):
+        for path in (self.exclusions, self.patterns):
+            with self.subTest(path=path.name):
+                text = path.read_text()
+                path.unlink()
+                with self.assertRaises(FileNotFoundError):
+                    Settings.load(self.write_settings(), port_check=always_listening)
+                path.write_text(text)
+
+    def test_empty_safety_file_stops_startup(self):
+        for path in (self.exclusions, self.patterns):
+            with self.subTest(path=path.name):
+                text = path.read_text()
+                path.write_text("# comments only\n")
+                with self.assertRaisesRegex(ValueError, path.name):
+                    Settings.load(self.write_settings(), port_check=always_listening)
+                path.write_text(text)
+
+    def test_bad_safety_entry_names_file_and_line(self):
+        self.exclusions.write_text(f"{AHMIA}\nexample.com\n")
+        with self.assertRaisesRegex(ValueError, "exclusions.txt: line 2"):
+            Settings.load(self.write_settings(), port_check=always_listening)
 
     def test_plaintext_password_key_rejected(self):
         with self.assertRaises(ValueError):
@@ -91,9 +127,10 @@ class SettingsLoadTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             Settings.load(self.write_settings(), port_check=always_listening)
 
-    def test_password_never_in_repr(self):
+    def test_password_and_safety_lists_never_in_repr(self):
         settings = Settings.load(self.write_settings(), port_check=always_listening)
-        self.assertNotIn("staple", repr(settings))
+        for secret in ("staple", AHMIA, "forbiddenterm"):
+            self.assertNotIn(secret, repr(settings))
 
     def test_frozen(self):
         settings = Settings.load(self.write_settings(), port_check=always_listening)

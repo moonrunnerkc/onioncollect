@@ -6,8 +6,8 @@ import httpx
 from python_socks import ProxyConnectionError, ProxyError, ProxyTimeoutError
 
 from onioncrawl import fetcher as fetcher_module
-from onioncrawl.config import Settings
 from onioncrawl.fetcher import Fetcher
+from tests.fixtures import throwaway_settings
 from tests.test_onion import AHMIA, DUCKDUCKGO, TORPROJECT, build_address
 
 HTML = {"content-type": "text/html; charset=utf-8"}
@@ -44,7 +44,7 @@ class FetcherTestCase(unittest.IsolatedAsyncioTestCase):
         self.transport_kwargs: list[dict] = []
         self.routes = {}
         self.tor = FakeTor()
-        self.fetcher = Fetcher(Settings(control_password="pw", max_body_bytes=1000), self.tor)
+        self.fetcher = Fetcher(throwaway_settings(max_body_bytes=1000), self.tor)
         patcher = mock.patch.object(fetcher_module, "AsyncProxyTransport", side_effect=self.make_transport)
         patcher.start()
         self.addCleanup(patcher.stop)

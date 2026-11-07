@@ -1,14 +1,14 @@
 import unittest
 from datetime import UTC, datetime, timedelta
 
-from onioncrawl.config import Settings
 from onioncrawl.db import PageInfo, Task
 from onioncrawl.scheduler import (
     host_is_dead, next_due_for_failure, next_due_for_url, retest_due, retry_cost, should_rotate,
 )
+from tests.fixtures import throwaway_settings
 
 NOW = datetime(2026, 11, 7, 12, 0, tzinfo=UTC)
-SETTINGS = Settings(control_password="x")
+SETTINGS = throwaway_settings()
 HOUR = timedelta(hours=1)
 
 
@@ -56,7 +56,7 @@ class NextDueForUrlTest(unittest.TestCase):
         self.assertEqual(self.due(gated=True, depth=0), 168 * HOUR)
 
     def test_follows_settings(self):
-        custom = Settings(control_password="x", recrawl_active_hours=6, recrawl_quiet_hours=72)
+        custom = throwaway_settings(recrawl_active_hours=6, recrawl_quiet_hours=72)
         self.assertEqual(next_due_for_url(task(), info(), True, custom, NOW) - NOW, 6 * HOUR)
         self.assertEqual(next_due_for_url(task(streak=5), info(), False, custom, NOW) - NOW, 72 * HOUR)
 
@@ -73,7 +73,7 @@ class NextDueForFailureTest(unittest.TestCase):
 
     def test_flaky_errors_park_at_max_retries(self):
         self.assertIsNone(self.due("timeout", retries=2))
-        longer = Settings(control_password="x", max_retries=4)
+        longer = throwaway_settings(max_retries=4)
         self.assertEqual(next_due_for_failure(task(retries=2), "timeout", longer, NOW) - NOW, timedelta(minutes=8))
 
     def test_permanent_errors_park_immediately(self):

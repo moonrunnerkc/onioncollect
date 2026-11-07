@@ -8,6 +8,7 @@ from onioncrawl.config import Settings
 from onioncrawl.crawler import Crawler
 from onioncrawl.db import stamp
 from onioncrawl.fetcher import FetchResult
+from onioncrawl.safety import parse_patterns
 from tests.test_onion import AHMIA, DUCKDUCKGO, TORPROJECT
 
 PATTERNS = "child_exploitation \\bforbiddenterm\\b\ncredential_dump zzcredzz\ncard_number 4111111111111111\n"
@@ -32,11 +33,9 @@ class CrawlerTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
-        (root / "exclusions.txt").write_text(f"# listed\n{DUCKDUCKGO}\n")
-        (root / "patterns.txt").write_text(PATTERNS)
         self.settings = Settings(
-            control_password="x", data_dir=root / "data", tor_instances=((10051, 11051),),
-            exclusions_file=root / "exclusions.txt", safety_patterns_file=root / "patterns.txt",
+            control_password="x", exclusions=frozenset({DUCKDUCKGO}), safety_patterns=parse_patterns(PATTERNS),
+            data_dir=root / "data", tor_instances=((10051, 11051),),
         )
         (root / "data").mkdir()
         self.crawler = Crawler(self.settings)

@@ -38,7 +38,8 @@ Roll back to the snapshot: `limactl stop node1 && cp -c ~/.lima/node1/disk.snaps
 - **Safety files.** `provision.sh` creates an empty `/home/crawler/exclusions.txt` (mode 600) and
   points `settings.toml` at it and at `/home/crawler/safety-patterns.txt`. The pattern list is not
   committed; `make deploy` installs it from `safety-patterns.txt` in the checkout when one exists.
-  The crawler refuses to start without both files.
+  The crawler refuses to start if either file is missing or lists nothing, so add at least one
+  host to `exclusions.txt` before the first run. Both are operator config the repo never holds.
 - **Right after `make provision`.** The update hole closes while apt's TLS connections to the Debian
   and Tor Project mirrors are still shutting down. For about 15 minutes those mirrors keep
   retransmitting; the guest's replies are dropped, and leak test 3 reports the inbound packets as

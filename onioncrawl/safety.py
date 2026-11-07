@@ -1,5 +1,4 @@
 import re
-from pathlib import Path
 
 from onioncrawl import onion
 
@@ -7,39 +6,49 @@ from onioncrawl import onion
 CATEGORIES = ("child_exploitation", "credential_dump", "card_number")
 
 
-def load_exclusions(path: Path) -> set[str]:
+def parse_exclusions(text: str) -> frozenset[str]:
     hosts = set()
-    for number, line in enumerate(path.read_text().splitlines(), 1):
+    for number, line in enumerate(text.splitlines(), 1):
         host = line.split("#", 1)[0].strip().lower()
         if not host:
             continue
         if not onion.is_v3_onion(host):
-            raise ValueError(f"{path}:{number}: not a v3 onion host")
+            raise ValueError(f"line {number}: not a v3 onion host")
         hosts.add(host)
-    return hosts
+    return frozenset(hosts)
 
 
-def is_excluded(host: str, exclusions: set[str]) -> bool:
+def is_excluded(host: str, exclusions) -> bool:
     return host.lower() in exclusions
 
 
-def load_patterns(path: Path) -> list[tuple[str, re.Pattern]]:
+def parse_patterns(text: str) -> tuple[re.Pattern, ...]:
     patterns = []
-    for number, line in enumerate(path.read_text().splitlines(), 1):
+    for number, line in enumerate(text.splitlines(), 1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         category, _, expression = line.strip().partition(" ")
         if category not in CATEGORIES or not expression.strip():
-            raise ValueError(f"{path}:{number}: expected '<category> <regex>' with category in {CATEGORIES}")
-        patterns.append((category, re.compile(expression.strip(), re.IGNORECASE | re.MULTILINE)))
-    missing = set(CATEGORIES) - {category for category, _ in patterns}
+            raise ValueError(f"line {number}: expected '<category> <regex>' with category in {CATEGORIES}")
+        # The category names the outermost group, which is always group 1, so the compiled pattern
+        # carries its own category and Settings can hold plain patterns.
+        try:
+            patterns.append(re.compile(f"(?P<{category}>{expression.strip()})", re.IGNORECASE | re.MULTILINE))
+        except re.error as exc:
+            raise ValueError(f"line {number}: {exc}") from None
+    missing = set(CATEGORIES) - {category_of(pattern) for pattern in patterns}
     if missing:
-        raise ValueError(f"{path}: no patterns for {sorted(missing)}")
-    return sorted(patterns, key=lambda entry: CATEGORIES.index(entry[0]))
+        raise ValueError(f"no patterns for {sorted(missing)}")
+    return tuple(sorted(patterns, key=lambda pattern: CATEGORIES.index(category_of(pattern))))
 
 
-def body_triggers_exclusion(text: str, patterns: list[tuple[str, re.Pattern]]) -> str | None:
-    for category, pattern in patterns:
+def category_of(pattern: re.Pattern) -> str:
+    return next(name for name, group in pattern.groupindex.items() if group == 1)
+
+
+def body_triggers_exclusion(text: str, patterns: tuple[re.Pattern, ...]) -> str | None:
+    for pattern in patterns:
+        category = category_of(pattern)
         for match in pattern.finditer(text):
             if category != "card_number" or luhn_valid(match.group()):
                 return category

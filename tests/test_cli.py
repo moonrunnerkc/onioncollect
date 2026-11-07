@@ -9,7 +9,7 @@ from unittest import mock
 
 from onioncrawl import cli
 from onioncrawl.config import Settings
-from tests.test_onion import AHMIA, DUCKDUCKGO
+from tests.test_onion import AHMIA, DUCKDUCKGO, TORPROJECT
 
 
 class LoggingTest(unittest.TestCase):
@@ -50,7 +50,12 @@ class MainTest(unittest.TestCase):
         (self.root / "pw").write_text("pw")
         (self.root / "pw").chmod(0o600)
         self.settings_path = self.root / "settings.toml"
-        self.settings_path.write_text(f'control_password_file = "{self.root / "pw"}"\ndata_dir = "{self.root / "data"}"\n')
+        (self.root / "exclusions.txt").write_text(f"{TORPROJECT}\n")
+        (self.root / "patterns.txt").write_text("child_exploitation x\ncredential_dump y\ncard_number z\n")
+        self.settings_path.write_text(
+            f'control_password_file = "{self.root / "pw"}"\ndata_dir = "{self.root / "data"}"\n'
+            f'exclusions_file = "{self.root / "exclusions.txt"}"\nsafety_patterns_file = "{self.root / "patterns.txt"}"\n'
+        )
         umask = os.umask(0o022)
         self.addCleanup(os.umask, umask)
         real_load = Settings.load

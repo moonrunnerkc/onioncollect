@@ -24,8 +24,7 @@ class Crawler:
         self.tor_pool = TorPool(settings)
         self.store = PageStore(settings.data_dir)
         self.stopping = asyncio.Event()
-        self.exclusions = safety.load_exclusions(settings.exclusions_file)
-        self.patterns = safety.load_patterns(settings.safety_patterns_file)
+        self.exclusions = set(settings.exclusions)
 
     async def run(self) -> None:
         await self.frontier.open(self.settings.data_dir / "crawl.db")
@@ -82,7 +81,9 @@ class Crawler:
         if safety.is_excluded(task.host, self.exclusions) or safety.is_excluded(final_host, self.exclusions):
             category = "listed"
         else:
-            category = safety.body_triggers_exclusion(result.body.decode("utf-8", errors="replace"), self.patterns)
+            category = safety.body_triggers_exclusion(
+                result.body.decode("utf-8", errors="replace"), self.settings.safety_patterns
+            )
         if category:
             self.exclusions.add(task.host)
             await self.frontier.exclude(task, info)

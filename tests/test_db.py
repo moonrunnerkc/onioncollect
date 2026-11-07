@@ -3,8 +3,8 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from onioncrawl.config import Settings
 from onioncrawl.db import Frontier, PageInfo, signed64, stamp, unstamp
+from tests.fixtures import throwaway_settings
 from tests.test_onion import build_address
 
 HOSTS = [build_address(bytes([n] * 32), 3) for n in range(1, 6)]
@@ -30,7 +30,7 @@ def page(sha: str = "a" * 64, links=(), text_onions=(), gated=False, title="t", 
 
 
 class FrontierTestCase(unittest.IsolatedAsyncioTestCase):
-    settings = Settings(control_password="x", per_host_concurrency=2, max_depth=2)
+    settings = throwaway_settings(per_host_concurrency=2, max_depth=2)
 
     async def asyncSetUp(self):
         self.dir = tempfile.TemporaryDirectory()

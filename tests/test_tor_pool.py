@@ -5,8 +5,8 @@ from unittest import mock
 from stem import Signal
 
 from onioncrawl import tor_pool
-from onioncrawl.config import Settings
 from onioncrawl.tor_pool import TorInstance, TorPool
+from tests.fixtures import throwaway_settings
 
 
 def fake_controller(ready="1", newnym_available=True, newnym_wait=0.0):
@@ -19,7 +19,7 @@ def fake_controller(ready="1", newnym_available=True, newnym_wait=0.0):
 
 def settings(instances=2):
     pairs = tuple((10050 + n, 11050 + n) for n in range(1, instances + 1))
-    return Settings(control_password="pw", tor_instances=pairs)
+    return throwaway_settings(tor_instances=pairs)
 
 
 class TorInstanceTest(unittest.IsolatedAsyncioTestCase):

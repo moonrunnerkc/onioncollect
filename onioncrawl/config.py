@@ -1,10 +1,14 @@
 import dataclasses
+import re
 import socket
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from onioncrawl import safety
+
+FILE_KEYS = ("control_password_file", "exclusions_file", "safety_patterns_file")
 TOR_BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0"
 
 
@@ -19,6 +23,8 @@ def port_is_listening(port: int) -> bool:
 @dataclass(frozen=True)
 class Settings:
     control_password: str = field(repr=False)
+    exclusions: frozenset[str] = field(repr=False)
+    safety_patterns: tuple[re.Pattern, ...] = field(repr=False)
     tor_instances: tuple[tuple[int, int], ...] = tuple((10050 + n, 11050 + n) for n in range(1, 7))
     workers_per_instance: int = 3
     per_host_concurrency: int = 2
@@ -32,18 +38,17 @@ class Settings:
     recrawl_quiet_hours: int = 168
     retest_dead_hours: int = 168
     data_dir: Path = Path("./data")
-    exclusions_file: Path = Path("./exclusions.txt")
-    safety_patterns_file: Path = Path("./safety-patterns.txt")
     user_agent: str = TOR_BROWSER_UA
 
     @classmethod
     def load(cls, path: Path, port_check: Callable[[int], bool] = port_is_listening) -> "Settings":
         with open(path, "rb") as f:
             raw = tomllib.load(f)
-        password_file = raw.pop("control_password_file", None)
-        if password_file is None:
-            raise ValueError(f"{path}: control_password_file is required")
-        known = {f.name for f in dataclasses.fields(cls)} - {"control_password"}
+        files = {key: raw.pop(key, None) for key in FILE_KEYS}
+        missing = [key for key, value in files.items() if value is None]
+        if missing:
+            raise ValueError(f"{path}: {', '.join(missing)} required")
+        known = {f.name for f in dataclasses.fields(cls)} - {"control_password", "exclusions", "safety_patterns"}
         unknown = set(raw) - known
         if unknown:
             raise ValueError(f"{path}: unknown settings {sorted(unknown)}")
@@ -52,10 +57,14 @@ class Settings:
         if "jitter_seconds" in raw:
             low, high = raw["jitter_seconds"]
             raw["jitter_seconds"] = (float(low), float(high))
-        for key in ("data_dir", "exclusions_file", "safety_patterns_file"):
-            if key in raw:
-                raw[key] = Path(raw[key])
-        settings = cls(control_password=read_password(Path(password_file)), **raw)
+        if "data_dir" in raw:
+            raw["data_dir"] = Path(raw["data_dir"])
+        settings = cls(
+            control_password=read_password(Path(files["control_password_file"])),
+            exclusions=read_safety_file(Path(files["exclusions_file"]), safety.parse_exclusions),
+            safety_patterns=read_safety_file(Path(files["safety_patterns_file"]), safety.parse_patterns),
+            **raw,
+        )
         dead = [port for pair in settings.tor_instances for port in pair if not port_check(port)]
         if dead:
             raise RuntimeError(f"Tor ports not listening on 127.0.0.1: {dead}")
@@ -69,3 +78,13 @@ def read_password(path: Path) -> str:
     if not password:
         raise ValueError(f"{path} is empty")
     return password
+
+
+def read_safety_file(path: Path, parse: Callable[[str], frozenset | tuple]) -> frozenset | tuple:
+    try:
+        parsed = parse(path.read_text())
+    except ValueError as exc:
+        raise ValueError(f"{path}: {exc}") from None
+    if not parsed:
+        raise ValueError(f"{path}: no entries, and the crawler never runs unfiltered")
+    return parsed

@@ -193,7 +193,8 @@ EOF
     fi
     rm -f "$rendered"
     if [ ! -e "$CRAWLER_HOME/exclusions.txt" ]; then
-        echo "# One v3 onion host per line. Content fetched from these hosts is never saved." |
+        printf '%s\n' "# One v3 onion host per line. These hosts are never fetched." \
+            "# The crawler will not start until at least one host is listed." |
             install -m 600 -o crawler -g crawler /dev/stdin "$CRAWLER_HOME/exclusions.txt"
         log "exclusions.txt created"
     fi
