@@ -16,6 +16,7 @@ Nothing runs in the cloud. Traffic and disk stay on this Mac.
 | `make checklist` | Section 15 machine checklist. Guest items run in the guest; FileVault and the snapshot are checked on the Mac. |
 | `make leak-test` | Section 15 leak tests 1 to 4 in the guest, with a five-minute packet capture. |
 | `make crawl-capture` | Build step 8: seeds `/home/crawler/seeds.txt`, runs the crawler with one worker on one Tor instance for `CRAWL_SECONDS` (default 600) under the leak test 3 capture, then audits the crawl log. |
+| `make crawl-full` | Build step 9: the same capture and audit with every Tor instance at `workers_per_instance`, plus each instance's peak SOCKS stream count against its worker count. Run `status` from a second `make shell` meanwhile. |
 | `make snapshot` | Stops the guest, APFS-clones its disk to `disk.snapshot`, starts it again. |
 
 Roll back to the snapshot: `limactl stop node1 && cp -c ~/.lima/node1/disk.snapshot ~/.lima/node1/disk`.
@@ -37,7 +38,7 @@ Roll back to the snapshot: `limactl stop node1 && cp -c ~/.lima/node1/disk.snaps
   plaintext never appears on a command line, in a log, or in this repo.
 - **Safety files.** `provision.sh` creates an empty `/home/crawler/exclusions.txt` (mode 600) and
   points `settings.toml` at it and at `/home/crawler/safety-patterns.txt`. The pattern list is not
-  committed; `make deploy` installs it from `safety-patterns.txt` in the checkout when one exists.
+  committed; `make deploy` installs each of `safety-patterns.txt` and `exclusions.txt` from the checkout when it exists there (both are gitignored).
   The crawler refuses to start if either file is missing or lists nothing, so add at least one
   host to `exclusions.txt` before the first run. Both are operator config the repo never holds.
 - **Right after `make provision`.** The update hole closes while apt's TLS connections to the Debian

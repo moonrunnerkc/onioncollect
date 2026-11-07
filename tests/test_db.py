@@ -278,6 +278,27 @@ class ListedHostTest(FrontierTestCase):
         self.assertEqual(await self.status_of(second.url), "parked")
 
 
+class UnexcludeTest(FrontierTestCase):
+    async def test_unexclude_requeues_parked_urls_at_discovery_priority(self):
+        await self.frontier.seed([f"http://{A}/", f"http://{A}/2"])
+        task, _ = await self.frontier.claim(2)
+        await self.frontier.complete(task, page(), self.clock.now + timedelta(days=1), "p")
+        await self.frontier.exclude(task, page())
+        self.clock.advance(minutes=1)
+        self.assertEqual(await self.frontier.unexclude(A), 1)
+        self.assertEqual(await self.host_state(A), "unknown")
+        self.assertEqual(await self.rows("SELECT status, priority, retries, next_due FROM urls WHERE url = ?", task.url),
+                         [("queued", 0, 0, stamp(self.clock.now))])
+        (again,) = await self.frontier.claim(5)
+        self.assertEqual(again.url, task.url)
+
+    async def test_unexclude_of_a_host_that_is_not_excluded_changes_nothing(self):
+        await self.frontier.seed([f"http://{A}/"])
+        self.assertIsNone(await self.frontier.unexclude(A))
+        self.assertIsNone(await self.frontier.unexclude(B))
+        self.assertEqual(await self.host_state(A), "unknown")
+
+
 class LeaseRecoveryTest(FrontierTestCase):
     async def test_crash_recovery(self):
         await self.frontier.seed([f"http://{A}/", f"http://{B}/"])
@@ -314,6 +335,16 @@ class StatsTest(FrontierTestCase):
         self.assertEqual(stats["urls"], {"done": 1, "leased": 1})
         self.assertEqual(stats["hosts"], {"up": 1, "unknown": 1, "excluded": 1})
         self.assertEqual((stats["pages"], stats["fetches_last_hour"], stats["up_last_hour"]), (1, 1, 1))
+        self.assertEqual((stats["leased_hosts"], stats["max_leased_per_host"]), (1, 1))
+        self.clock.advance(minutes=6)
+        self.assertEqual(((await self.frontier.stats())["fetches_recent"], stats["fetches_recent"]), (0, 1))
+
+    async def test_leases_per_host(self):
+        await self.frontier.seed([f"http://{A}/", f"http://{A}/2", f"http://{A}/3", f"http://{B}/"])
+        await self.frontier.claim(4)
+        stats = await self.frontier.stats()
+        self.assertEqual((stats["leased_hosts"], stats["max_leased_per_host"]), (2, 2))
+        await self.frontier.release_stale_leases()
 
     def test_stamp_round_trip(self):
         moment = datetime(2026, 11, 7, 12, 0, 0, 123000, tzinfo=UTC)

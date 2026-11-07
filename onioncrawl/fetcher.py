@@ -1,4 +1,5 @@
 import time
+import zlib
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from urllib.parse import urljoin
@@ -16,6 +17,8 @@ TEXT_TYPES = ("text/html", "application/xhtml", "text/plain")
 MAX_HOPS = 3
 CLIENT_CACHE_SIZE = 32
 CONNECT_TIMEOUT = 20.0
+COMPRESSED = {"gzip", "x-gzip", "deflate"}
+GZIP_OR_ZLIB = 32 + zlib.MAX_WBITS
 
 
 @dataclass
@@ -116,14 +119,26 @@ class Fetcher:
         result.error = "other:TooManyRedirects"
 
     async def _read_capped(self, response: httpx.Response) -> tuple[bytes, bool]:
-        chunks, size = [], 0
-        async for chunk in response.aiter_bytes():
-            if size + len(chunk) > self.max_body_bytes:
-                chunks.append(chunk[: self.max_body_bytes - size])
-                return b"".join(chunks), True
-            chunks.append(chunk)
-            size += len(chunk)
-        return b"".join(chunks), False
+        # Inflate by hand: httpx inflates each raw read whole, and 64 KiB of gzip'd zeros is 67 MB before
+        # any cap could see it. max_length stops zlib at one byte past the cap, the byte that proves
+        # truncation; input it has not inflated yet waits in unconsumed_tail.
+        encoding = response.headers.get("content-encoding", "").strip().lower()
+        inflater = zlib.decompressobj(GZIP_OR_ZLIB) if encoding in COMPRESSED else None
+        body = bytearray()
+        async for raw in response.aiter_raw():
+            while raw:
+                room = self.max_body_bytes + 1 - len(body)
+                if inflater is None:
+                    body += raw[:room]
+                    raw = b""
+                else:
+                    body += inflater.decompress(raw, room)
+                    raw = inflater.unconsumed_tail
+                if len(body) > self.max_body_bytes:
+                    return bytes(body[: self.max_body_bytes]), True
+        if inflater is not None:
+            body += inflater.flush()
+        return bytes(body[: self.max_body_bytes]), len(body) > self.max_body_bytes
 
     async def close(self) -> None:
         for client in self._clients.values():

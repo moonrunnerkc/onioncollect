@@ -1,5 +1,8 @@
+import gzip
 import os
+import tracemalloc
 import unittest
+import zlib
 from unittest import mock
 
 import httpx
@@ -72,7 +75,8 @@ class FetcherTestCase(unittest.IsolatedAsyncioTestCase):
         return route()
 
     def route(self, url, status=200, headers=HTML, body=b"<html></html>", stream=None):
-        self.routes[url] = lambda: httpx.Response(status, headers=headers, content=None if stream else body, stream=stream)
+        # Always a stream, as from the network: Response(content=...) reads itself eagerly and refuses aiter_raw.
+        self.routes[url] = lambda: httpx.Response(status, headers=headers, stream=stream or TrackingStream([body]))
 
 
 class RedirectTrapTest(FetcherTestCase):
@@ -193,6 +197,53 @@ class GateTest(FetcherTestCase):
         result = await self.fetcher.fetch(url)
         self.assertEqual(len(result.body), 1000)
         self.assertFalse(result.truncated)
+
+
+class CompressedBodyTest(FetcherTestCase):
+    """The 2 MB cap counts decompressed bytes, and a gzip bomb is never inflated past it."""
+
+    GZIP = HTML | {"content-encoding": "gzip"}
+
+    async def test_gzip_body_that_expands_past_the_cap_stops_at_the_cap(self):
+        url = f"http://{AHMIA}/bomb"
+        bomb = gzip.compress(b"<p>" + b"a" * 5_000_000)
+        raw = [bomb[i:i + 1024] for i in range(0, len(bomb), 1024)]
+        stream = TrackingStream(raw)
+        self.route(url, headers=self.GZIP, stream=stream)
+        result = await self.fetcher.fetch(url)
+        self.assertIsNone(result.error)
+        self.assertEqual(result.body, b"<p>" + b"a" * 997)
+        self.assertTrue(result.truncated)
+        self.assertEqual(stream.consumed, 1)
+        self.assertGreater(len(raw), 1)
+
+    async def test_one_raw_read_of_a_bomb_is_never_inflated_past_the_cap(self):
+        url = f"http://{AHMIA}/bomb"
+        bomb = gzip.compress(b"\0" * 50_000_000)
+        self.route(url, headers=self.GZIP, body=bomb)
+        tracemalloc.start()
+        try:
+            result = await self.fetcher.fetch(url)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual((len(result.body), result.truncated), (1000, True))
+        self.assertLess(peak, 5_000_000)
+
+    async def test_small_gzip_and_deflate_bodies_are_decoded_whole(self):
+        page = b"<html><p>hello</p></html>"
+        for encoding, compressed in (("gzip", gzip.compress(page)), ("deflate", zlib.compress(page))):
+            with self.subTest(encoding=encoding):
+                url = f"http://{AHMIA}/{encoding}"
+                self.route(url, headers=HTML | {"content-encoding": encoding}, body=compressed)
+                result = await self.fetcher.fetch(url)
+                self.assertEqual((result.body, result.truncated), (page, False))
+
+    async def test_body_exactly_at_the_cap_is_not_truncated(self):
+        url = f"http://{AHMIA}/exact"
+        self.route(url, headers=self.GZIP, body=gzip.compress(b"x" * 1000))
+        result = await self.fetcher.fetch(url)
+        self.assertEqual((len(result.body), result.truncated), (1000, False))
 
 
 class AnonymityControlsTest(FetcherTestCase):

@@ -3,7 +3,8 @@ import logging
 import time
 from collections import deque
 
-from stem import Signal
+import stem.connection
+from stem import Signal, SocketError
 from stem.control import Controller
 
 from onioncrawl.config import Settings
@@ -17,6 +18,7 @@ READY_POLL = 2.0
 HEALTH_INTERVAL = 60.0
 UNHEALTHY_BELOW = 0.3
 ROTATE_COOLDOWN = 30.0
+CONTROL_ERRORS = (SocketError, stem.connection.AuthenticationFailure)
 
 
 class TorInstance:
@@ -34,6 +36,11 @@ class TorInstance:
 
     def is_ready(self) -> bool:
         return self.controller.get_info("status/circuit-established", "0") == "1"
+
+    def open_counts(self) -> tuple[int, int]:
+        # Counted only: each status line names the target, and nothing here may print or log it.
+        circuits = [line for line in self.controller.get_info("circuit-status", "").splitlines() if " BUILT " in line]
+        return len(circuits), len(self.controller.get_info("stream-status", "").splitlines())
 
     def socks_url(self) -> str:
         return f"socks5://127.0.0.1:{self.socks_port}"

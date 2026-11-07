@@ -12,6 +12,7 @@ from onioncrawl import onion, schema
 from onioncrawl.config import Settings
 
 LEASE = timedelta(minutes=10)
+RATE_WINDOW = timedelta(minutes=5)
 FRESH, RECRAWL = 0, 1
 
 # One statement, so no other claim can interleave. `due` keeps only rows whose host still has a free
@@ -243,8 +244,24 @@ class Frontier:
         rows = await self.db.execute_fetchall("SELECT host FROM hosts WHERE state = 'excluded'")
         return {row[0] for row in rows}
 
+    async def unexclude(self, host: str) -> int | None:
+        now = stamp(self.clock())
+        async with self._write() as db:
+            cursor = await db.execute("UPDATE hosts SET state = 'unknown' WHERE host = ? AND state = 'excluded'", (host,))
+            if not cursor.rowcount:
+                return None
+            cursor = await db.execute(
+                "UPDATE urls SET status = 'queued', priority = ?, retries = 0, next_due = ? WHERE host = ? AND status = 'parked'",
+                (FRESH, now, host),
+            )
+            return cursor.rowcount
+
     async def stats(self) -> dict:
         since = stamp(self.clock() - timedelta(hours=1))
+        (recent,), = await self.db.execute_fetchall(
+            "SELECT COUNT(*) FROM uptime WHERE checked_at >= ?", (stamp(self.clock() - RATE_WINDOW),)
+        )
+        leases = await self.db.execute_fetchall("SELECT COUNT(*) FROM urls WHERE status = 'leased' GROUP BY host")
         urls = await self.db.execute_fetchall("SELECT status, COUNT(*) FROM urls GROUP BY status")
         hosts = await self.db.execute_fetchall("SELECT state, COUNT(*) FROM hosts GROUP BY state")
         (pages,), = await self.db.execute_fetchall("SELECT COUNT(*) FROM pages")
@@ -253,7 +270,8 @@ class Frontier:
         )
         return {
             "urls": dict(urls), "hosts": dict(hosts), "pages": pages,
-            "fetches_last_hour": fetches, "up_last_hour": ups,
+            "fetches_last_hour": fetches, "up_last_hour": ups, "fetches_recent": recent,
+            "leased_hosts": len(leases), "max_leased_per_host": max((count for count, in leases), default=0),
         }
 
     async def _queue(self, urls, depth: int) -> None:

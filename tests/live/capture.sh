@@ -27,7 +27,7 @@ capture_start() {
     echo "capture: tcpdump -i $DEV 'not port 22' for $1, guest address $LOCAL_IP"
     tcpdump -i "$DEV" -nn -Z root -w "$WORK/cap.pcap" 'not port 22' 2>"$WORK/tcpdump.err" &
     TCPDUMP=$!
-    ( while :; do ss -tnpH state established; sleep 1; done ) > "$WORK/ss.txt" &
+    ( while :; do echo "sample $(date +%s)"; ss -tnpH state established; sleep 1; done ) > "$WORK/ss.txt" &
     SAMPLER=$!
     iptables -I "${LOG_RULE[@]:0:1}" 1 "${LOG_RULE[@]:1}"
     sleep 2
@@ -47,6 +47,15 @@ capture_stop() {
     echo "      kill switch DROP counter: $DROPS_BEFORE -> $DROPS_AFTER (blocked attempts never reach the wire)"
     echo "      ss -tnp | grep -v 127.0.0.1, at the end of the window:"
     ss -tnpH | grep -v 127.0.0.1 | awk '{print "        " $1, $4, $5, $6}' | head -12
+}
+
+# The crawler's own end of each SOCKS connection, counted per Tor port in every one-second sample. Each
+# connection is one Tor stream, so the peak per port is the most streams that instance carried for us.
+socks_peaks() {
+    awk '/^sample / { for (port in now) { if (now[port] > peak[port]) peak[port] = now[port] }; delete now; next }
+         $4 ~ /^127\.0\.0\.1:100[0-9][0-9]$/ && $5 ~ /python/ { split($4, a, ":"); now[a[2]]++ }
+         END { for (port in now) { if (now[port] > peak[port]) peak[port] = now[port] }
+               for (port in peak) print port, peak[port] }' "$WORK/ss.txt" | sort
 }
 
 capture_judge() {

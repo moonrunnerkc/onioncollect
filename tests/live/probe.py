@@ -50,7 +50,7 @@ async def main(settings_path: Path) -> None:
     if after_second < 9:
         raise SystemExit("step 3: FAIL, the NEWNYM rate limit was not respected")
 
-    fetchers = [Fetcher(settings, pool.assign(n)) for n in range(len(pool.instances))]
+    fetchers = [Fetcher(settings, pool.assign(n), set(settings.exclusions)) for n in range(len(pool.instances))]
     for n, url in enumerate(LIVE_ONIONS + CLEARNET):
         fetcher = fetchers[n % len(fetchers)]
         result = await fetcher.fetch(url)
