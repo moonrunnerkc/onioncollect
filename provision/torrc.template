@@ -1,0 +1,7 @@
+SocksPort 127.0.0.1:1005@N@ IsolateSOCKSAuth
+ControlPort 127.0.0.1:1105@N@
+HashedControlPassword @HASH@
+ClientOnly 1
+SafeLogging 1
+MaxCircuitDirtiness 600
+Log notice syslog

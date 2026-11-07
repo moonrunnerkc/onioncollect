@@ -1,0 +1,23 @@
+data/
+crawl.db
+crawl.db-*
+pages/
+*.log
+control-password
+exclusions.txt
+safety-patterns.txt
+settings.toml
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+# provision/ holds templates only. The control password and its hash are generated in the guest and
+# the disk lives in ~/.lima; these keep a copied-in secret or disk image from ever being staged.
+*.hash
+*.img
+*.qcow2
+*.iso
+*.raw
+disk
+disk.snapshot

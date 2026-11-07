@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    # Pure unit tests, the network-boundary check, and leak test 4 (mocked redirect trap).
+    # Nothing here talks to Tor or the network; live leak tests 1 to 3 run in the guest via `make leak-test`.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --require-hashes -r requirements.txt
+      - run: python -m unittest discover -s tests -t . -v

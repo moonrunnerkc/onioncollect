@@ -1,0 +1,45 @@
+# Debian 13 guest for onioncrawl. provision.sh does section 3 of docs/build-guide.md on every boot.
+# Lima inlines the data files at create time and they seed the first boot only (overwrite: false);
+# after that `make provision` copies the current files in, so a boot never rolls them back.
+# plain mode: no shared folders, no port forwarding, no Lima guest agent inside the VM.
+minimumLimaVersion: 2.0.0
+
+base:
+- template:_images/debian-13
+
+vmType: vz
+cpus: 2
+memory: 4GiB
+disk: 40GiB
+plain: true
+mounts: []
+timezone: UTC
+propagateProxyEnv: false
+upgradePackages: false
+
+ssh:
+  loadDotSSHPubKeys: false
+  forwardAgent: false
+  forwardX11: false
+
+provision:
+- mode: data
+  path: /etc/onioncrawl/provision.sh
+  permissions: 700
+  overwrite: false
+  file:
+    url: provision.sh
+- mode: data
+  path: /etc/onioncrawl/torrc.template
+  overwrite: false
+  file:
+    url: torrc.template
+- mode: data
+  path: /etc/onioncrawl/requirements.txt
+  overwrite: false
+  file:
+    url: requirements.txt
+- mode: system
+  script: |
+    #!/bin/bash
+    exec /etc/onioncrawl/provision.sh
