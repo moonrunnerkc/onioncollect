@@ -41,12 +41,16 @@ class SettingsLoadTest(unittest.TestCase):
             'tor_instances = [[10051, 11051], [10052, 11052]]\n'
             'jitter_seconds = [2, 5]\n'
             'data_dir = "/home/crawler/data"\n'
+            'exclusions_file = "/home/crawler/exclusions.txt"\n'
+            'safety_patterns_file = "/home/crawler/safety-patterns.txt"\n'
             'max_depth = 4\n'
         )
         settings = Settings.load(path, port_check=always_listening)
         self.assertEqual(settings.tor_instances, ((10051, 11051), (10052, 11052)))
         self.assertEqual(settings.jitter_seconds, (2.0, 5.0))
         self.assertEqual(settings.data_dir, Path("/home/crawler/data"))
+        self.assertEqual(settings.exclusions_file, Path("/home/crawler/exclusions.txt"))
+        self.assertEqual(settings.safety_patterns_file, Path("/home/crawler/safety-patterns.txt"))
         self.assertEqual(settings.max_depth, 4)
 
     def test_every_port_is_checked_and_dead_ones_named(self):

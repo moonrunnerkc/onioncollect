@@ -32,6 +32,8 @@ class Settings:
     recrawl_quiet_hours: int = 168
     retest_dead_hours: int = 168
     data_dir: Path = Path("./data")
+    exclusions_file: Path = Path("./exclusions.txt")
+    safety_patterns_file: Path = Path("./safety-patterns.txt")
     user_agent: str = TOR_BROWSER_UA
 
     @classmethod
@@ -50,8 +52,9 @@ class Settings:
         if "jitter_seconds" in raw:
             low, high = raw["jitter_seconds"]
             raw["jitter_seconds"] = (float(low), float(high))
-        if "data_dir" in raw:
-            raw["data_dir"] = Path(raw["data_dir"])
+        for key in ("data_dir", "exclusions_file", "safety_patterns_file"):
+            if key in raw:
+                raw[key] = Path(raw[key])
         settings = cls(control_password=read_password(Path(password_file)), **raw)
         dead = [port for pair in settings.tor_instances for port in pair if not port_check(port)]
         if dead:

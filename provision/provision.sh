@@ -184,12 +184,19 @@ write_settings() {
     cat > "$rendered" <<EOF
 control_password_file = "$PASSWORD_FILE"
 data_dir = "$CRAWLER_HOME/data"
+exclusions_file = "$CRAWLER_HOME/exclusions.txt"
+safety_patterns_file = "$CRAWLER_HOME/safety-patterns.txt"
 EOF
     if ! cmp -s "$rendered" "$settings"; then
         install -m 600 -o crawler -g crawler "$rendered" "$settings"
         log "settings.toml written"
     fi
     rm -f "$rendered"
+    if [ ! -e "$CRAWLER_HOME/exclusions.txt" ]; then
+        echo "# One v3 onion host per line. Content fetched from these hosts is never saved." |
+            install -m 600 -o crawler -g crawler /dev/stdin "$CRAWLER_HOME/exclusions.txt"
+        log "exclusions.txt created"
+    fi
 }
 
 install_kill_switch() {

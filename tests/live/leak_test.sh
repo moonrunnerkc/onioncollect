@@ -4,24 +4,8 @@
 # Everything that runs crawler code or the crawler's venv runs as crawler, never as root.
 set -uo pipefail
 
-APP=/home/crawler/app
-PY=/home/crawler/venv/bin/python
 WINDOW=${LEAK_WINDOW_SECONDS:-300}
-WORK=$(mktemp -d)
-FAILED=0
-# Non-terminating rule, present only for the capture window: the kernel logs the owning UID of every
-# new outbound flow, so attribution never depends on catching a short-lived socket with ss.
-LOG_RULE=(OUTPUT ! -o lo -m conntrack --ctstate NEW -j LOG --log-prefix "onioncrawl-lt3: " --log-uid)
-cleanup() {
-    iptables -D "${LOG_RULE[@]}" 2>/dev/null
-    rm -rf "$WORK"
-}
-trap cleanup EXIT
-
-report() {
-    if [ "$2" = pass ]; then echo "PASS  $1"; else echo "FAIL  $1"; FAILED=1; fi
-}
-as_crawler() { sudo -u crawler -H "$@"; }
+source "$(dirname "$0")/capture.sh"
 
 # Section 15 test 1. The kill switch ends in DROP, so a blocked attempt gets no reply and curl gives up
 # at -m 5: exit 28 is the expected result and only exit 0 fails here. The pass rests on evidence of the
@@ -37,9 +21,6 @@ curl_attempt() {
     [ "$code" != 0 ]
 }
 
-# Counts packets in the finished capture that match a tcpdump filter.
-captured() { tcpdump -r "$WORK/cap.pcap" -nn "$1" 2>/dev/null | wc -l; }
-
 # Section 15 test 2: no address may come back, from the system resolver or a direct query.
 dns_blocked() {
     local stub direct python
@@ -52,20 +33,7 @@ dns_blocked() {
     ! grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' <<<"$stub$direct" && grep -q gaierror <<<"$python"
 }
 
-drop_count() { iptables -L OUTPUT -v -n -x | awk '$3 == "DROP" {print $1}'; }
-
-DEV=$(ip route show default | awk '{print $5; exit}')
-LOCAL_IP=$(ip -4 -o addr show dev "$DEV" | awk '{split($4, a, "/"); print a[1]; exit}')
-echo "capture: tcpdump -i $DEV 'not port 22' for ${WINDOW}s, guest address $LOCAL_IP"
-
-tcpdump -i "$DEV" -nn -Z root -w "$WORK/cap.pcap" 'not port 22' 2>"$WORK/tcpdump.err" &
-TCPDUMP=$!
-( while :; do ss -tnpH state established; sleep 1; done ) > "$WORK/ss.txt" &
-SAMPLER=$!
-iptables -I "${LOG_RULE[@]:0:1}" 1 "${LOG_RULE[@]:1}"
-sleep 2
-STARTED=$(date +%s)
-DROPS_BEFORE=$(drop_count)
+capture_start "${WINDOW}s"
 
 echo "test 1: clearnet block (as crawler)"
 T1=pass
@@ -96,16 +64,7 @@ if [ "$REMAINING" -gt 0 ]; then
     echo "      holding the capture open ${REMAINING}s more"
     sleep "$REMAINING"
 fi
-DROPS_AFTER=$(drop_count)
-iptables -D "${LOG_RULE[@]}"
-journalctl -k --since "@$((STARTED - 2))" -o cat --no-pager | grep "onioncrawl-lt3: " > "$WORK/flows.txt"
-kill "$SAMPLER" 2>/dev/null
-kill -INT "$TCPDUMP" && wait "$TCPDUMP" 2>/dev/null
-tcpdump -r "$WORK/cap.pcap" -nn -q -tt 2>/dev/null > "$WORK/cap.txt"
-chmod 755 "$WORK" && chmod 644 "$WORK/cap.txt" "$WORK/ss.txt" "$WORK/flows.txt"
-echo "      kill switch DROP counter: $DROPS_BEFORE -> $DROPS_AFTER (blocked attempts never reach the wire)"
-echo "      ss -tnp | grep -v 127.0.0.1, at the end of the window:"
-ss -tnpH | grep -v 127.0.0.1 | awk '{print "        " $1, $4, $5, $6}' | head -12
+capture_stop
 echo "test 1: evidence of the drop"
 CRAWLER_UID=$(id -u crawler)
 RESOLVER_UID=$(id -u systemd-resolve)
@@ -125,9 +84,5 @@ echo "      example.com: kernel log lines for uid systemd-resolve -> port 53: $T
 [ "$T1_LOOKUP" -gt 0 ] && [ "$T1_LOOKUP_WIRE" = 0 ] || T1=fail
 report "test 1 clearnet block" "$T1"
 
-if as_crawler "$PY" "$APP/tests/live/leak_analyze.py" "$WORK/cap.txt" "$WORK/ss.txt" "$WORK/flows.txt" "$LOCAL_IP" /home/crawler/control-password | sed 's/^/      /'; then
-    report "test 3 packet capture: only tor talks to the network" pass
-else
-    report "test 3 packet capture: only tor talks to the network" fail
-fi
+capture_judge "test 3 packet capture: only tor talks to the network"
 exit $FAILED

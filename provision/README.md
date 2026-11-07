@@ -15,6 +15,7 @@ Nothing runs in the cloud. Traffic and disk stay on this Mac.
 | `make shell` | A shell as `crawler` in the guest. All live steps run from here. |
 | `make checklist` | Section 15 machine checklist. Guest items run in the guest; FileVault and the snapshot are checked on the Mac. |
 | `make leak-test` | Section 15 leak tests 1 to 4 in the guest, with a five-minute packet capture. |
+| `make crawl-capture` | Build step 8: seeds `/home/crawler/seeds.txt`, runs the crawler with one worker on one Tor instance for `CRAWL_SECONDS` (default 600) under the leak test 3 capture, then audits the crawl log. |
 | `make snapshot` | Stops the guest, APFS-clones its disk to `disk.snapshot`, starts it again. |
 
 Roll back to the snapshot: `limactl stop node1 && cp -c ~/.lima/node1/disk.snapshot ~/.lima/node1/disk`.
@@ -34,6 +35,14 @@ Roll back to the snapshot: `limactl stop node1 && cp -c ~/.lima/node1/disk.snaps
 - **Control password.** Generated in the guest into `/home/crawler/control-password` (mode 600,
   owned by crawler). The hash for torrc is computed by `provision.sh` from that file, so the
   plaintext never appears on a command line, in a log, or in this repo.
+- **Safety files.** `provision.sh` creates an empty `/home/crawler/exclusions.txt` (mode 600) and
+  points `settings.toml` at it and at `/home/crawler/safety-patterns.txt`. The pattern list is not
+  committed; `make deploy` installs it from `safety-patterns.txt` in the checkout when one exists.
+  The crawler refuses to start without both files.
+- **Right after `make provision`.** The update hole closes while apt's TLS connections to the Debian
+  and Tor Project mirrors are still shutting down. For about 15 minutes those mirrors keep
+  retransmitting; the guest's replies are dropped, and leak test 3 reports the inbound packets as
+  not on a Tor socket. Nothing leaves the guest, but wait before running the leak tests.
 - **Clock.** NTP is masked; the hypervisor sets the clock at boot. Without the Lima guest agent
   there is no resync after the Mac sleeps, so after a long sleep restart the guest
   (`limactl stop node1 && limactl start node1`) if Tor complains about clock skew.
