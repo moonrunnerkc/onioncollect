@@ -122,12 +122,13 @@ When you later need to update packages, insert a temporary rule at the top (`sud
 
 ## 4. Project layout
 
-Nine files, one job each. Nothing imports from a file below it in this list except `crawler.py` and `cli.py`, which tie everything together.
+Eleven files, one job each. Nothing imports from a file below it in this list except `crawler.py` and `cli.py`, which tie everything together.
 
 ```text
 onioncrawl/
   config.py       settings, loaded once, never mutated
   onion.py        v3 address validation, URL normalization
+  safety.py       host exclusions, body content checks (pure)
   tor_pool.py     talks to the six Tor instances, rotates circuits
   db.py           SQLite schema and the Frontier class
   fetcher.py      one HTTP request through Tor, safely
@@ -153,7 +154,7 @@ How a single URL moves through the code:
 6. `scheduler.next_due()` decides when that URL and that host are looked at again.
 7. On any failure, `Frontier.fail()` bumps the retry count and `TorPool.rotate()` may ask that instance for a fresh circuit.
 
-Two small dataclasses are shared across files and live in `db.py`: `Task` (a claimed frontier row: `url`, `host`, `depth`, `retries`, `last_hash`) and `PageInfo` (what the parser returns). Keeping them there avoids circular imports.
+Two small dataclasses are shared across files and live in `db.py`: `Task` (a claimed frontier row: `url`, `host`, `depth`, `retries`, `last_hash`, and the host's `unchanged_streak`, which the scheduler needs) and `PageInfo` (what the parser returns). Keeping them there avoids circular imports.
 
 ## 5. config.py
 
@@ -263,11 +264,13 @@ SQLite in WAL mode with `busy_timeout=5000`, one connection shared by all worker
 | Table | Columns | Purpose |
 | --- | --- | --- |
 | `urls` | `url` PK, `host`, `depth`, `status`, `priority`, `retries`, `next_due`, `lease_until`, `last_fetched`, `last_hash`, `last_code`, `discovered_at` | The frontier. `status` is one of `queued`, `leased`, `done`, `parked`. |
-| `hosts` | `host` PK, `first_seen`, `last_up`, `last_down`, `consecutive_failures`, `state`, `title`, `unchanged_streak`, `simhash` | One row per onion service. `state` is `unknown`, `up`, `dead`, or `gated`. |
+| `hosts` | `host` PK, `first_seen`, `last_up`, `last_down`, `consecutive_failures`, `state`, `title`, `unchanged_streak`, `simhash` | One row per onion service. `state` is `unknown`, `up`, `dead`, `gated`, or `excluded` (set by the safety checks; never changes back). |
 | `pages` | `sha256` PK, `url`, `host`, `fetched_at`, `http_code`, `bytes`, `title`, `simhash`, `path` | One row per distinct page body ever stored. |
 | `uptime` | `host`, `checked_at`, `up` | Append-only log. Every fetch attempt writes one row. This is the host history nobody else keeps. |
 
-Indexes: `urls(status, next_due, priority)` for claiming, `urls(host)` for per-host counts, `pages(simhash)` for near-duplicate lookup, `uptime(host, checked_at)`.
+Timestamps are UTC text, `YYYY-MM-DD HH:MM:SS.mmm`, so they sort as strings and read cleanly in `sqlite3`. Simhashes are stored as signed 64-bit integers, because SQLite has no unsigned type.
+
+Indexes: `urls(status, next_due, priority)` for claiming, `urls(host, status)` for per-host lease counts, `pages(simhash)` for near-duplicate lookup, `uptime(host, checked_at)`.
 
 ### class Frontier
 
@@ -275,13 +278,17 @@ Indexes: `urls(status, next_due, priority)` for claiming, `urls(host)` for per-h
 
 **`seed(urls: list[str])`**: normalizes each URL through `onion.normalize`, inserts with `depth=0`, `priority=0`, `status='queued'`, `next_due=now`. `INSERT OR IGNORE`, so re-seeding is harmless.
 
-**`claim(n: int) -> list[Task]`**: the one tricky query. In a single statement, pick up to `n` rows where `status='queued'` and `next_due <= now`, ordered by `priority`, then `depth`, then `discovered_at`; set them to `leased` with `lease_until = now + 10 minutes`; return them. SQLite 3.35+ supports `UPDATE ... RETURNING`, which makes this atomic without a transaction dance. Skip rows whose host already has `per_host_concurrency` leased rows (a subquery count). Never-fetched URLs get priority 0; recrawls get priority 1, so discovery always wins over revisiting.
+**`claim(n: int) -> list[Task]`**: the one tricky query. In a single statement, pick up to `n` rows where `status` is `queued` or `done` (a `done` row is a page waiting for its recrawl; without it nothing is ever revisited) and `next_due <= now`, ordered by `priority`, then `depth`, then `discovered_at`; set them to `leased` with `lease_until = now + 10 minutes`; return them. SQLite 3.35+ supports `UPDATE ... RETURNING`, which makes this atomic without a transaction dance. Skip rows whose host already has `per_host_concurrency` leased rows. A correlated subquery count alone is not enough: inside one `UPDATE` it reads the table as it was before the update, so a batch could take three rows of a host with one free slot. Count leased rows per host once, then number each host's candidates with `ROW_NUMBER() OVER (PARTITION BY host ...)` and keep only those that fit the free slots. Never-fetched URLs get priority 0; `complete` sets priority 1 for the recrawl, so discovery always wins over revisiting.
 
-**`complete(task, info: PageInfo, next_due)`**: in one transaction: set the url row to `done` with the new hash, code, and `next_due`; upsert the host row as `up` with `consecutive_failures=0`, bump or reset `unchanged_streak` depending on whether the hash changed; insert the page row if the sha256 is new; append the uptime row; then call `add_discovered` with the links from `info`.
+**`complete(task, info: PageInfo, next_due, page_path)`**: in one transaction: set the url row to `done` at priority 1 with the new hash, code, and `next_due`; set the host row to `up` (or `gated` when `info.gated`; an `excluded` host stays excluded) with `consecutive_failures=0`, bump or reset `unchanged_streak` depending on whether the hash changed, and take the title and simhash only from the host's root page; insert the page row if the sha256 is new and the body was stored (`page_path` is None for a gated page); append the uptime row; then call `add_discovered` with the links from `info`, unless the page is gated.
 
-**`fail(task, reason: str)`**: increment `retries`. If below `max_retries`, set back to `queued` with `next_due = now + 2^retries minutes`. Otherwise `parked`. Bump the host's `consecutive_failures`, append an uptime row with `up=0`, and if the host crosses `dead_after_failures` spread over at least 24 hours, set the host to `dead` and park every queued URL on it.
+**`fail(task, retries, next_due, host_answered)`**: db.py sits above scheduler.py in the layout, so it cannot call it; `crawler.py` asks the scheduler for the new retry count and `next_due` (None means park) and passes them in. Set the row to `queued` at that `next_due`, or `parked`. When the host answered with an HTTP status (a redirect offsite, a PDF, a malformed response) it is up, not down: record `up=1` and reset its failures, or five PDFs in a day would mark a live site dead. Otherwise bump `consecutive_failures`, set `last_down`, and append `up=0`.
 
-**`add_discovered(urls, depth)`**: `INSERT OR IGNORE` each normalized URL at the given depth, skipping any beyond `max_depth` and any whose host is `dead` or `gated`. New hosts get a `hosts` row in state `unknown`.
+**`recent_failures(host) -> list[datetime]`** and **`mark_dead(host)`**: the dead-host rule. The crawler passes the failure times since the host was last up to `scheduler.host_is_dead`; if it says dead, `mark_dead` sets the state and parks every queued URL on the host.
+
+**`exclude(task, info)`**: the safety path. Parks the URL and every queued or done URL on the host, sets the host `excluded`, appends an `up=1` uptime row, still queues the page's links, and writes no page row and no title.
+
+**`add_discovered(urls, depth)`**: `INSERT OR IGNORE` each normalized URL at the given depth, skipping any beyond `max_depth` and any whose host is `dead`, `gated` or `excluded`. It runs inside the caller's transaction, so it is private (`_queue`) and `seed` uses it too. New hosts get a `hosts` row in state `unknown`.
 
 **`release_stale_leases()`**: any `leased` row with `lease_until < now` goes back to `queued`. Run at startup and every 5 minutes.
 
@@ -353,11 +360,11 @@ No `allow_redirects` shortcut. No session persistence across hosts. No reading o
 
 ## 10. parser.py
 
-Pure functions over a bytes body. No network, no database. Returns a `PageInfo` dataclass: `title`, `headings` (list of h1 and h2 text), `links` (set of normalized onion URLs), `text_onions` (set of hosts found in raw text), `sha256`, `simhash`, `server` (the `Server` header value), `gated` (bool), `word_count`.
+Pure functions over a bytes body. No network, no database. Returns a `PageInfo` dataclass: `title`, `headings` (list of h1 and h2 text), `links` (set of normalized onion URLs), `text_onions` (set of hosts found in raw text), `sha256`, `simhash`, `server` (the `Server` header value), `gated` (bool), `word_count`, `http_code`, and `size` (body bytes; the `pages` row needs both).
 
-**`parse(url, body: bytes, headers) -> PageInfo`**
+**`parse(url, status: int, body: bytes, headers) -> PageInfo`**
 
-The orchestrator. Decodes the body (`utf-8` with `errors="replace"`; onion sites are sloppy about charsets), builds a selectolax `HTMLParser`, and calls the helpers below in order.
+The orchestrator. Decodes the body (`utf-8` with `errors="replace"`; onion sites are sloppy about charsets), builds a selectolax `LexborHTMLParser` (selectolax 1.0 removed the old Modest `HTMLParser`; the API is the same), and calls the helpers below. `status` is there because `detect_gate` needs it. `visible_text` runs before `detect_gate`, so a DDoS-guard page full of inline JavaScript is judged on its visible words.
 
 **`extract_links(tree, base_url) -> set[str]`**
 
@@ -373,7 +380,7 @@ Title from `<title>`, trimmed to 200 characters. Headings from `h1` and `h2`, fi
 
 **`detect_gate(tree, status) -> bool`**
 
-True when the page is a captcha wall, login wall, or DDoS-guard interstitial. Signals: a `<form>` with an `<input type="password">` and under 300 words of text; an `<img>` whose `src` or `alt` contains `captcha`; a title or body matching `DDoS`, `checking your browser`, or `queue`; HTTP 403 or 429 with a tiny body. A gated host is marked in the database and recrawled weekly only, since it yields nothing until it changes.
+True when the page is a captcha wall, login wall, or DDoS-guard interstitial. Signals: a `<form>` with an `<input type="password">` and under 300 words of text; an `<img>` whose `src` or `alt` contains `captcha`; a title matching `DDoS`, `checking your browser`, or `queue`, or a body under 300 words matching them (on a full page those are ordinary words, and a forum thread mentioning a queue is not a wall); HTTP 403 or 429 with under 50 words. A gated host is marked in the database and recrawled weekly only, since it yields nothing until it changes.
 
 **`content_hash(body: bytes) -> str`**
 
@@ -405,28 +412,30 @@ What is not stored: images, scripts, stylesheets, fonts, anything that was not H
 
 ## 12. scheduler.py
 
-Pure decision functions. Given what just happened to a URL or host, when should it be looked at again? Keeping this logic out of the database class makes it easy to tune without touching SQL.
+Pure decision functions. Given what just happened to a URL or host, when should it be looked at again? Keeping this logic out of the database class makes it easy to tune without touching SQL. Each function that needs the time takes `now` as an argument instead of reading the clock, so the tests can pin it.
 
-**`next_due_for_url(task, info, changed: bool, settings) -> datetime`**
+**`next_due_for_url(task, info, changed: bool, settings, now) -> datetime`**
+
+- Gated page: `now + 7 days`, even at depth 0.
 
 - Page changed since the last visit: `now + recrawl_active_hours`.
-- Unchanged, and the host's `unchanged_streak` is under 3: `now + 2 x recrawl_active_hours`.
-- Unchanged 3 or more visits in a row: `now + recrawl_quiet_hours`.
+- Unchanged, and the host's `unchanged_streak` counting this visit is under 3: `now + 2 x recrawl_active_hours`.
+- Unchanged 3 or more visits in a row, this one included: `now + recrawl_quiet_hours`.
 - Depth 0 (a seed or a host root): never later than `recrawl_active_hours` regardless, because root pages are where new links show up.
 
-**`next_due_for_failure(task, error: str, settings) -> datetime | None`**
+**`next_due_for_failure(task, error: str, settings, now) -> datetime | None`** and **`retry_cost(error) -> int`**
 
-- `timeout` or `tor_unreachable`: `now + 2^retries minutes` (2, 4, 8). Onion services flap constantly; a timeout at 14:00 says little about 14:10.
-- `redirect_offsite`, `not_text`: None, meaning park the URL permanently. Nothing will change.
-- `other:*`: same backoff as timeout but counted double toward `max_retries`, since it's usually a malformed response that will repeat.
+- `timeout` or `tor_unreachable`: `now + 2^retries minutes`, counting this failure (2, 4, 8 as far as `max_retries` allows; at the default of 3 the third failure parks). Returns None once `retries` would reach `max_retries`. Onion services flap constantly; a timeout at 14:00 says little about 14:10.
+- `redirect_offsite`, `not_text`, `not_onion`: None, meaning park the URL permanently. Nothing will change.
+- `other:*`: same backoff as timeout but counted double toward `max_retries` (`retry_cost` returns 2), since it's usually a malformed response that will repeat.
 
 **`host_is_dead(failures: list[datetime], settings) -> bool`**
 
 True when there are `dead_after_failures` or more consecutive failures and the first and last are at least 24 hours apart. The time spread matters: five timeouts in five minutes is a bad circuit or a brief outage, not a dead service.
 
-**`retest_due(host_row, settings) -> bool`**
+**`retest_due(host_row, settings, now) -> bool`**
 
-For hosts in `dead` or `gated`: True when `last_down` (or the gate detection time) is older than `retest_dead_hours`. `Crawler.maintenance_loop` calls this hourly and re-queues the host's root URL at priority 2 (below discovery and normal recrawls).
+For hosts in `dead` or `gated`: True when `last_down` (or, for a gated host, `last_up`, since the gate page was the last successful fetch) is older than `retest_dead_hours`. Never for `excluded`. `Crawler.maintenance_loop` calls this hourly and re-queues the host's root URL at priority 2 (below discovery and normal recrawls).
 
 **`should_rotate(error: str, instance) -> bool`**
 
@@ -466,17 +475,18 @@ Claiming one at a time (not a batch) keeps the lease window tight and lets 18 wo
 
 **`handle_success(task, result)`**
 
-1. `info = parser.parse(result.final_url, result.body, result.headers)`.
-2. If `info.gated`: mark the host `gated` in the database, record the URL as done with a weekly `next_due`, and skip link extraction. Links on a captcha page are the captcha vendor's, not the site's.
-3. `changed = info.sha256 != task.last_hash`.
-4. `store.save(info.sha256, result.body)`.
-5. `due = scheduler.next_due_for_url(task, info, changed, settings)`.
-6. `await frontier.complete(task, info, due)`, which also queues every URL in `info.links` and `http://<host>/` for every host in `info.text_onions`.
-7. Log one line: host, status, bytes, new links count, changed or not, elapsed. Never the title, never the URL path. Hosts are enough to debug with and the log stays safe to keep.
+1. `info = parser.parse(result.final_url, result.status, result.body, result.headers)`.
+2. Safety: if `task.host` or the host of `final_url` is in the exclusion list, or `safety.body_triggers_exclusion` names a category, save nothing. Add the host to the in-memory exclusion set, `await frontier.exclude(task, info)`, log only the host and the category, and stop. Nothing between this check and `store.save` may await, so a page from a host that another worker just excluded is never stored.
+3. If `info.gated`: the body is not stored; `complete` marks the host `gated`, records the URL as done with the weekly `next_due` from the scheduler, and skips link extraction. Links on a captcha page are the captcha vendor's, not the site's.
+4. `changed = info.sha256 != task.last_hash`.
+5. `store.save(info.sha256, result.body)`, skipped for a gated page.
+6. `due = scheduler.next_due_for_url(task, info, changed, settings, now)`.
+7. `await frontier.complete(task, info, due, page_path)`, which also queues every URL in `info.links` and `http://<host>/` for every host in `info.text_onions`.
+8. Log one line: host, status, bytes, new links count, changed or not, elapsed. Never the title, never the URL path. Hosts are enough to debug with and the log stays safe to keep.
 
 **`handle_failure(task, result)`**
 
-1. `await frontier.fail(task, result.error)`, which applies the backoff from `scheduler.next_due_for_failure` and the dead-host rule.
+1. `due = scheduler.next_due_for_failure(...)`, `retries = task.retries + scheduler.retry_cost(error)`, then `await frontier.fail(task, retries, due, host_answered=result.status is not None)`. Then the dead-host rule: `scheduler.host_is_dead(await frontier.recent_failures(host))`, and `frontier.mark_dead(host)` if so.
 2. If `scheduler.should_rotate(result.error, fetcher.tor)`: `await tor_pool.rotate_for(fetcher.tor)`.
 3. Log host and error string.
 
@@ -488,11 +498,11 @@ A note on concurrency: all 18 workers share one event loop, one database connect
 
 ## 14. cli.py
 
-Argparse with four subcommands. Entry point `python -m onioncrawl <command>` from the `crawler` user inside the venv.
+Argparse with four subcommands. Entry point `python -m onioncrawl --settings <settings.toml> <command>` from the `crawler` user inside the venv.
 
 **`seed <file>`**: reads one URL or bare onion host per line, skips blank lines and `#` comments, calls `Frontier.seed`. Prints how many were accepted and how many rejected by validation. Good first seeds: the Ahmia onion address, a couple of the long-running link directories, and anything you already know. Fifty good seeds is plenty; discovery does the rest.
 
-**`run [--workers N]`**: loads settings, overrides `workers_per_instance` if given, builds `Crawler`, runs it until Ctrl-C. Logs to stderr and to `data/crawl.log` with rotation at 50 MB, 5 files.
+**`run [--workers N]`**: loads settings, overrides `workers_per_instance` if given, builds `Crawler`, runs it until Ctrl-C. Logs to stderr and to `data/crawl.log` with rotation at 50 MB, 5 files. Library loggers are filtered to WARNING and up on the handlers themselves: httpx logs every request, full URL included, at INFO, and stem sets its own logger to TRACE, so the root logger's level is not enough.
 
 **`status`**: prints `Frontier.stats()` and per-instance health as a short table: queued, leased, done, parked; hosts up, dead, gated, unknown; pages stored and disk size; fetches and success rate over the last hour; one line per Tor instance. Run it in a second terminal while `run` is going. Fetch rate under 1 per second across 18 workers means Tor is struggling, usually a bad guard on one instance; check the per-instance lines.
 
