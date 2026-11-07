@@ -12,7 +12,7 @@ HASH_FILE=/etc/tor/onioncrawl-control.hash
 VENV=$CRAWLER_HOME/venv
 TOR_KEY_FPR=A3C4F0F979CAA22CDBA8F512EE8CBC9E886DDD89
 TOR_KEYRING=/usr/share/keyrings/deb.torproject.org-keyring.gpg
-PACKAGES="tor deb.torproject.org-keyring python3-venv iptables iptables-persistent tcpdump bind9-dnsutils curl"
+PACKAGES="tor deb.torproject.org-keyring python3-venv iptables iptables-persistent tcpdump bind9-dnsutils curl sqlite3"
 
 log() { echo "provision: $*"; }
 
