@@ -8,34 +8,11 @@ from urllib.parse import urlsplit
 
 import aiosqlite
 
-from onioncrawl import onion
+from onioncrawl import onion, schema
 from onioncrawl.config import Settings
 
 LEASE = timedelta(minutes=10)
 FRESH, RECRAWL = 0, 1
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS urls (
-    url TEXT PRIMARY KEY, host TEXT NOT NULL, depth INTEGER NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued', priority INTEGER NOT NULL DEFAULT 0, retries INTEGER NOT NULL DEFAULT 0,
-    next_due TEXT NOT NULL, lease_until TEXT, last_fetched TEXT, last_hash TEXT, last_code INTEGER,
-    discovered_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS hosts (
-    host TEXT PRIMARY KEY, first_seen TEXT NOT NULL, last_up TEXT, last_down TEXT,
-    consecutive_failures INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'unknown', title TEXT,
-    unchanged_streak INTEGER NOT NULL DEFAULT 0, simhash INTEGER
-);
-CREATE TABLE IF NOT EXISTS pages (
-    sha256 TEXT PRIMARY KEY, url TEXT NOT NULL, host TEXT NOT NULL, fetched_at TEXT NOT NULL,
-    http_code INTEGER NOT NULL, bytes INTEGER NOT NULL, title TEXT, simhash INTEGER, path TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS uptime (host TEXT NOT NULL, checked_at TEXT NOT NULL, up INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS urls_claim ON urls(status, next_due, priority);
-CREATE INDEX IF NOT EXISTS urls_host ON urls(host, status);
-CREATE INDEX IF NOT EXISTS pages_simhash ON pages(simhash);
-CREATE INDEX IF NOT EXISTS uptime_host ON uptime(host, checked_at);
-"""
 
 # One statement, so no other claim can interleave. `due` keeps only rows whose host still has a free
 # lease slot; the window numbers each host's candidates so a batch never takes more of one host than
@@ -123,7 +100,7 @@ class Frontier:
         self.db = await aiosqlite.connect(path)
         await self.db.execute("PRAGMA journal_mode=WAL")
         await self.db.execute("PRAGMA busy_timeout=5000")
-        await self.db.executescript(SCHEMA)
+        await self.db.executescript(schema.TABLES + schema.INDEXES)
         await self.db.commit()
         await self.release_stale_leases()
 

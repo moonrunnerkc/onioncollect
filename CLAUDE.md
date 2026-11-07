@@ -35,7 +35,8 @@ onioncrawl/
   safety.py      host exclusions, body content checks (pure)
   config.py      frozen Settings dataclass, loaded once
   tor_pool.py    the Tor instances, circuit rotation
-  db.py          schema, Frontier class, Task and PageInfo dataclasses
+  schema.py      CREATE TABLE and CREATE INDEX statements
+  db.py          Frontier class, Task and PageInfo dataclasses
   fetcher.py     one request through Tor, all in-code anonymity controls
   parser.py      links, text onions, metadata, simhash (pure)
   storage.py     content-addressed page store

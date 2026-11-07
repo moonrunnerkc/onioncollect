@@ -122,7 +122,7 @@ When you later need to update packages, insert a temporary rule at the top (`sud
 
 ## 4. Project layout
 
-Eleven files, one job each. Nothing imports from a file below it in this list except `crawler.py` and `cli.py`, which tie everything together. `onion.py` and `safety.py` come first because they are pure and import nothing else from the package, and `config.py` uses `safety.py` to parse the two safety files.
+Twelve files, one job each. Nothing imports from a file below it in this list except `crawler.py` and `cli.py`, which tie everything together. `onion.py` and `safety.py` come first because they are pure and import nothing else from the package, and `config.py` uses `safety.py` to parse the two safety files.
 
 ```text
 onioncrawl/
@@ -130,7 +130,8 @@ onioncrawl/
   safety.py       host exclusions, body content checks (pure)
   config.py       settings, loaded once, never mutated
   tor_pool.py     talks to the six Tor instances, rotates circuits
-  db.py           SQLite schema and the Frontier class
+  schema.py       the CREATE TABLE and CREATE INDEX statements
+  db.py           the Frontier class over that schema
   fetcher.py      one HTTP request through Tor, safely
   parser.py       links, onion addresses, metadata, simhash
   storage.py      raw page store on disk
@@ -286,7 +287,7 @@ Indexes: `urls(status, next_due, priority)` for claiming, `urls(host, status)` f
 
 ### class Frontier
 
-**`open(path)`**: connects, sets WAL and busy timeout, runs `CREATE TABLE IF NOT EXISTS` for all four tables, then calls `release_stale_leases()` so a crashed previous run's work is picked up again.
+**`open(path)`**: connects, sets WAL and busy timeout, runs the `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` statements from `schema.py` (plain string constants, split out so db.py stays under 300 lines), then calls `release_stale_leases()` so a crashed previous run's work is picked up again.
 
 **`seed(urls: list[str])`**: normalizes each URL through `onion.normalize`, inserts with `depth=0`, `priority=0`, `status='queued'`, `next_due=now`. `INSERT OR IGNORE`, so re-seeding is harmless.
 
