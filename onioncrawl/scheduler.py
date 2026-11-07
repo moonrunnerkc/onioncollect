@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from onioncrawl.config import Settings
 from onioncrawl.db import PageInfo, Task
 
-PERMANENT_ERRORS = {"redirect_offsite", "not_text", "not_onion"}
+PERMANENT_ERRORS = {"redirect_offsite", "redirect_excluded", "not_text", "not_onion"}
 FLAKY_ERRORS = {"timeout", "tor_unreachable"}
 QUIET_AFTER_UNCHANGED = 3
 GATED_RECRAWL = timedelta(days=7)

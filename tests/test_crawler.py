@@ -29,6 +29,9 @@ class FakeTor:
         return self.rate
 
 
+FETCHER = mock.Mock(tor=FakeTor())
+
+
 class CrawlerTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -50,6 +53,10 @@ class CrawlerTest(unittest.IsolatedAsyncioTestCase):
         (task,) = await self.crawler.frontier.claim(1)
         return task
 
+    async def status_of(self, url: str) -> str:
+        (status,), = await self.rows("SELECT status FROM urls WHERE url = ?", url)
+        return status
+
     async def rows(self, sql: str, *params):
         return list(await self.crawler.frontier.db.execute_fetchall(sql, params))
 
@@ -59,7 +66,7 @@ class CrawlerTest(unittest.IsolatedAsyncioTestCase):
     async def test_success_saves_and_completes(self):
         task = await self.claim(f"http://{AHMIA}/")
         with self.assertLogs("onioncrawl.crawler", "INFO") as logs:
-            await self.crawler.handle_success(task, ok(task.url))
+            await self.crawler.handle_success(task, ok(task.url), FETCHER)
         self.assertEqual(len(self.stored_files()), 1)
         self.assertEqual(await self.rows("SELECT status FROM urls WHERE url = ?", task.url), [("done",)])
         self.assertEqual(await self.rows("SELECT COUNT(*) FROM pages"), [(1,)])
@@ -78,7 +85,7 @@ class CrawlerTest(unittest.IsolatedAsyncioTestCase):
         task = await self.claim(f"http://{AHMIA}/")
         body = PAGE + b" forbiddenterm 4111111111111111"
         with self.assertLogs("onioncrawl.crawler") as logs:
-            await self.crawler.handle_success(task, ok(task.url, body))
+            await self.crawler.handle_success(task, ok(task.url, body), FETCHER)
         self.assertEqual(self.stored_files(), [])
         self.assertEqual(await self.rows("SELECT COUNT(*) FROM pages"), [(0,)])
         self.assertEqual(await self.rows("SELECT DISTINCT status FROM urls WHERE host = ?", AHMIA), [("parked",)])
@@ -89,20 +96,34 @@ class CrawlerTest(unittest.IsolatedAsyncioTestCase):
     async def test_second_in_flight_page_of_an_excluded_host_is_not_saved(self):
         await self.crawler.frontier.seed([f"http://{AHMIA}/a", f"http://{AHMIA}/b"])
         first, second = await self.crawler.frontier.claim(2)
-        await self.crawler.handle_success(first, ok(first.url, PAGE + b" zzcredzz"))
-        await self.crawler.handle_success(second, ok(second.url))
+        await self.crawler.handle_success(first, ok(first.url, PAGE + b" zzcredzz"), FETCHER)
+        await self.crawler.handle_success(second, ok(second.url), FETCHER)
         self.assertEqual(self.stored_files(), [])
         self.assertEqual(await self.rows("SELECT state FROM hosts WHERE host = ?", AHMIA), [("excluded",)])
 
-    async def test_redirect_onto_a_listed_host_is_not_saved(self):
+    async def test_redirect_onto_an_excluded_host_parks_the_url_and_spares_the_origin(self):
         task = await self.claim(f"http://{AHMIA}/go")
-        await self.crawler.handle_success(task, ok(task.url, final_url=f"http://{DUCKDUCKGO}/landing"))
+        result = FetchResult(url=task.url, final_url=task.url, status=302, error="redirect_excluded", elapsed=3.0)
+        with self.assertLogs("onioncrawl.crawler") as logs:
+            await self.crawler.handle_failure(task, result, FETCHER)
+        self.assertEqual(await self.status_of(task.url), "parked")
+        self.assertEqual(await self.rows("SELECT state FROM hosts WHERE host = ?", AHMIA), [("up",)])
+        self.assertNotIn(AHMIA, self.crawler.exclusions)
+        self.assertEqual(logs.output, [f"INFO:onioncrawl.crawler:{AHMIA} error=redirect_excluded elapsed=3.0s"])
+
+    async def test_landing_on_a_host_excluded_mid_fetch_is_the_same_verdict(self):
+        task = await self.claim(f"http://{AHMIA}/go")
+        with self.assertLogs("onioncrawl.crawler") as logs:
+            await self.crawler.handle_success(task, ok(task.url, final_url=f"http://{DUCKDUCKGO}/landing"), FETCHER)
         self.assertEqual(self.stored_files(), [])
+        self.assertEqual(await self.status_of(task.url), "parked")
+        self.assertEqual(await self.rows("SELECT state FROM hosts WHERE host = ?", AHMIA), [("up",)])
+        self.assertEqual(logs.output, [f"INFO:onioncrawl.crawler:{AHMIA} error=redirect_excluded elapsed=1.5s"])
 
     async def test_gated_page_is_not_saved_and_recrawled_weekly(self):
         task = await self.claim(f"http://{AHMIA}/")
         gate = b"<title>DDoS protection</title><form><input type=password></form>"
-        await self.crawler.handle_success(task, ok(task.url, gate))
+        await self.crawler.handle_success(task, ok(task.url, gate), FETCHER)
         self.assertEqual(self.stored_files(), [])
         (state,), = await self.rows("SELECT state FROM hosts WHERE host = ?", AHMIA)
         (due,), = await self.rows("SELECT next_due FROM urls WHERE url = ?", task.url)
@@ -144,7 +165,7 @@ class CrawlerTest(unittest.IsolatedAsyncioTestCase):
     async def test_logs_never_carry_paths_queries_or_titles(self):
         task = await self.claim(f"http://{AHMIA}/inner/path?q=secret")
         with self.assertLogs("onioncrawl", "DEBUG") as logs:
-            await self.crawler.handle_success(task, ok(task.url))
+            await self.crawler.handle_success(task, ok(task.url), FETCHER)
             await self.crawler.handle_failure(task, FetchResult(url=task.url, final_url=task.url, error="timeout"),
                                               mock.Mock(tor=FakeTor()))
         joined = "\n".join(logs.output)

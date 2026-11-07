@@ -77,7 +77,7 @@ class NextDueForFailureTest(unittest.TestCase):
         self.assertEqual(next_due_for_failure(task(retries=2), "timeout", longer, NOW) - NOW, timedelta(minutes=8))
 
     def test_permanent_errors_park_immediately(self):
-        for error in ("redirect_offsite", "not_text", "not_onion"):
+        for error in ("redirect_offsite", "redirect_excluded", "not_text", "not_onion"):
             self.assertIsNone(self.due(error))
 
     def test_other_errors_count_double(self):

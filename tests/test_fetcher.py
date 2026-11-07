@@ -44,7 +44,8 @@ class FetcherTestCase(unittest.IsolatedAsyncioTestCase):
         self.transport_kwargs: list[dict] = []
         self.routes = {}
         self.tor = FakeTor()
-        self.fetcher = Fetcher(throwaway_settings(max_body_bytes=1000), self.tor)
+        self.exclusions = {TORPROJECT}
+        self.fetcher = Fetcher(throwaway_settings(max_body_bytes=1000), self.tor, self.exclusions)
         patcher = mock.patch.object(fetcher_module, "AsyncProxyTransport", side_effect=self.make_transport)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -113,6 +114,22 @@ class RedirectTrapTest(FetcherTestCase):
         self.assertIsNone(result.error)
         self.assertEqual(result.final_url, target)
         self.assertEqual([kw["username"] for kw in self.transport_kwargs], [AHMIA, DUCKDUCKGO])
+
+    async def test_redirect_onto_an_excluded_host_is_never_followed(self):
+        start = f"http://{AHMIA}/moved"
+        self.route(start, status=302, headers={"location": f"http://{TORPROJECT.upper()}/landing"})
+        result = await self.fetcher.fetch(start)
+        self.assertEqual((result.error, result.status, result.body), ("redirect_excluded", 302, None))
+        self.assertEqual(self.served_by, [(AHMIA, AHMIA)])
+        self.assertEqual(len(self.transport_kwargs), 1)
+
+    async def test_redirect_check_sees_hosts_excluded_after_the_fetcher_was_built(self):
+        start = f"http://{AHMIA}/moved"
+        self.route(start, status=301, headers={"location": f"http://{DUCKDUCKGO}/"})
+        self.exclusions.add(DUCKDUCKGO)
+        result = await self.fetcher.fetch(start)
+        self.assertEqual(result.error, "redirect_excluded")
+        self.assertEqual(len(self.requests), 1)
 
     async def test_relative_redirect_is_normalized(self):
         start = f"http://{AHMIA}/a/b"

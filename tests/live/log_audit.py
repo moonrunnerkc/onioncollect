@@ -14,7 +14,7 @@ HOST = r"[a-z2-7]{56}\.onion"
 PREFIX = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} (\w+) (\S+): (.*)$")
 SHAPES = {
     "fetched": re.compile(rf"{HOST} status=\d{{3}} bytes=\d+ links=\d+ onions=\d+ changed=(yes|no)( gated)? elapsed=\d+\.\ds"),
-    "failed": re.compile(rf"{HOST} error=(timeout|tor_unreachable|redirect_offsite|not_text|not_onion|other:\w+) elapsed=\d+\.\ds"),
+    "failed": re.compile(rf"{HOST} error=(timeout|tor_unreachable|redirect_offsite|redirect_excluded|not_text|not_onion|other:\w+) elapsed=\d+\.\ds"),
     "excluded": re.compile(rf"{HOST} excluded: (listed|child_exploitation|credential_dump|card_number)"),
     "dead": re.compile(rf"{HOST} marked dead"),
     "lifecycle": re.compile(r"crawler: (\d+ workers on \d+ tor instances|stopping, letting in-flight fetches finish|stopped)"),

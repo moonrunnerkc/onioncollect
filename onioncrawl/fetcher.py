@@ -7,7 +7,7 @@ import httpx
 from httpx_socks import AsyncProxyTransport
 from python_socks import ProxyConnectionError, ProxyError, ProxyTimeoutError, parse_proxy_url
 
-from onioncrawl import onion
+from onioncrawl import onion, safety
 from onioncrawl.config import Settings
 from onioncrawl.tor_pool import TorInstance
 
@@ -31,8 +31,9 @@ class FetchResult:
 
 
 class Fetcher:
-    def __init__(self, settings: Settings, tor: TorInstance):
+    def __init__(self, settings: Settings, tor: TorInstance, exclusions: set[str]):
         self.tor = tor
+        self.exclusions = exclusions
         self.max_body_bytes = settings.max_body_bytes
         self.timeout = httpx.Timeout(settings.request_timeout, connect=CONNECT_TIMEOUT)
         self.headers = {
@@ -99,6 +100,9 @@ class Fetcher:
                         target = onion.normalize(urljoin(current, response.headers.get("location", "")))
                         if target is None:
                             result.error = "redirect_offsite"
+                            return
+                        if safety.is_excluded(onion.host_of(target), self.exclusions):
+                            result.error = "redirect_excluded"
                             return
                         current = target
                         continue

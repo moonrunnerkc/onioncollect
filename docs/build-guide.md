@@ -313,7 +313,7 @@ One class, `Fetcher`, one per worker, bound to one `TorInstance`. Every anonymit
 
 ### class Fetcher
 
-Constructor takes the `Settings` and a `TorInstance`. Builds the fixed header dict once:
+Constructor takes the `Settings`, a `TorInstance`, and the crawler's live exclusion set (the listed hosts plus every host excluded since, shared by reference so a host excluded on one worker is seen by all). Builds the fixed header dict once:
 
 ```python
 HEADERS = {
@@ -356,7 +356,7 @@ Steps, in order:
 
 1. `host = onion.host_of(url)`. Check `onion.is_v3_onion(host)`; if it fails, return `error="not_onion"` without creating a client or sending anything. This is a belt-and-braces check; the frontier should never hand over a bad host, but the fetcher doesn't trust it.
 2. Get the client for the host. Send `GET` with `stream=True` so the body is read under control.
-3. If the status is 301, 302, 303, 307, or 308: read `Location`, resolve it against the current URL, run it through `onion.normalize`. If it comes back None (clearnet, bad host, bad scheme), return a result with `error="redirect_offsite"` and stop. Otherwise loop, at most 3 hops, with the new URL and possibly a new host (which means a new client and a new circuit). A fourth redirect ends the fetch with `error="other:TooManyRedirects"`.
+3. If the status is 301, 302, 303, 307, or 308: read `Location`, resolve it against the current URL, run it through `onion.normalize`. If it comes back None (clearnet, bad host, bad scheme), return a result with `error="redirect_offsite"` and stop. If the new host is in the exclusion set, return `error="redirect_excluded"` and stop, before any connection to it. Otherwise loop, at most 3 hops, with the new URL and possibly a new host (which means a new client and a new circuit). A fourth redirect ends the fetch with `error="other:TooManyRedirects"`.
 4. Check `Content-Type`. If it does not start with `text/html`, `application/xhtml`, or `text/plain`, close the response and return `error="not_text"`. No images, PDFs, archives, or binaries are ever read into memory.
 5. Read the body in chunks via `aiter_bytes()`, stopping at `max_body_bytes`. If the cap is hit, keep what you have and mark `truncated=True`; a truncated page still yields links.
 6. Clear the client's cookie jar: `client.cookies.clear()`. Do it in a `finally` so it happens even on error.
@@ -439,7 +439,7 @@ Pure decision functions. Given what just happened to a URL or host, when should 
 **`next_due_for_failure(task, error: str, settings, now) -> datetime | None`** and **`retry_cost(error) -> int`**
 
 - `timeout` or `tor_unreachable`: `now + 2^retries minutes`, counting this failure (2, 4, 8 as far as `max_retries` allows; at the default of 3 the third failure parks). Returns None once `retries` would reach `max_retries`. Onion services flap constantly; a timeout at 14:00 says little about 14:10.
-- `redirect_offsite`, `not_text`, `not_onion`: None, meaning park the URL permanently. Nothing will change.
+- `redirect_offsite`, `redirect_excluded`, `not_text`, `not_onion`: None, meaning park the URL permanently. Nothing will change.
 - `other:*`: same backoff as timeout but counted double toward `max_retries` (`retry_cost` returns 2), since it's usually a malformed response that will repeat.
 
 **`host_is_dead(failures: list[datetime], settings) -> bool`**
@@ -489,7 +489,7 @@ Claiming one at a time (not a batch) keeps the lease window tight and lets 18 wo
 **`handle_success(task, result)`**
 
 1. `info = parser.parse(result.final_url, result.status, result.body, result.headers)`.
-2. Safety: if `task.host` or the host of `final_url` is in the exclusion list, or `safety.body_triggers_exclusion` names a category, save nothing. Add the host to the in-memory exclusion set, `await frontier.exclude(task, info)`, log only the host and the category, and stop. Nothing between this check and `store.save` may await, so a page from a host that another worker just excluded is never stored.
+2. Safety. If the fetch was redirected and the host of `final_url` is now in the exclusion set (another worker excluded it while the body was being read, after the fetcher's hop check passed), treat it as `redirect_excluded`: hand it to `handle_failure`, save nothing, and leave the origin host alone. A redirect onto an excluded host does not condemn the origin; a seized site, a parked address, or a deliberate trick could all produce one. Otherwise, if `task.host` is in the exclusion set or `safety.body_triggers_exclusion` names a category, save nothing. Add the host to the in-memory exclusion set, `await frontier.exclude(task, info)`, log only the host and the category, and stop. Nothing between this check and `store.save` may await, so a page from a host that another worker just excluded is never stored.
 3. If `info.gated`: the body is not stored; `complete` marks the host `gated`, records the URL as done with the weekly `next_due` from the scheduler, and skips link extraction. Links on a captcha page are the captcha vendor's, not the site's.
 4. `changed = info.sha256 != task.last_hash`.
 5. `store.save(info.sha256, result.body)`, skipped for a gated page.

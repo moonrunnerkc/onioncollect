@@ -48,7 +48,7 @@ class Crawler:
         log.info("crawler: stopped")
 
     async def worker(self, worker_id: int) -> None:
-        fetcher = Fetcher(self.settings, self.tor_pool.assign(worker_id))
+        fetcher = Fetcher(self.settings, self.tor_pool.assign(worker_id), self.exclusions)
         try:
             while not self.stopping.is_set():
                 tasks = await self.frontier.claim(1)
@@ -60,7 +60,7 @@ class Crawler:
                 if result.error:
                     await self.handle_failure(task, result, fetcher)
                 else:
-                    await self.handle_success(task, result)
+                    await self.handle_success(task, result, fetcher)
                 await self.pause(random.uniform(*self.settings.jitter_seconds))
         except Exception as exc:
             # Only the exception's type: its message can carry a URL. The claimed lease expires and is retried.
@@ -73,12 +73,17 @@ class Crawler:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self.stopping.wait(), seconds)
 
-    async def handle_success(self, task: Task, result: FetchResult) -> None:
+    async def handle_success(self, task: Task, result: FetchResult, fetcher: Fetcher) -> None:
         info = parser.parse(result.final_url, result.status, result.body, result.headers)
         final_host = onion.host_of(result.final_url)
         # Nothing below may await before store.save: a body that trips the filter on another worker adds
         # its host to self.exclusions synchronously, so this check always sees it.
-        if safety.is_excluded(task.host, self.exclusions) or safety.is_excluded(final_host, self.exclusions):
+        if final_host != task.host and safety.is_excluded(final_host, self.exclusions):
+            # Excluded after the fetcher's hop check: the fetcher's verdict, and the origin is not condemned.
+            result.error = "redirect_excluded"
+            await self.handle_failure(task, result, fetcher)
+            return
+        if safety.is_excluded(task.host, self.exclusions):
             category = "listed"
         else:
             category = safety.body_triggers_exclusion(
