@@ -230,7 +230,7 @@ Just the lowercase hostname, used as the SOCKS username and the per-host key eve
 
 **`find_onions_in_text(text: str) -> set[str]`**
 
-Regex `[a-z2-7]{56}\.onion` over the raw page text, then filter through `is_v3_onion`. This catches the majority of darknet links, which are pasted as plain text in forum posts, link lists, and "mirrors" pages rather than wrapped in anchor tags. Each hit becomes `http://<host>/` in the frontier at the current depth plus one.
+Every 56-character `[a-z2-7]` label followed by `.onion` in the raw page text, filtered through `is_v3_onion`. The code finds each `.onion` and checks the 56 characters before it rather than running `[a-z2-7]{56}\.onion` as a regex: on a hostile 2 MB run of letters the regex tries a 56-character match at every position, about 400 ms in one C call that holds the GIL. This catches the majority of darknet links, which are pasted as plain text in forum posts, link lists, and "mirrors" pages rather than wrapped in anchor tags. Each hit becomes `http://<host>/` in the frontier at the current depth plus one.
 
 ## 7. tor_pool.py
 
@@ -488,7 +488,7 @@ Claiming one at a time (not a batch) keeps the lease window tight and lets 18 wo
 
 **`handle_success(task, result)`**
 
-1. `info = parser.parse(result.final_url, result.status, result.body, result.headers)`.
+1. `info, category = await asyncio.to_thread(inspect, result, settings.safety_patterns)`, where `inspect` runs `parser.parse(result.final_url, result.status, result.body, result.headers)` and `safety.body_triggers_exclusion` on the decoded body. Both are pure and share nothing, so a thread is safe.
 2. Safety. If the fetch was redirected and the host of `final_url` is now in the exclusion set (another worker excluded it while the body was being read, after the fetcher's hop check passed), treat it as `redirect_excluded`: hand it to `handle_failure`, save nothing, and leave the origin host alone. A redirect onto an excluded host does not condemn the origin; a seized site, a parked address, or a deliberate trick could all produce one. Otherwise, if `task.host` is in the exclusion set or `safety.body_triggers_exclusion` names a category, save nothing. Add the host to the in-memory exclusion set, `await frontier.exclude(task, info)`, log only the host and the category, and stop. Nothing between this check and `store.save` may await, so a page from a host that another worker just excluded is never stored.
 3. If `info.gated`: the body is not stored; `complete` marks the host `gated`, records the URL as done with the weekly `next_due` from the scheduler, and skips link extraction. Links on a captcha page are the captcha vendor's, not the site's.
 4. `changed = info.sha256 != task.last_hash`.
@@ -507,7 +507,9 @@ Claiming one at a time (not a batch) keeps the lease window tight and lets 18 wo
 
 Every 5 minutes: `frontier.release_stale_leases()`. Every hour: for each `dead` or `gated` host where `scheduler.retest_due` is True, re-queue its root. Once a day: `VACUUM` is not needed with WAL, but run `PRAGMA wal_checkpoint(TRUNCATE)` so the WAL file doesn't grow unbounded.
 
-A note on concurrency: all 18 workers share one event loop, one database connection, and one process. There are no threads and no multiprocessing. Python handles this load easily because every worker spends 99% of its time waiting on Tor.
+A note on concurrency: all 18 workers share one event loop, one database connection, and one process. There is no multiprocessing. Python handles this load easily because every worker spends 99% of its time waiting on Tor.
+
+One departure from a single thread, made at step 9: parsing and the body check run in `asyncio.to_thread`. On a hostile 2 MB body (a long run of letters, thousands of card-shaped numbers, a run of `a@b.cc:`) they took up to 1.8 s with the first pattern list, and at 18 workers that stalls every fetch on the loop. The thread alone is not enough. CPython hands the GIL over between C calls, not inside one, so the loop still waits out the longest single regex scan or lexbor parse. Two fixes keep those calls short: `find_onions_in_text` looks back from each `.onion` instead of trying a 56-character match at every position, and each pattern that opens with a character run starts with a lookbehind and uses possessive quantifiers. With both, the longest loop stall on any hostile body measured is about 60 ms. `tests/live/pattern_timing.py` reruns the measurement for any pattern file (`python -m tests.live.pattern_timing <file>`) and fails above 100 ms. The exclusion-set check and `store.save` stay on the loop, after the thread returns, with no await between them.
 
 ## 14. cli.py
 

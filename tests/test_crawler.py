@@ -1,9 +1,12 @@
+import asyncio
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
+from onioncrawl import crawler as crawler_module
 from onioncrawl.config import Settings
 from onioncrawl.crawler import Crawler
 from onioncrawl.db import stamp
@@ -100,6 +103,43 @@ class CrawlerTest(unittest.IsolatedAsyncioTestCase):
         await self.crawler.handle_success(second, ok(second.url), FETCHER)
         self.assertEqual(self.stored_files(), [])
         self.assertEqual(await self.rows("SELECT state FROM hosts WHERE host = ?", AHMIA), [("excluded",)])
+
+    async def test_host_excluded_while_the_body_is_inspected_is_not_saved(self):
+        task = await self.claim(f"http://{AHMIA}/")
+        real_inspect = crawler_module.inspect
+
+        def inspect_while_another_worker_excludes(result, patterns):
+            self.crawler.exclusions.add(AHMIA)
+            return real_inspect(result, patterns)
+
+        with mock.patch.object(crawler_module, "inspect", inspect_while_another_worker_excludes):
+            await self.crawler.handle_success(task, ok(task.url), FETCHER)
+        self.assertEqual(self.stored_files(), [])
+        self.assertEqual(await self.status_of(task.url), "parked")
+
+    async def test_hostile_body_does_not_stall_the_loop(self):
+        task = await self.claim(f"http://{AHMIA}/")
+        body = b" ".join(b"word%d" % n for n in range(200_000))
+        # The test runner's debug mode logs every slow step, which is itself slow enough to blur the measure.
+        asyncio.get_running_loop().set_debug(False)
+        gaps, done = [], asyncio.Event()
+
+        async def ticker():
+            last = time.perf_counter()
+            while not done.is_set():
+                await asyncio.sleep(0.001)
+                now = time.perf_counter()
+                gaps.append(now - last)
+                last = now
+
+        ticking = asyncio.create_task(ticker())
+        await asyncio.sleep(0.01)
+        started = time.perf_counter()
+        await self.crawler.handle_success(task, ok(task.url, body), FETCHER)
+        took = time.perf_counter() - started
+        done.set()
+        await ticking
+        self.assertLess(max(gaps), took / 2)
 
     async def test_redirect_onto_an_excluded_host_parks_the_url_and_spares_the_origin(self):
         task = await self.claim(f"http://{AHMIA}/go")

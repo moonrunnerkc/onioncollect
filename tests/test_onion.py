@@ -152,6 +152,16 @@ class FindOnionsInTextTest(unittest.TestCase):
     def test_subdomain_yields_service_host(self):
         self.assertEqual(find_onions_in_text(f"http://www.{AHMIA}/"), {AHMIA})
 
+    def test_address_glued_to_preceding_letters_is_still_found(self):
+        self.assertEqual(find_onions_in_text(f"mirror:abc{AHMIA}"), {AHMIA})
+
+    def test_non_ascii_lookalike_is_rejected(self):
+        k = AHMIA.index("k")
+        self.assertEqual(find_onions_in_text(AHMIA[:k] + "\u212a" + AHMIA[k + 1:]), set())
+
+    def test_suffix_without_a_full_label(self):
+        self.assertEqual(find_onions_in_text(".onion abc.onion " + "a" * 100), set())
+
     def test_nothing_found(self):
         self.assertEqual(find_onions_in_text("plain text with example.com and no onions"), set())
 

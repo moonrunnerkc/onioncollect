@@ -2,12 +2,13 @@ import asyncio
 import contextlib
 import logging
 import random
+import re
 import signal
 from datetime import UTC, datetime
 
 from onioncrawl import onion, parser, safety, scheduler
 from onioncrawl.config import Settings
-from onioncrawl.db import Frontier, Task
+from onioncrawl.db import Frontier, PageInfo, Task
 from onioncrawl.fetcher import Fetcher, FetchResult
 from onioncrawl.storage import PageStore
 from onioncrawl.tor_pool import TorPool
@@ -15,6 +16,11 @@ from onioncrawl.tor_pool import TorPool
 log = logging.getLogger(__name__)
 
 IDLE_SLEEP = 5.0
+
+
+def inspect(result: FetchResult, patterns: tuple[re.Pattern, ...]) -> tuple[PageInfo, str | None]:
+    info = parser.parse(result.final_url, result.status, result.body, result.headers)
+    return info, safety.body_triggers_exclusion(result.body.decode("utf-8", errors="replace"), patterns)
 
 
 class Crawler:
@@ -74,7 +80,9 @@ class Crawler:
             await asyncio.wait_for(self.stopping.wait(), seconds)
 
     async def handle_success(self, task: Task, result: FetchResult, fetcher: Fetcher) -> None:
-        info = parser.parse(result.final_url, result.status, result.body, result.headers)
+        # Parsing and the body check are pure and can take a few hundred milliseconds on a hostile 2 MB body,
+        # so they run in a thread; the GIL changes hands between their C calls and other fetches keep moving.
+        info, category = await asyncio.to_thread(inspect, result, self.settings.safety_patterns)
         final_host = onion.host_of(result.final_url)
         # Nothing below may await before store.save: a body that trips the filter on another worker adds
         # its host to self.exclusions synchronously, so this check always sees it.
@@ -85,10 +93,6 @@ class Crawler:
             return
         if safety.is_excluded(task.host, self.exclusions):
             category = "listed"
-        else:
-            category = safety.body_triggers_exclusion(
-                result.body.decode("utf-8", errors="replace"), self.settings.safety_patterns
-            )
         if category:
             self.exclusions.add(task.host)
             await self.frontier.exclude(task, info)
