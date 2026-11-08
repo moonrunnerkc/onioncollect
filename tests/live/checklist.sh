@@ -22,7 +22,7 @@ crawler_has_no_sudo() {
         sudo -l -U crawler | grep -q "not allowed"
 }
 
-data_dir_locked() { [ "$(stat -c '%U %a' /home/crawler/data)" = "crawler 700" ]; }
+data_dir_locked() { [ "$(stat -c '%U %a' /home/analyst/data)" = "analyst 700" ]; }
 
 tor_instances_hardened() {
     for n in 1 2 3 4 5 6; do
@@ -93,7 +93,7 @@ only_tor_leaves_the_box() { ! ss -tnpH state established | grep -v '127.0.0.1' |
 
 check "dedicated VM" is_vm
 check "crawler has no sudo" crawler_has_no_sudo
-check "crawler owns data/ with mode 700" data_dir_locked
+check "analyst owns data/ with mode 700" data_dir_locked
 check "six tor@crawlN running: ClientOnly, SafeLogging, IsolateSOCKSAuth, SOCKS on loopback only" tor_instances_hardened
 check "control password file mode 600, owned by crawler, outside any repo" password_file_locked
 check "iptables OUTPUT: lo, SSH replies, six Tor UIDs, DROP; ip6tables OUTPUT policy DROP" kill_switch_live

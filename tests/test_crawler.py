@@ -17,6 +17,7 @@ from onioncollect.records import RefusedWrite
 from tests.fixtures import (CANDIDATE, DECLINED, NEWS, NEWS_CONFIG, NEWS_MIRROR, OFF_SOURCE, detail_page, headlines,
                             listing_page, make_live, throwaway_settings)
 from tests.test_onion import AHMIA, DUCKDUCKGO
+from tests.writer_harness import start_writer
 
 # Synthetic credentials. Each plaintext below must never be found anywhere under the data directory.
 PLAINTEXT = ("SynthPassw0rd!", "bob.synthetic@example.org", "4111 1111 1111 1111")
@@ -56,29 +57,38 @@ class CrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         (self.root / "configs").mkdir()
         (self.root / "data").mkdir()
         (self.root / "configs" / "news.toml").write_text(NEWS_CONFIG)
+        self.harness = await start_writer(self.root / "data", self.root / "configs")
+        self.stores = self.harness.stores
         self.settings = throwaway_settings(data_dir=self.root / "data", configs_dir=self.root / "configs",
+                                           state_dir=self.root / "state", writer_socket=self.harness.socket,
                                            tor_instances=((10051, 11051),), max_retries=1)
         self.crawler = Crawler(self.settings)
         await self.crawler.open()
-        await make_live(self.crawler.sources)
+        await make_live(self.stores.sources)
 
     async def asyncTearDown(self):
         await self.crawler.close()
+        await self.harness.stop()
         self.tmp.cleanup()
+
+    async def claim(self):
+        return await self.crawler.frontier.claim(1, await self.crawler.writer.collecting())
 
     async def crawl(self, pages, hosts=None) -> ScriptedFetcher:
         """One scheduler pass, then workers until nothing is claimable."""
         fetcher = ScriptedFetcher(pages, hosts)
         await self.crawler.start_due_runs()
-        while tasks := await self.crawler.frontier.claim(1):
+        while tasks := await self.claim():
             await self.crawler.handle(tasks[0], fetcher)
         return fetcher
 
     async def rows(self, sql: str, *params):
-        return await self.crawler.collect.rows(sql, params)
+        # The frontier is the crawler's own database; everything else is the writer's.
+        database = self.crawler.queue if " urls" in sql else self.stores.collect
+        return await database.rows(sql, params)
 
     async def records(self):
-        return await self.crawler.records.db.rows("SELECT * FROM records ORDER BY id")
+        return await self.stores.records.db.rows("SELECT * FROM records ORDER BY id")
 
     def everything_on_disk(self) -> bytes:
         return b"".join(path.read_bytes() for path in self.root.rglob("*") if path.is_file())
@@ -89,7 +99,7 @@ class ApprovalGateTest(CrawlerTestCase):
 
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        table = self.crawler.sources
+        table = self.stores.sources
         await table.change_state("news", lifecycle.DISABLED, "reviewer pulled it")
         await table.approve(AHMIA, "directory", "directories", "listing index", "tester", frozenset())
         await table.add_candidates({CANDIDATE, DECLINED}, None)
@@ -110,7 +120,7 @@ class ApprovalGateTest(CrawlerTestCase):
         built = []
         configs = {"news": mock.Mock(hosts=(NEWS,), scheme="http"), "directory": mock.Mock(hosts=(AHMIA,), scheme="http")}
         with mock.patch.object(fetcher_module, "AsyncProxyTransport", side_effect=lambda **kw: built.append(kw)):
-            fetcher = Fetcher(self.settings, mock.Mock(), self.crawler.sources, configs, lifecycle.COLLECTING)
+            fetcher = Fetcher(self.settings, mock.Mock(), self.crawler.writer, configs, lifecycle.COLLECTING)
             for source_id in ("news", "directory", CANDIDATE, DECLINED, "nothing-here"):
                 result = await fetcher.fetch(source_id, "/")
                 self.assertEqual(result.error, "not_approved", source_id)
@@ -121,11 +131,11 @@ class FrontierContainmentTest(CrawlerTestCase):
     """Section 17, test 2: off-source onion links become candidates and reach no frontier."""
 
     async def test_off_source_links_land_in_the_candidate_table_only(self):
-        await self.crawler.sources.approve(DUCKDUCKGO, "search", "privacy-services", "search", "tester", frozenset())
+        await self.stores.sources.approve(DUCKDUCKGO, "search", "privacy-services", "search", "tester", frozenset())
         links = "".join(f"<a href='http://{host}/x'>x</a>" for host in (AHMIA, OFF_SOURCE, DUCKDUCKGO))
         page = listing_page("A", "B", extra=links + f"<p>mirror at {CANDIDATE}</p>")
         await self.crawl({"/articles/": page, "/articles/1": detail_page("one"), "/articles/2": detail_page("two")})
-        candidates = await self.crawler.sources.hosts(lifecycle.CANDIDATE)
+        candidates = await self.stores.sources.hosts(lifecycle.CANDIDATE)
         self.assertEqual({row["host"] for row in candidates}, {AHMIA, OFF_SOURCE, CANDIDATE})
         self.assertEqual({row["found_on"] for row in candidates}, {"news"})
         queued = await self.rows("SELECT source_id, path FROM urls ORDER BY path")
@@ -137,10 +147,10 @@ class FrontierContainmentTest(CrawlerTestCase):
                             redirect_to=f"http://{OFF_SOURCE}/articles/")
         fetcher = await self.crawl({"/articles/": moved})
         self.assertEqual(fetcher.calls, [("news", "/articles/")])
-        self.assertEqual([row["host"] for row in await self.crawler.sources.hosts(lifecycle.CANDIDATE)], [OFF_SOURCE])
+        self.assertEqual([row["host"] for row in await self.stores.sources.hosts(lifecycle.CANDIDATE)], [OFF_SOURCE])
         (status,), = await self.rows("SELECT status FROM urls WHERE path = '/articles/'")
         self.assertEqual(status, "failed")
-        self.assertEqual(await self.crawler.sources.redirected_from([OFF_SOURCE]), {OFF_SOURCE: ["news"]})
+        self.assertEqual(await self.stores.sources.redirected_from([OFF_SOURCE]), {OFF_SOURCE: ["news"]})
 
     async def test_redirect_within_the_source_is_queued_as_its_own_fetch(self):
         (self.root / "configs" / "news.toml").write_text(NEWS_CONFIG.replace('["/articles/"]', '["/articles"]'))
@@ -158,8 +168,8 @@ class RedactionGateTest(CrawlerTestCase):
 
     async def test_synthetic_credentials_are_redacted_everywhere_on_disk(self):
         # An item already at the most the shortfall formula gives, on a heavier category, to rank against.
-        await self.crawler.sources.approve(AHMIA, "directory", "directories", "listing index", "tester", frozenset())
-        await self.crawler.health.raise_item("directory", health.Finding(health.UNREACHABLE, 100, "down"), None)
+        await self.stores.sources.approve(AHMIA, "directory", "directories", "listing index", "tester", frozenset())
+        await self.stores.health.raise_item("directory", health.Finding(health.UNREACHABLE, 100, "down"), None)
         with self.assertLogs("onioncollect.crawler", logging.INFO) as logs:
             await self.crawl({"/articles/": listing_page("A " + LEAKY, "B", extra=LEAKY),
                               "/articles/1": detail_page(LEAKY), "/articles/2": detail_page("two")})
@@ -173,20 +183,20 @@ class RedactionGateTest(CrawlerTestCase):
             self.assertNotIn(secret.encode(), disk, secret)
         (events,), = await self.rows("SELECT redactions FROM runs")
         self.assertGreater(events, 0)
-        top, *rest = await self.crawler.health.queue()
+        top, *rest = await self.stores.health.queue()
         self.assertEqual((top["source_id"], top["kind"], top["priority"]), ("news", health.REDACTION, health.REDACTION_PRIORITY))
         self.assertTrue(all(item["priority"] < top["priority"] for item in rest))
-        self.assertEqual((await self.crawler.sources.get("news"))["state"], lifecycle.DEGRADED)
+        self.assertEqual((await self.stores.sources.get("news"))["state"], lifecycle.DEGRADED)
         self.assertFalse(any("WARNING" in line for line in logs.output), "the item replaced the warning line")
         for secret in PLAINTEXT:
             self.assertNotIn(secret, "\n".join(logs.output))
 
     async def test_refused_write_is_logged_without_the_record_and_raised(self):
-        with mock.patch.object(self.crawler.records, "add", side_effect=RefusedWrite("x")):
+        with mock.patch.object(self.stores.records, "add", side_effect=RefusedWrite("x")):
             with self.assertLogs("onioncollect.crawler", logging.WARNING) as logs:
                 await self.crawl({"/articles/": listing_page("A", "B")})
         self.assertIn("news write refused", "\n".join(logs.output))
-        (item,) = [item for item in await self.crawler.health.queue() if item["kind"] == health.REDACTION]
+        (item,) = [item for item in await self.stores.health.queue() if item["kind"] == health.REDACTION]
         self.assertEqual(item["detail"], "write refused: a secret survived")
 
 
@@ -207,16 +217,16 @@ class CollectionTest(CrawlerTestCase):
         run, = await self.rows("SELECT * FROM runs")
         self.assertIsNotNone(run["finished_at"])
         self.assertEqual((run["pages"], run["failures"], run["below_expectation"]), (5, 0, 0))
-        source = await self.crawler.sources.get("news")
+        source = await self.stores.sources.get("news")
         self.assertGreater(source["next_run"], run["finished_at"])
-        kinds = await self.crawler.records.db.rows("SELECT kind, COUNT(*) FROM snapshots GROUP BY kind ORDER BY kind")
+        kinds = await self.stores.records.db.rows("SELECT kind, COUNT(*) FROM snapshots GROUP BY kind ORDER BY kind")
         self.assertEqual([tuple(row) for row in kinds], [(DETAIL, 1), (LISTING, 3)])
 
     async def test_second_run_refreshes_records_and_skips_known_details(self):
         pages = {"/articles/": listing_page("A", "B"), "/articles/1": detail_page("one"), "/articles/2": detail_page("two")}
         await self.crawl(pages)
-        await self.crawler.collect.conn.execute("UPDATE sources SET next_run = NULL")
-        await self.crawler.collect.conn.commit()
+        await self.stores.collect.conn.execute("UPDATE sources SET next_run = NULL")
+        await self.stores.collect.conn.commit()
         fetcher = await self.crawl(pages)
         self.assertEqual(fetcher.calls, [("news", "/articles/")])
         self.assertEqual(len(await self.records()), 2)
@@ -233,21 +243,21 @@ class CollectionTest(CrawlerTestCase):
         run, = await self.rows("SELECT pages, failures, finished_at FROM runs")
         self.assertEqual((run["pages"], run["failures"]), (0, 1))
         self.assertIsNotNone(run["finished_at"])
-        self.assertEqual((await self.crawler.sources.get("news"))["failed_runs"], 1)
+        self.assertEqual((await self.stores.sources.get("news"))["failed_runs"], 1)
 
     async def test_body_tripping_the_safety_check_disables_the_source_and_stores_nothing(self):
         with self.assertLogs("onioncollect.crawler", logging.WARNING):
             await self.crawl({"/articles/": listing_page("A forbiddenterm", "B")})
-        source = await self.crawler.sources.get("news")
+        source = await self.stores.sources.get("news")
         self.assertEqual((source["state"], source["reason"]), ("disabled", "safety: child_exploitation"))
-        self.assertEqual(await self.crawler.records.counts(), {"records": 0, "snapshots": 0})
+        self.assertEqual(await self.stores.records.counts(), {"records": 0, "snapshots": 0})
         (open_runs,), = await self.rows("SELECT COUNT(*) FROM runs WHERE finished_at IS NULL")
         self.assertEqual(open_runs, 0)
 
     async def test_gated_page_stores_nothing(self):
         gate = b"<html><head><title>Checking your browser</title></head><body>wait</body></html>"
         await self.crawl({"/articles/": gate})
-        self.assertEqual(await self.crawler.records.counts(), {"records": 0, "snapshots": 0})
+        self.assertEqual(await self.stores.records.counts(), {"records": 0, "snapshots": 0})
         (error,), = await self.rows("SELECT error FROM page_metrics")
         self.assertEqual(error, "gated")
 
@@ -280,7 +290,7 @@ class CollectionTest(CrawlerTestCase):
 
     async def test_hostile_body_does_not_stall_the_loop(self):
         await self.crawler.start_due_runs()
-        (task,) = await self.crawler.frontier.claim(1)
+        (task,) = await self.claim()
         fetcher = ScriptedFetcher({"/articles/": b"<p>" + b"a" * 1_999_000 + b"</p>"})
         # The test runner's debug mode logs every slow step, which is itself slow enough to blur the measure.
         asyncio.get_running_loop().set_debug(False)
@@ -308,27 +318,27 @@ class HealthTest(CrawlerTestCase):
     """Section 13's entry rules, raised as runs finish."""
 
     async def again(self, pages):
-        await self.crawler.collect.conn.execute("UPDATE sources SET next_run = NULL")
-        await self.crawler.collect.conn.commit()
+        await self.stores.collect.conn.execute("UPDATE sources SET next_run = NULL")
+        await self.stores.collect.conn.commit()
         return await self.crawl(pages)
 
     async def items(self):
-        return [(item["kind"], item["priority"]) for item in await self.crawler.health.queue()]
+        return [(item["kind"], item["priority"]) for item in await self.stores.health.queue()]
 
     async def test_a_thin_run_raises_by_how_far_below_and_degrades_the_source(self):
         await self.crawl({"/articles/": listing_page("only one"), "/articles/1": detail_page("x")})
         self.assertEqual(await self.items(), [(health.BELOW_EXPECTATION, 50)])
-        self.assertEqual((await self.crawler.sources.get("news"))["state"], lifecycle.DEGRADED)
+        self.assertEqual((await self.stores.sources.get("news"))["state"], lifecycle.DEGRADED)
         fetcher = await self.again({"/articles/": listing_page("only one")})
         self.assertEqual(fetcher.calls, [("news", "/articles/")], "a degraded source still collects")
-        (item,) = await self.crawler.health.queue()
+        (item,) = await self.stores.health.queue()
         self.assertEqual(item["occurrences"], 2)
 
     async def test_a_required_field_lost_across_the_run(self):
         page = b"<html><body>" + b"<article><time datetime='2026-11-07'>x</time></article>" * 3 + b"</body></html>"
         await self.crawl({"/articles/": page})
         self.assertEqual(await self.items(), [(health.REQUIRED_FIELD_LOST, 100)])
-        (item,) = await self.crawler.health.queue()
+        (item,) = await self.stores.health.queue()
         self.assertEqual(item["detail"], "title, url resolved on none of 3 items")
 
     async def test_per_field_hits_are_kept_per_run(self):
@@ -343,7 +353,7 @@ class HealthTest(CrawlerTestCase):
             await self.again({})
             raised = await self.items()
             self.assertEqual(raised, [] if run <= scheduler.QUICK_RETRY_RUNS else [(health.UNREACHABLE, 100)], run)
-        (item,) = await self.crawler.health.queue()
+        (item,) = await self.stores.health.queue()
         self.assertEqual(item["detail"], "nothing fetched in 4 runs in a row, last error timeout")
 
     async def test_a_body_over_the_tag_cap_is_never_parsed(self):
@@ -360,8 +370,8 @@ class HealthTest(CrawlerTestCase):
         self.assertEqual(fetcher.calls, [("news", "/articles/")], "a refusal is not retried")
         (error,), = await self.rows("SELECT error FROM page_metrics")
         self.assertEqual(error, "parse_refused")
-        self.assertEqual(await self.crawler.records.counts(), {"records": 0, "snapshots": 0})
-        self.assertEqual(await self.crawler.records.seed_fingerprints(), {})
+        self.assertEqual(await self.stores.records.counts(), {"records": 0, "snapshots": 0})
+        self.assertEqual(await self.stores.records.seed_fingerprints(), {})
         self.assertEqual(await self.items(), [(health.PARSE_REFUSED, 100)])
 
     async def test_a_disabled_source_raises_nothing_more(self):
@@ -375,7 +385,7 @@ class MirrorClusterTest(CrawlerTestCase):
 
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        await make_live(self.crawler.sources, "paper", NEWS_MIRROR)
+        await make_live(self.stores.sources, "paper", NEWS_MIRROR)
         (self.root / "configs" / "paper.toml").write_text(
             NEWS_CONFIG.replace('id = "news"', 'id = "paper"').replace(NEWS, NEWS_MIRROR))
         self.pages = {"/articles/": listing_page(*headlines("monday")),
@@ -383,34 +393,34 @@ class MirrorClusterTest(CrawlerTestCase):
 
     async def test_fingerprints_are_stored_per_host_and_path_with_the_seed_marked(self):
         await self.crawl(self.pages, {"paper": NEWS_MIRROR})
-        rows = await self.crawler.records.db.rows("SELECT host, path, seed FROM fingerprints ORDER BY host, path")
+        rows = await self.stores.records.db.rows("SELECT host, path, seed FROM fingerprints ORDER BY host, path")
         self.assertEqual({(row["host"], row["path"]) for row in rows if row["seed"]}, {(NEWS, "/articles/"),
                                                                                        (NEWS_MIRROR, "/articles/")})
         self.assertEqual(len(rows), 12)
 
     async def test_records_dedupe_across_the_cluster_from_the_first_run(self):
         await self.crawl(self.pages, {"paper": NEWS_MIRROR})
-        self.assertEqual(await self.crawler.sources.cluster_of("news"), ("news", "paper"))
+        self.assertEqual(await self.stores.sources.cluster_of("news"), ("news", "paper"))
         records = await self.records()
         self.assertEqual(len(records), 5)
         self.assertTrue(all("body" in json.loads(row["fields"]) for row in records))
-        sightings = await self.crawler.records.db.rows("SELECT record_id, host, source_id FROM record_hosts")
+        sightings = await self.stores.records.db.rows("SELECT record_id, host, source_id FROM record_hosts")
         self.assertEqual(len(sightings), 10)
         self.assertEqual({(row["host"], row["source_id"]) for row in sightings}, {(NEWS, "news"), (NEWS_MIRROR, "paper")})
-        (found,) = await self.crawler.records.search('"monday story 3"', source="paper")
+        (found,) = await self.stores.records.search('"monday story 3"', source="paper")
         self.assertEqual(found["sources"], ["news", "paper"])
 
     async def only_due(self, source_id: str) -> None:
-        await self.crawler.collect.conn.execute(
+        await self.stores.collect.conn.execute(
             "UPDATE sources SET next_run = CASE WHEN id = ? THEN NULL ELSE '2999-01-01' END", (source_id,))
-        await self.crawler.collect.conn.commit()
+        await self.stores.collect.conn.commit()
 
     async def test_a_template_only_match_is_two_sources_with_their_own_rows(self):
         await self.only_due("news")
         await self.crawl(self.pages)
         await self.only_due("paper")
         await self.crawl(self.pages | {"/articles/": listing_page(*headlines("tuesday"))}, {"paper": NEWS_MIRROR})
-        self.assertEqual(await self.crawler.sources.cluster_of("paper"), ("paper",))
+        self.assertEqual(await self.stores.sources.cluster_of("paper"), ("paper",))
         self.assertEqual(len(await self.records()), 10)
         self.assertEqual({row["source_id"] for row in await self.records()}, {"news", "paper"})
 

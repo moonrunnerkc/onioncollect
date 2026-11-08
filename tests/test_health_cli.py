@@ -6,7 +6,7 @@ from onioncollect import golive, health, health_cli, lifecycle
 from onioncollect.config import Settings
 from onioncollect.health_queue import HealthQueue
 from tests.fixtures import CANDIDATE, NEWS, NEWS_CONFIG, NEWS_MIRROR, OFF_SOURCE, listing_page, make_live
-from tests.test_cli import CliTestCase
+from tests.test_cli import WriterCliTestCase
 from tests.test_golive import GOOD, ScriptedFetcher
 
 TWO_HOSTS = NEWS_CONFIG.replace(f'["{NEWS}"]', f'["{NEWS}", "{NEWS_MIRROR}"]')
@@ -16,7 +16,7 @@ def crawl_settings_loaded() -> list[bool]:
     return [call.kwargs["crawl"] for call in Settings.load.call_args_list]
 
 
-class HealthCliTestCase(CliTestCase):
+class HealthCliTestCase(WriterCliTestCase):
     def setUp(self):
         super().setUp()
         self.live_news()
@@ -140,8 +140,8 @@ class ResolveTest(HealthCliTestCase):
         self.assertEqual(self.state()["state"], lifecycle.LIVE)
 
     def test_a_checked_disposition_waits_for_a_running_crawl(self):
-        self.data.mkdir(exist_ok=True)
-        with open(self.data / "run.lock", "w") as held:
+        (self.root / "state").mkdir(exist_ok=True)
+        with open(self.root / "state" / "run.lock", "w") as held:
             fcntl.flock(held, fcntl.LOCK_EX)
             message = self.with_tor_refused(NEWS_MIRROR)
         self.assertIn("a crawl or go-live is running", message)

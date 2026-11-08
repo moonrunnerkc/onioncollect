@@ -42,3 +42,8 @@ def check_approval(source_id: str, category: str, note: str) -> None:
 def check_transition(current: str, target: str) -> None:
     if target not in TRANSITIONS.get(current, ()):
         raise ValueError(f"a source cannot go from {current} to {target}")
+
+
+# Section 3's retention clocks. Settings defaults to these, and so does the writer, which reads no settings file.
+RECORD_RETENTION_DAYS = 180
+SNAPSHOT_RETENTION_DAYS = 30

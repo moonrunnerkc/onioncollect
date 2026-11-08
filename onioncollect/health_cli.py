@@ -9,6 +9,7 @@ from onioncollect.source_config import ConfigError
 from onioncollect.sources import RefusedChange, SourceTable
 from onioncollect.stores import operator, reading, with_stores
 from onioncollect.tor_pool import TorPool
+from onioncollect.writer_client import Writer
 
 # These two prove themselves with go-live checks 1, 4 and 5, so they fetch, and need Tor and the run lock.
 CHECKED = (health.FIXED, health.MIRROR_SWAPPED)
@@ -100,8 +101,9 @@ def resolve_command(settings: Settings, args: argparse.Namespace) -> None:
         with_stores(settings, lambda table, store: decide(args, table))
         print(f"item {args.item}: {args.disposition}")
         return
+    # As the crawler, which fetches: everything it records goes through the writer.
     with crawl_cli.run_lock(settings):
-        report = with_stores(settings, lambda table, store: checked(settings, args, table, store))
+        report = crawl_cli.through_writer(lambda: checked(settings, args, Writer(settings.writer_socket)))
     for ok, line in report.lines:
         print(f"{'PASS' if ok else 'FAIL'}  {line}")
     if not report.passed:
@@ -121,35 +123,34 @@ async def decide(args: argparse.Namespace, table: SourceTable) -> None:
     await queue.close_source(item["source_id"], health.DISABLED, args.note, operator())
 
 
-async def checked(settings: Settings, args: argparse.Namespace, table: SourceTable, store: RecordStore) -> Report:
-    queue = HealthQueue(table.db, table)
-    item = await queue.open_item(args.item)
+async def checked(settings: Settings, args: argparse.Namespace, writer: Writer) -> Report:
+    item = await writer.open_item(args.item)
     source_id = item["source_id"]
     try:
         config = load_config(settings.configs_dir, source_id)
     except ConfigError as exc:
         raise RefusedChange(str(exc)) from None
-    source = await table.resolve(source_id)
+    source = await writer.resolve(source_id)
     host = (args.to or source.active_host).lower()
     if args.disposition == health.MIRROR_SWAPPED and host == source.active_host:
         raise RefusedChange(f"{host} is already {source_id}'s active host")
     if host not in source.hosts:
-        owner = (await table.members()).get(host)
+        owner = (await writer.members()).get(host)
         raise RefusedChange(f"{host} is not in {source_id}'s host set"
                             + (f"; it belongs to {owner}, so run sources merge first" if owner else ""))
     pool = TorPool(settings)
     try:
         await pool.start()
-        report = await recheck(source_id, host, config, settings, table, store, pool.instances)
+        report = await recheck(source_id, host, config, settings, writer, pool.instances)
     finally:
         pool.stop()
     if not report.passed:
-        await queue.refused(args.item, args.disposition, args.note, operator(), f"{host}: {report.failure}")
+        await writer.refuse_item(args.item, args.disposition, args.note, f"{host}: {report.failure}")
         return report
     if args.disposition == health.MIRROR_SWAPPED:
-        detail = f"active host {await table.set_active_host(source_id, host)} -> {host}"
+        detail = f"active host {await writer.set_active_host(source_id, host)} -> {host}"
     else:
         detail = f"go-live checks 1, 4 and 5 passed on {host}"
-    await queue.resolve(args.item, args.disposition, args.note, operator(), detail)
+    await writer.resolve_item(args.item, args.disposition, args.note, detail)
     report.check(True, detail)
     return report

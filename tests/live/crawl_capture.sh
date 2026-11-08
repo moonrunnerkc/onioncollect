@@ -25,9 +25,12 @@ else
     PER_INSTANCE=${PER_INSTANCE:-3}
 fi
 CLI="cd $APP && exec $PY -m onioncollect --settings $SETTINGS"
+# The stores are the analyst's: reads and the log audit run as the analyst, from the root-owned copy.
+as_analyst() { runuser -u analyst -- env HOME=/home/analyst "$@"; }
+ANALYST_CLI="cd /opt/onioncollect/app && exec /opt/onioncollect/venv/bin/python -m onioncollect --settings /home/analyst/settings.toml"
 # The timer's crawl would hold the run lock; this one runs alone and the timer starts again at the end.
 systemctl stop onioncollect-crawl.timer onioncollect-crawl.service 2>/dev/null
-as_crawler bash -c "$CLI sources list --state live" 2>/dev/null | grep -q . ||
+as_analyst bash -c "$ANALYST_CLI sources list --state live" 2>/dev/null | grep -q . ||
     { echo "no live sources: triage approve, fill in the config, then golive"; exit 1; }
 
 capture_start "the crawl (${RUN_SECONDS}s)"
@@ -48,7 +51,8 @@ done < <(socks_peaks)
 report "step $STEP no instance carries more streams than its workers" "$STREAMS"
 
 echo "step $STEP: crawl log audit"
-if as_crawler "$PY" "$APP/tests/live/log_audit.py" --data "$HOME_DIR/data" "$HOME_DIR/data/crawl.log" | sed 's/^/      /'; then
+if as_analyst /opt/onioncollect/venv/bin/python /opt/onioncollect/app/tests/live/log_audit.py --data /home/analyst/data \
+        /var/log/onioncollect/crawl.log | sed 's/^/      /'; then
     report "step $STEP log carries source ids, codes, counts, timings and error names only" pass
 else
     report "step $STEP log carries source ids, codes, counts, timings and error names only" fail

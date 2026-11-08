@@ -19,6 +19,7 @@ from onioncollect.redact import Redacted
 from tests.fixtures import (OFF_SOURCE, TESTONION, TESTONION_CONFIG, TESTONION_PASSWORD, TESTONION_USER, make_live,
                             throwaway_settings, write_credential)
 from tests.test_fetcher import HTML, FakeTor, TrackingStream
+from tests.writer_harness import start_writer
 
 TOKEN = "s3ss10n"
 # The member pages echo the credential, on a line of its own, as a careless app might: the gate's job.
@@ -69,32 +70,36 @@ class SessionRunTestCase(unittest.IsolatedAsyncioTestCase):
         for name in ("configs", "data"):
             (root / name).mkdir()
         (root / "configs" / "testonion.toml").write_text(TESTONION_CONFIG)
+        self.harness = await start_writer(root / "data", root / "configs")
+        self.stores = self.harness.stores
         self.settings = throwaway_settings(data_dir=root / "data", configs_dir=root / "configs",
+                                           state_dir=root / "state", writer_socket=self.harness.socket,
                                            credentials_dir=root / "etc", tor_instances=((10051, 11051),),
                                            max_retries=1, jitter_seconds=(0.0, 0.0))
         write_credential(self.settings)
         self.crawler = Crawler(self.settings)
         await self.crawler.open()
-        await make_live(self.crawler.sources, "testonion", TESTONION, "self-hosted")
+        await make_live(self.stores.sources, "testonion", TESTONION, "self-hosted")
         self.app = TestOnionStandIn()
         patcher = mock.patch.object(fetcher_module, "AsyncProxyTransport",
                                     side_effect=lambda **kwargs: httpx.MockTransport(self.app.handle))
         patcher.start()
         self.addCleanup(patcher.stop)
         self.tor = FakeTor()
-        self.fetcher = Fetcher(self.settings, self.tor, self.crawler.sources, self.crawler.configs,
+        self.fetcher = Fetcher(self.settings, self.tor, self.crawler.writer, self.crawler.configs,
                                lifecycle.COLLECTING, sessions=self.crawler.logins.sessions)
 
     async def asyncTearDown(self):
         await self.fetcher.close()
         await self.crawler.close()
+        await self.harness.stop()
         self.tmp.cleanup()
 
     async def crawl(self) -> list[str]:
         """One scheduler pass, then pages until nothing is claimable; every log line of it, from every logger."""
         with self.assertLogs(level=logging.DEBUG) as logs:
             await self.crawler.start_due_runs()
-            while tasks := await self.crawler.frontier.claim(1):
+            while tasks := await self.crawler.frontier.claim(1, await self.crawler.writer.collecting()):
                 await self.crawler.handle(tasks[0], self.fetcher)
         return logs.output
 
@@ -108,7 +113,7 @@ class SessionRunTestCase(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(value, logged, value)
 
     async def errors(self) -> list[str]:
-        return [row["error"] for row in await self.crawler.collect.rows("SELECT error FROM page_metrics ORDER BY rowid")]
+        return [row["error"] for row in await self.stores.collect.rows("SELECT error FROM page_metrics ORDER BY rowid")]
 
 
 class SessionRunTest(SessionRunTestCase):
@@ -119,16 +124,16 @@ class SessionRunTest(SessionRunTestCase):
         self.assertEqual(await self.errors(), [None] * 5)
         self.assertFalse(self.crawler.logins.sessions.holds("testonion"))
         self.assertEqual(self.crawler.logins.outcomes, {})
-        titles = {json.loads(row["fields"])["title"] for row in await self.crawler.records.db.rows("SELECT fields FROM records")}
+        titles = {json.loads(row["fields"])["title"] for row in await self.stores.records.db.rows("SELECT fields FROM records")}
         self.assertIn("Rotate the relay keys", titles)
 
     async def test_the_credential_is_nowhere_under_the_data_dir_or_in_any_log(self):
         logs = await self.crawl()
         self.assert_credential_absent(logs)
         self.assertIn("INFO:onioncollect.session:testonion session started", logs)
-        (kind, priority), = {(item["kind"], item["priority"]) for item in await self.crawler.health.queue()}
+        (kind, priority), = {(item["kind"], item["priority"]) for item in await self.stores.health.queue()}
         self.assertEqual((kind, priority), (health.REDACTION, health.REDACTION_PRIORITY))
-        stored = (await self.crawler.records.db.rows("SELECT fields FROM records"))
+        stored = (await self.stores.records.db.rows("SELECT fields FROM records"))
         self.assertTrue(any("[user_password]" in row["fields"] for row in stored), stored)
 
     async def test_with_the_redaction_gate_broken_the_storage_refusal_keeps_it_off_disk(self):
@@ -141,7 +146,7 @@ class SessionRunTest(SessionRunTestCase):
             logs = await self.crawl()
         self.assert_credential_absent(logs)
         self.assertIn("WARNING:onioncollect.crawler:testonion write refused: a secret survived redaction", logs)
-        details = {item["detail"] for item in await self.crawler.health.queue()}
+        details = {item["detail"] for item in await self.stores.health.queue()}
         self.assertIn("write refused: a secret survived", details)
 
     async def test_wrong_credentials_fail_the_run_after_one_post(self):
@@ -164,15 +169,15 @@ class SessionRunTest(SessionRunTestCase):
         self.app.landing = f"http://{OFF_SOURCE}/members/"
         await self.crawl()
         self.assertEqual(self.app.member_gets, [])
-        self.assertEqual([row["host"] for row in await self.crawler.sources.hosts(lifecycle.CANDIDATE)], [OFF_SOURCE])
+        self.assertEqual([row["host"] for row in await self.stores.sources.hosts(lifecycle.CANDIDATE)], [OFF_SOURCE])
         self.assertEqual(await self.errors(), ["auth_rejected", "auth_rejected"])
 
     async def test_a_landing_page_tripping_the_safety_check_disables_the_source(self):
         self.app.members = page(("/members/notes/1", "forbiddenterm"), signed_in=True)
         await self.crawl()
-        source = await self.crawler.sources.get("testonion")
+        source = await self.stores.sources.get("testonion")
         self.assertEqual((source["state"], source["reason"]), (lifecycle.DISABLED, "safety: child_exploitation"))
-        self.assertEqual(await self.crawler.records.counts(), {"records": 0, "snapshots": 0})
+        self.assertEqual(await self.stores.records.counts(), {"records": 0, "snapshots": 0})
 
     async def test_a_source_without_form_session_never_posts(self):
         (self.settings.configs_dir / "testonion.toml").write_text(

@@ -6,13 +6,16 @@ Section 17's leak and boundary tests, by where they run:
   1 approval gate                 test_crawler.ApprovalGateTest
   2 frontier containment          test_crawler.FrontierContainmentTest
   3 redaction gate                test_crawler.RedactionGateTest, the top-priority health item included
-  4 storage refusal               test_records.StorageRefusalTest
+  4 storage refusal               test_writer.DetectorRefusalTest, through the write socket, so the second detector
+                                  runs in the writer, as the analyst; test_writer_boundary.CrawlerSeparationTest
+                                  for a crawl that reaches no store file
   5 auth containment              AuthContainmentTest, below, for the code; and for behaviour,
                                   test_fetcher_auth (any other source id raises before a request is built, a source
                                   not live or degraded is refused, the jar is empty after every response) and
                                   test_session (one login a run, the session gone after the run and after a crash,
                                   the credential nowhere under the data dir through the redaction gate and through
                                   a storage refusal)
+  the writer serves AF_UNIX only      test_writer_boundary.WriterContainmentTest
   the search UI reads, never fetches  UIContainmentTest, below; test_ui for the read-only connection;
                                   test_ui_entry for its entry point's import closure, static and loaded
 """
@@ -32,7 +35,8 @@ ALLOWED_ONLY_IN = {
     "httpx_socks": {"fetcher.py"},
     "python_socks": {"fetcher.py"},
     "stem": {"tor_pool.py"},
-    "socket": {"config.py"},
+    # config.py checks the Tor ports on 127.0.0.1; writer.py serves its one AF_UNIX socket (WriterContainmentTest).
+    "socket": {"config.py", "writer.py"},
 }
 FORBIDDEN = {"urllib.request", "urllib3", "requests", "aiohttp", "http.client", "ssl", "asyncio.open_connection"}
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE"}

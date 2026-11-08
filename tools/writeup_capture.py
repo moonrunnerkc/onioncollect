@@ -117,12 +117,12 @@ def gather(settings_path: Path, settings: Settings, credentials_dir: Path) -> di
         texts["leak-test.json"] = settings.leak_test_result.read_text()
     except OSError as exc:
         texts["leak-test.json"] = f"[not readable: {type(exc).__name__}]\n"
-    logs = sorted(settings.data_dir.glob("crawl.log*"), reverse=True)
+    logs = sorted(settings.log_dir.glob("crawl.log*"), reverse=True)
     texts["tor-lines.txt"] = "".join(line for path in logs for line in path.read_text().splitlines(keepends=True)
                                      if TOR_LINE.search(line))
     audit = subprocess.run([sys.executable, "-s", "-E", str(APP / "tests/live/log_audit.py"), "--data",
                             str(settings.data_dir), "--credentials", str(credentials_dir),
-                            str(settings.data_dir / "crawl.log"), str(Path.home() / "ui.log")],
+                            str(settings.log_dir / "crawl.log"), str(Path.home() / "ui.log")],
                            cwd=APP, capture_output=True, text=True)
     texts["log-audit.txt"] = audit.stdout + f"exit {audit.returncode}\n"
     return texts

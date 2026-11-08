@@ -41,5 +41,11 @@ with an SSH forward through Lima's ssh config:
 ssh -F ~/.lima/node1/ssh.config -N -L 8470:127.0.0.1:8470 lima-node1
 ```
 
-then open http://127.0.0.1:8470/. `make test` runs the suite locally; `make writeup-capture` gathers the
+then open http://127.0.0.1:8470/.
+
+The crawler never opens a store. Every write it makes goes over a unix socket to `onioncollect.writer`, a
+standard-library-and-aiosqlite process running as the analyst, which owns the stores (mode 700). The writer
+admits the crawler's uid alone, takes one op from a fixed list per line, and runs the storage layer's secret
+detector itself, so the redaction gate and the second detector run under two different users. The crawler keeps
+only its frontier, in its own state dir. [provision/README.md](provision/README.md) has the layout. `make test` runs the suite locally; `make writeup-capture` gathers the
 write-up's evidence in the guest; `make writeup-check` lists any write-up marker still waiting for data.

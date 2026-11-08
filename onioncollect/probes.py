@@ -7,11 +7,11 @@ from typing import Awaitable, Callable
 
 from onioncollect import lifecycle
 from onioncollect.config import Settings
-from onioncollect.db import Frontier
 from onioncollect.fetcher import REFUSALS, Fetcher
 from onioncollect.source_config import SourceConfig
-from onioncollect.sources import PinnedHost, SourceTable
+from onioncollect.sources import PinnedHost
 from onioncollect.tor_pool import TorInstance
+from onioncollect.writer_client import Writer
 
 log = logging.getLogger(__name__)
 
@@ -20,11 +20,9 @@ NEVER = datetime.min.replace(tzinfo=UTC)
 
 
 class Prober:
-    def __init__(self, settings: Settings, sources: SourceTable, frontier: Frontier,
-                 clock: Callable[[], datetime] = lambda: datetime.now(UTC)):
+    def __init__(self, settings: Settings, writer: Writer, clock: Callable[[], datetime] = lambda: datetime.now(UTC)):
         self.settings = settings
-        self.sources = sources
-        self.frontier = frontier
+        self.writer = writer
         self.clock = clock
         # A probe the fetcher refused leaves no uptime row, so without this it would be due again every pass.
         self.attempted: dict[str, datetime] = {}
@@ -32,7 +30,7 @@ class Prober:
     async def probe_due(self, config_for: Callable[[str], Awaitable[SourceConfig | None]],
                         tor_for: Callable[[int], TorInstance]) -> int:
         now = self.clock()
-        due = [(source_id, host) for source_id, host in await self.frontier.due_probes(PROBE_INTERVAL)
+        due = [(source_id, host) for source_id, host in await self.writer.due_probes(PROBE_INTERVAL)
                if now - self.attempted.get(host, NEVER) >= PROBE_INTERVAL]
         for n, (source_id, host) in enumerate(due):
             self.attempted[host] = now
@@ -42,7 +40,7 @@ class Prober:
         return len(due)
 
     async def probe(self, source_id: str, host: str, config: SourceConfig, tor: TorInstance) -> bool | None:
-        fetcher = Fetcher(self.settings, tor, PinnedHost(self.sources, host), {source_id: config}, lifecycle.COLLECTING)
+        fetcher = Fetcher(self.settings, tor, PinnedHost(self.writer, host), {source_id: config}, lifecycle.COLLECTING)
         try:
             result = await fetcher.fetch(source_id, config.seeds[0])
         finally:
@@ -51,7 +49,7 @@ class Prober:
             log.warning("%s sibling probe refused: %s", source_id, result.error)
             return None
         up = result.status is not None
-        await self.frontier.record_probe(host, up)
+        await self.writer.probe_result(host, up)
         log.info("%s sibling probe status=%s error=%s elapsed=%.1fs", source_id, result.status, result.error,
                  result.elapsed)
         return up

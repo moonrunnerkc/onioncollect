@@ -120,11 +120,14 @@ class SettingsLoadTest(unittest.TestCase):
         # Triage refuses to approve an excluded host, so the analyst loads the list too.
         self.assertEqual(settings.exclusions, frozenset({AHMIA}))
 
-    def test_salt_always_required(self):
+    def test_the_exclusions_always_and_the_salt_only_for_the_crawler(self):
         path = self.dir / "settings.toml"
         path.write_text('data_dir = "/tmp/x"\n')
-        with self.assertRaisesRegex(ValueError, "redaction_salt_file, exclusions_file required"):
+        with self.assertRaisesRegex(ValueError, "exclusions_file required$"):
             Settings.load(path, port_check=always_listening)
+        with self.assertRaisesRegex(ValueError, "exclusions_file, redaction_salt_file, control_password_file,"
+                                                " safety_patterns_file required"):
+            Settings.load(path, crawl=True, port_check=always_listening)
 
     def test_safety_files_are_parsed_into_settings(self):
         settings = self.load_crawl()

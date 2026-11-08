@@ -43,15 +43,28 @@ Roll back to the snapshot: `limactl stop node1 && cp -c ~/.lima/node1/disk.snaps
   committed; `make deploy` installs each of `safety-patterns.txt` and `exclusions.txt` from the checkout when it exists there (both are gitignored).
   The crawler refuses to start if either file is missing or lists nothing, so add at least one
   host to `exclusions.txt` before the first run. Both are operator config the repo never holds.
-- **Data, configs and the salt.** `provision.sh` creates `/home/crawler/data` and
-  `/home/crawler/configs` (mode 700) and a `/home/crawler/redaction-salt` (mode 600) that is never
-  regenerated, since a new salt would orphan every keyed hash already stored. The crawler owns all
-  three. The `analyst` user reads the data dir through its group (2750 crawler:analyst) and runs the
-  read-only commands with `/home/analyst/settings.toml`, which names no secret file, and the search UI through
-  its own entry point, `python -m onioncollect.ui_main --data-dir /home/crawler/data --configs-dir
-  /home/crawler/configs --port 8470` (`onioncollect-ui.service`), which never imports the CLI or a network library.
-  It has no firewall rule of its own, so it reaches loopback only. The local socket service the
-  crawler writes through is not provisioned yet; until it is, the commands that write run as crawler.
+- **Data, configs and the salt.** `provision.sh` lays the guest out like this, and moves an older
+  layout's files into it on the next run (`migrate_layout`, idempotent):
+
+  | Path | Owner, mode | Holds |
+  | --- | --- | --- |
+  | `/home/analyst/data` | analyst, 700 | `collect.db`, `records.db`, `snapshots/` |
+  | `/var/lib/onioncollect/configs` | analyst:onioncollect-ipc, 2750, files 640 | the collection configs |
+  | `/home/crawler/state` | crawler, 700 | the frontier and the run lock |
+  | `/var/log/onioncollect` | crawler:analyst, 2750, files 640 | `crawl.log` |
+  | `/run/onioncollect/writer.sock` | analyst:onioncollect-ipc, 0660 | the write socket |
+  | `/home/crawler/redaction-salt` | crawler, 600 | never regenerated: a new salt would orphan every keyed hash |
+
+  `onioncollect-ipc` holds the crawler alone. The analyst owns the stores and runs the writer
+  (`python -m onioncollect.writer`, `onioncollect-writer.service`), the only process that writes them for the
+  crawler: the crawler sends every write over the socket, the writer checks the peer's uid with SO_PEERCRED before
+  reading a byte, checks each request against its op's spec, and runs the storage layer's own secret detector, so
+  the two detectors run under two different users. The crawler never opens a store file. The analyst runs triage,
+  the reader commands and the retention sweep with `/home/analyst/settings.toml`, which names no secret file but
+  its own copy of the exclusion list, and the search UI through its own entry point,
+  `python -m onioncollect.ui_main --data-dir /home/analyst/data --configs-dir /var/lib/onioncollect/configs
+  --port 8470` (`onioncollect-ui.service`), which never imports the CLI or a network library and sees the stores
+  read-only. The analyst has no firewall rule of its own, so it reaches loopback only.
 - **Root-owned runtime.** `/opt/onioncollect/venv` (same hashes as the crawler's venv) and
   `/opt/onioncollect/app` are root's, so the user a systemd unit runs as cannot change the code it runs.
 - **Right after `make provision`.** The update hole closes while apt's TLS connections to the Debian

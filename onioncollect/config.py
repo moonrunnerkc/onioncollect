@@ -8,13 +8,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from onioncollect import safety, source_config
+from onioncollect import lifecycle, safety, source_config
 from onioncollect.source_config import ConfigError, SourceConfig
 
 CRAWL_FILE_KEYS = ("control_password_file", "safety_patterns_file")
 FILE_KEYS = (*CRAWL_FILE_KEYS, "redaction_salt_file", "exclusions_file")
 SECRET_FIELDS = {"control_password", "exclusions", "safety_patterns", "redaction_salt"}
-PATH_FIELDS = ("data_dir", "configs_dir", "leak_test_result", "credentials_dir")
+PATH_FIELDS = ("data_dir", "configs_dir", "state_dir", "log_dir", "writer_socket", "leak_test_result", "credentials_dir")
 CREDENTIAL_KEYS = ("username", "password")
 MIN_SALT_CHARS = 32
 TOR_BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0"
@@ -41,10 +41,15 @@ class Settings:
     max_body_bytes: int = 2_000_000
     max_retries: int = 3
     jitter_seconds: tuple[float, float] = (1.0, 4.0)
-    record_retention_days: int = 180
-    snapshot_retention_days: int = 30
+    record_retention_days: int = lifecycle.RECORD_RETENTION_DAYS
+    snapshot_retention_days: int = lifecycle.SNAPSHOT_RETENTION_DAYS
+    # The analyst's stores. The crawler never opens them: it writes through writer_socket.
     data_dir: Path = Path("./data")
     configs_dir: Path = Path("./configs")
+    # The crawler's own: its frontier and run lock (state_dir), and the crawl log, which the analyst reads.
+    state_dir: Path = Path("./state")
+    log_dir: Path = Path("./log")
+    writer_socket: Path = Path("/run/onioncollect/writer.sock")
     # Written by `make leak-test` as root in the guest; golive reads it for check 3.
     leak_test_result: Path = Path("/var/lib/onioncollect/leak-test.json")
     # Section 15's secrets files, one per form-session source, owned by the crawler and mode 600.
@@ -54,25 +59,26 @@ class Settings:
     @classmethod
     def load(cls, path: Path, crawl: bool = False, reader: bool = False,
              port_check: Callable[[int], bool] = port_is_listening) -> "Settings":
-        # `crawl` is the crawler user's view: Tor credentials and the safety patterns are required and the Tor
-        # ports must answer. The analyst runs everything else and never holds the control password. Both load
-        # the exclusion list: the fetcher refuses its hosts and triage refuses to approve them. A `reader`
-        # opens the stores read-only and reads no secret file at all, so it runs without the salt.
+        # `crawl` is the crawler user's view: the salt, Tor credentials and the safety patterns are required and
+        # the Tor ports must answer. The analyst runs everything else and never holds the salt or the control
+        # password. Both load the exclusion list: the fetcher refuses its hosts and triage refuses to approve them.
+        # A `reader` opens the stores read-only and reads no file but this one.
         with open(path, "rb") as f:
             raw = tomllib.load(f)
         files = {key: raw.pop(key, None) for key in FILE_KEYS}
         if reader:
             return cls(redaction_salt=b"", **cls.plain(path, raw))
-        required = ("redaction_salt_file", "exclusions_file", *(CRAWL_FILE_KEYS if crawl else ()))
+        required = ("exclusions_file", *(("redaction_salt_file", *CRAWL_FILE_KEYS) if crawl else ()))
         missing = [key for key in required if files[key] is None]
         if missing:
             raise ValueError(f"{path}: {', '.join(missing)} required")
         raw = cls.plain(path, raw)
-        salt = read_secret(Path(files["redaction_salt_file"]))
-        if len(salt) < MIN_SALT_CHARS:
-            raise ValueError(f"{files['redaction_salt_file']}: at least {MIN_SALT_CHARS} characters of salt")
         raw["exclusions"] = read_safety_file(Path(files["exclusions_file"]), safety.parse_exclusions)
+        salt = ""
         if crawl:
+            salt = read_secret(Path(files["redaction_salt_file"]))
+            if len(salt) < MIN_SALT_CHARS:
+                raise ValueError(f"{files['redaction_salt_file']}: at least {MIN_SALT_CHARS} characters of salt")
             raw |= {
                 "control_password": read_secret(Path(files["control_password_file"])),
                 "safety_patterns": read_safety_file(Path(files["safety_patterns_file"]), safety.parse_patterns),
@@ -155,6 +161,8 @@ def write_config(directory: Path, source_id: str, text: str) -> Path:
     path = config_path(directory, source_id)
     temp = path.with_suffix(".toml.tmp")
     temp.write_text(text)
+    # Group-readable whatever the umask: in the guest the configs dir's group is the crawler's, which reads them.
+    temp.chmod(0o640)
     os.replace(temp, path)
     return path
 

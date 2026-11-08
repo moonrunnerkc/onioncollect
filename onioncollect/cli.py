@@ -4,7 +4,7 @@ import os
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-from onioncollect import config_cli, crawl_cli, fingerprint, health, health_cli, lifecycle, mirrors, source_config
+from onioncollect import config_cli, crawl_cli, health, health_cli, lifecycle, matching, mirrors, source_config
 from onioncollect.config import Settings, config_path, write_config
 from onioncollect.health_queue import HealthQueue
 from onioncollect.records import RecordStore
@@ -16,20 +16,22 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if os.geteuid() == 0:
         raise SystemExit("onioncollect: refusing to run as root")
-    # Closed to others, readable by the group: in the guest the data dir's group is the analyst's, which reads.
-    os.umask(0o027)
+    os.umask(0o077)
     # A command that may fetch decides from its own arguments whether it needs the crawler's Tor settings.
     crawl = args.crawl(args) if callable(args.crawl) else args.crawl
     try:
         settings = Settings.load(args.settings, crawl=crawl, reader=args.reader)
     except (OSError, ValueError, RuntimeError) as exc:
         raise SystemExit(f"onioncollect: {exc}") from None
-    if args.reader:
+    if crawl:
+        # The crawler's commands reach the stores only through the writer, and never touch the data dir.
+        pass
+    elif args.reader:
         # A reader opens both stores read-only, so it may run against a data dir another user owns.
         if not settings.data_dir.is_dir():
             raise SystemExit(f"onioncollect: no data directory at {settings.data_dir}")
     else:
-        settings.data_dir.mkdir(mode=0o750, parents=True, exist_ok=True)
+        settings.data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         if settings.data_dir.stat().st_uid != os.geteuid():
             raise SystemExit(f"onioncollect: {settings.data_dir} is not owned by this user")
     args.command(settings, args)
@@ -118,7 +120,7 @@ def candidates_command(settings: Settings, args: argparse.Namespace) -> None:
     for row in rows:
         print(f"{row['first_seen'][:16]}  {row['host']}  found on {row['found_on'] or 'request'}")
         for source_id, near in matched.get(row["host"], []):
-            print(f"    candidate matches source {source_id} ({fingerprint.describe(near)})")
+            print(f"    candidate matches source {source_id} ({matching.describe(near)})")
         for source_id in redirected.get(row["host"], []):
             print(f"    candidate was the redirect target of source {source_id}")
     print(f"{len(rows)} candidates")
@@ -204,7 +206,7 @@ def merge_command(settings: Settings, args: argparse.Namespace) -> None:
                 raise RefusedChange(f"{source_id} is {source.state if source else 'not a source'}, not live")
         near = dict(await mirrors.source_matches(args.id, table, store)).get(args.into)
         if near is None and not args.force:
-            raise RefusedChange(f"{args.id}'s seed pages are not within {fingerprint.MIRROR_MAX_BITS} bits of"
+            raise RefusedChange(f"{args.id}'s seed pages are not within {matching.MIRROR_MAX_BITS} bits of"
                                 f" {args.into}'s (see mirrors {args.id}); --force --note to merge anyway")
         # Proven before anything changes, as in the fold.
         try:
@@ -222,7 +224,7 @@ def merge_command(settings: Settings, args: argparse.Namespace) -> None:
         return moved, merged, near
 
     moved, (hashes, removed), near = with_stores(settings, merge)
-    print(f"{args.id} merged into {args.into}" + (f" ({fingerprint.describe(near)})" if near else " (forced)")
+    print(f"{args.id} merged into {args.into}" + (f" ({matching.describe(near)})" if near else " (forced)")
           + f": {', '.join(moved)} added to {args.into} and its config; {hashes} shared records merged,"
             f" {removed} duplicate rows removed; {args.id} is disabled, and {config_path(settings.configs_dir, args.id)}"
             f" is yours to delete")
@@ -255,9 +257,9 @@ def mirrors_command(settings: Settings, args: argparse.Namespace) -> None:
     cluster, rows = with_stores(settings, lambda table, store: mirrors.cluster_report(args.id, table, store))
     print(f"{args.id}: " + (f"cluster {cluster}" if cluster else "in no cluster, its own hosts only")
           + f"; * marks each source's active host; distances are from {args.id}'s,"
-            f" a match is {fingerprint.MIRROR_MAX_BITS} bits or fewer on each")
+            f" a match is {matching.MIRROR_MAX_BITS} bits or fewer on each")
     for row in rows:
-        near = (fingerprint.describe(row["distance"]) if row["distance"] else
+        near = (matching.describe(row["distance"]) if row["distance"] else
                 "not comparable" if row["fingerprinted"] else "no seed fingerprint")
         print(f"{'*' if row['active'] else ' '} {row['host']}  {row['source_id']} ({row['source_state']})"
               f"  last up {(row['last_up'] or 'never')[:16]}  last down {(row['last_down'] or 'never')[:16]}  {near}")

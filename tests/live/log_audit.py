@@ -50,7 +50,7 @@ MIN_FIELD_CHARS = 8
 def visited(db_path: Path) -> set[str]:
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     found = set()
-    for (path,) in db.execute("SELECT path FROM urls"):
+    for (path,) in db.execute("SELECT path FROM visited_paths"):
         parts = urlsplit(path)
         if parts.path not in ("", "/"):
             found.add(parts.path)

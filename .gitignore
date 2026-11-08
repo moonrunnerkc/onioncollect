@@ -42,3 +42,6 @@ writeup-capture/
 leak-test.json
 deploy-stamp
 .lima/
+# The crawler's state dir and log dir under the default settings.
+state/
+log/

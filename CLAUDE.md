@@ -37,7 +37,7 @@ Violating any of these is a bug, not a judgment call:
 - Logs record source ids, page kinds, status codes, byte and item counts, hit rates, timings, error names. Never hosts, paths, query strings, page titles, page text or record text. The UI logs its route name, status, result count and time, never a query.
 - The search UI reads. It never writes and never fetches. `ui.py` opens each store per request through a `mode=ro` SQLite connection with `query_only` on, reads snapshot files only after the id matches the content-address format and the snapshots table, imports nothing that can reach the network, and binds only the literal `127.0.0.1` (`UIContainmentTest`). It starts from `ui_main.py`, never `cli.py`; `test_ui_entry` holds its import closure to an exact list, statically and as loaded in a clean interpreter. It refuses root, the crawler, and any user who can write the stores, answers only GET under a local Host name, and sends `default-src 'none'; style-src 'unsafe-inline'`. Every stored value reaches the page through `views.text`, and the only links are its own routes: a record's onion link or a snapshot's markup is shown as text, never followed or rendered.
 - Search input, from the CLI or the UI, is quoted down to literal FTS5 terms by `search.literal_query` and bound as a parameter. Operator syntax is matched as text, never parsed.
-- The analyst reads the crawler's stores through the data dir's group (2750 crawler:analyst in the guest, files 640) and writes none of them. Reader commands (`reader=True`: search, sources list and export, triage list, health and its runs and log) open both stores read-only, need no secret file, and never create a store. `Database.close` leaves empty `-wal` and `-shm` files so a read-only reader can open a WAL database the crawler has closed.
+- The analyst owns the stores (`/home/analyst/data`, mode 700, umask 077). The crawler never opens a store file: every write and every store read of `crawl run`, `golive` and the fixed and mirror-swapped dispositions goes through `writer_client.Writer` over `/run/onioncollect/writer.sock` to `writer.py`, run as the analyst, which admits the crawler's uid alone (SO_PEERCRED, root refused) before reading a byte, takes one op from `writer_ops.OPS` per line, checks every field against the op's spec, and runs `RecordStore`, so the second detector runs as the analyst. The crawler keeps its frontier (`urls`, paths and scheduling only) in its own state dir. `test_writer` and `test_writer_boundary` hold this; a new op is a reviewed change to `writer_ops.OPS`. Reader commands (`reader=True`: search, sources list and export, triage list, health and its runs and log) open both stores read-only, need no secret file, and never create a store. `Database.close` leaves empty `-wal` and `-shm` files so a read-only reader can open a WAL database the crawler has closed.
 - `make deploy` never deletes a guest config unless `PRUNE_CONFIGS=1` and a typed `yes` (`deploy/sync_configs.sh`). No timer runs golive, triage, sources, a disposition or a deploy; `test_deploy` reads every unit's `User=` and `ExecStart=`.
 
 If you touch fetcher.py, the torrc files, or the firewall, rerun the four Tor leak tests (`make leak-test`) before committing and before the next golive. testonion/torrc is the second VM's, not the crawler's, and is not covered by this rule.
@@ -60,7 +60,8 @@ onioncollect/
   extractor.py      records, hit rate, next page and follows from one page (pure)
   redact.py         text to tags, counts and keyed hashes (pure)
   parser.py         links, discovered hosts, gate detection, visible text (pure)
-  fingerprint.py    content and structure simhashes, the mirror threshold, clustering (pure)
+  matching.py       Fingerprint, distances, the mirror threshold, clustering (pure, standard library)
+  fingerprint.py    content and structure simhashes of a page (pure)
   scheduler.py      page retries, run cadence with the health multiplier (pure)
   health.py         section 13's entry rules, priorities, kinds and dispositions (pure)
   search.py         the full-text query shared by the CLI and the UI, input quoted to literal terms (pure)
@@ -68,14 +69,19 @@ onioncollect/
   config.py         frozen Settings, loaded once; config file loading and writing
   tor_pool.py       the Tor instances, circuit rotation
   schema.py         CREATE TABLE and CREATE INDEX statements
-  db.py             Database helper, Frontier, Task and PageMetric, per-field hits, probe bookkeeping
+  db.py             Database helper; the crawler's Frontier (its own state dir), Task and PageMetric
   sources.py        SourceTable: candidates, approve, mirror approve, fold and merge, decline, state changes,
                     cluster ids, redirect evidence, active host, reapprove; PinnedHost
+  runs.py           RunLog: run totals, page metrics, per-field hits, uptime and probes, visited paths (writer side)
   health_queue.py   HealthQueue: items, dispositions, snoozes, run summaries and per-run metrics
   records.py        RecordStore: records, host sightings, cluster dedup and merge, FTS, snapshots and baselines,
                     fingerprints, retention
   mirrors.py        clusters and matches from stored fingerprints, merge on cluster growth; no fetch
   stores.py         opening both stores for one analyst command
+  wire.py           the write socket's line protocol and error codes (pure)
+  writer_ops.py     every op the crawler may send: its field spec and what it does to the stores
+  writer.py         the write socket server, as the analyst: peer check, line cap, spec check, one op at a time
+  writer_client.py  the crawler's side of the socket: one connection per op, typed errors
   fetcher.py        one GET through Tor for a source id and path, all in-code anonymity controls; section 15's
                     auth step (log_in, _post_form, _session_for) and the Sessions store
   pages.py          the whole life of a body: inspect, and signed_in for the login check (no I/O)
@@ -123,4 +129,4 @@ testonion/          section 15's self-hosted onion for its own VM (testonion-vm)
 
 ## Running
 
-In the guest, systemd runs the routine jobs from a root-owned copy of the code and venv under /opt/onioncollect (`deploy/systemd/`): `crawl run --until-idle` as crawler every 15 minutes, the retention sweep nightly as crawler (the analyst cannot write the stores until the write socket exists), the leak tests daily as root, the log audit as the analyst after every crawl, and the search UI as the analyst on 127.0.0.1:8470, reached by an SSH forward. `crawl run`, `golive` and the two fetching dispositions (`health resolve --disposition fixed|mirror-swapped`) run only as the unprivileged `crawler` user inside the venv, and take the run lock, on the hardened VM described in section 5. The self-hosted onion runs on its own VM (`make testonion`), never on the crawler's; `make testonion-credentials` pipes its credential into the crawler guest without it touching the host's disk. The firewall is the backstop; the code is the first line of defense. Both must hold independently. Triage, search and the rest belong to the `analyst` user, which never holds the Tor control password or any secret file. The analyst runs the reader commands and the UI now; the commands that write still run as crawler until the crawler's local write socket exists. Never open a snapshot in a browser on that box.
+In the guest, systemd runs the routine jobs from a root-owned copy of the code and venv under /opt/onioncollect (`deploy/systemd/`): `crawl run --until-idle` as crawler every 15 minutes, the retention sweep nightly as the analyst, the writer as the analyst at boot (the crawl unit requires it), the leak tests daily as root, the log audit as the analyst after every crawl, and the search UI as the analyst on 127.0.0.1:8470, reached by an SSH forward. `crawl run`, `golive` and the two fetching dispositions (`health resolve --disposition fixed|mirror-swapped`) run only as the unprivileged `crawler` user inside the venv, and take the run lock, on the hardened VM described in section 5. The self-hosted onion runs on its own VM (`make testonion`), never on the crawler's; `make testonion-credentials` pipes its credential into the crawler guest without it touching the host's disk. The firewall is the backstop; the code is the first line of defense. Both must hold independently. Triage, search and the rest belong to the `analyst` user, which never holds the Tor control password or any secret file. The analyst runs triage, the reader commands, the retention sweep, the writer and the UI. Never open a snapshot in a browser on that box.

@@ -1,9 +1,11 @@
 # crawl run in the timer's mode: start what cadence says is due, stop when no page is left to fetch. It refuses
 # to start without a leak test result newer than the current deploy and under 36 h old, or with any config that
-# fails validation. The log audit runs as the analyst after every crawl, whatever its outcome.
+# fails validation, or with no writer to store what it fetches. The log audit runs as the analyst after every crawl,
+# whatever its outcome.
 [Unit]
 Description=onioncollect crawl of the due live sources
-After=network.target
+Requires=onioncollect-writer.service
+After=network.target onioncollect-writer.service
 OnSuccess=onioncollect-log-audit.service
 OnFailure=onioncollect-log-audit.service
 
@@ -14,11 +16,13 @@ Group=crawler
 WorkingDirectory=/opt/onioncollect/app
 ExecStart=/opt/onioncollect/venv/bin/python -s -E -m onioncollect --settings /home/crawler/settings.toml crawl run --until-idle
 TimeoutStartSec=3h
+# The crawl log is the analyst's to audit; the crawler's other files sit in its mode 700 state dir.
 UMask=0027
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/crawler/data
+# Its frontier and run lock, and its log. The stores are the writer's, reached over the socket.
+ReadWritePaths=/home/crawler/state /var/log/onioncollect
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes
@@ -33,7 +37,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 CapabilityBoundingSet=
-# Tor's SOCKS and control ports are on 127.0.0.1; nothing else is reachable from this unit.
+# Tor's SOCKS and control ports are on 127.0.0.1 and the writer is a unix socket; nothing else is reachable.
 RestrictAddressFamilies=AF_INET AF_UNIX
 IPAddressDeny=any
 IPAddressAllow=localhost

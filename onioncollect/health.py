@@ -8,6 +8,8 @@ PARSE_REFUSED, REDACTION = "parse-refused", "redaction"
 KINDS = (REDACTION, UNREACHABLE, REQUIRED_FIELD_LOST, BELOW_EXPECTATION, PARSE_REFUSED)
 
 FIXED, MIRROR_SWAPPED, DISABLED, WATCHING = "fixed", "mirror-swapped", "disabled", "watching"
+# The note on items a clean golive closes as fixed.
+PASSED_GOLIVE = "passed go-live"
 DISPOSITIONS = (FIXED, MIRROR_SWAPPED, DISABLED, WATCHING)
 
 # The shortfall formula tops out at 100, so a redaction outranks every other item whatever its source:

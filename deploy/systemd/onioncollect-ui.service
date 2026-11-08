@@ -10,7 +10,7 @@ Type=simple
 User=analyst
 Group=analyst
 WorkingDirectory=/opt/onioncollect/app
-ExecStart=/opt/onioncollect/venv/bin/python -s -E -m onioncollect.ui_main --data-dir /home/crawler/data --configs-dir /home/crawler/configs --port 8470
+ExecStart=/opt/onioncollect/venv/bin/python -s -E -m onioncollect.ui_main --data-dir /home/analyst/data --configs-dir /var/lib/onioncollect/configs --port 8470
 Restart=on-failure
 RestartSec=10
 UMask=0077
@@ -18,6 +18,8 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/analyst
+# The analyst owns the stores; in here they are read-only, which is what the UI's own user check asks for.
+ReadOnlyPaths=/home/analyst/data
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes

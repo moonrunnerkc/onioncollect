@@ -11,7 +11,6 @@ import aiosqlite
 from onioncollect import health, lifecycle
 from onioncollect.db import Database, stamp
 from onioncollect.health import Finding, RunSummary
-from onioncollect.source_config import SourceConfig
 from onioncollect.sources import RefusedChange, SourceTable
 
 AUTOMATIC = "health"
@@ -58,13 +57,14 @@ class HealthQueue:
             await self.sources.change_state(source_id, lifecycle.DEGRADED)
         return item
 
-    async def after_run(self, run: aiosqlite.Row, config: SourceConfig) -> list[Finding]:
-        """Raises what a finished run calls for, then ends any snooze this run has run out."""
+    async def after_run(self, run: aiosqlite.Row, min_items: int, required: tuple[str, ...],
+                        category: str) -> list[Finding]:
+        """Raises what a finished run calls for, judged by its config's expectations, then ends any snooze this
+        run has run out."""
         source = await self.sources.get(run["source_id"])
         if source is None or source["state"] not in lifecycle.COLLECTING:
             return []
-        found = health.assess(await self.summary(run), config.min_items_per_page, config.required_fields,
-                              config.category)
+        found = health.assess(await self.summary(run), min_items, required, category)
         for finding in found:
             await self.raise_item(run["source_id"], finding, run["id"])
         await self._end_snoozes(run["source_id"])

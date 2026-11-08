@@ -8,7 +8,7 @@ from selectolax.lexbor import LexborHTMLParser
 from onioncollect import extractor, fingerprint, parser, redact, safety
 from onioncollect.db import LISTING
 from onioncollect.fetcher import FetchResult
-from onioncollect.fingerprint import Fingerprint
+from onioncollect.matching import Fingerprint
 from onioncollect.redact import Redacted
 from onioncollect.source_config import SourceConfig
 

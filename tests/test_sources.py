@@ -129,7 +129,7 @@ class ChangeStateTest(CollectTestCase):
 
     async def test_disabling_needs_a_reason_and_closes_open_runs(self):
         await make_live(self.table)
-        run_id = await self.frontier.start_run("news", ("/",))
+        run_id = await self.start_run("news", ("/",))
         with self.assertRaisesRegex(RefusedChange, "reason"):
             await self.table.change_state("news", lifecycle.DISABLED)
         await self.table.change_state("news", lifecycle.DISABLED, "layout gone")

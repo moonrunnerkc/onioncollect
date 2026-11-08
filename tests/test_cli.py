@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import stat
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -19,11 +20,12 @@ from onioncollect.db import open_collect
 from onioncollect.records import RecordStore
 from onioncollect.redact import Redacted
 from onioncollect.sources import SourceTable
-from onioncollect.fingerprint import MIRROR_MAX_BITS
+from onioncollect.matching import MIRROR_MAX_BITS
 from tests.fixtures import (CANDIDATE, EXCLUDED, NEWS, NEWS_CONFIG, NEWS_MIRROR, OFF_SOURCE, headlines, listing_page,
                             leak_result_owned_by_root, make_live, write_leak_result)
 from tests.test_fingerprint import print_of
 from tests.test_onion import AHMIA
+from tests.writer_harness import ThreadedWriter
 
 
 class LoggingTest(unittest.TestCase):
@@ -70,7 +72,8 @@ class CliTestCase(unittest.TestCase):
         self.settings_path.write_text("\n".join(f'{key} = "{self.root / name}"' for key, name in (
             ("control_password_file", "pw"), ("redaction_salt_file", "salt"), ("exclusions_file", "exclusions.txt"),
             ("safety_patterns_file", "patterns.txt"), ("data_dir", "data"), ("configs_dir", "configs"),
-            ("leak_test_result", "leak-test.json"),
+            ("leak_test_result", "leak-test.json"), ("state_dir", "state"), ("log_dir", "log"),
+            ("writer_socket", "no-writer.sock"),
         )) + "\n")
         write_leak_result(self.root / "leak-test.json")
         leak_result_owned_by_root(self)
@@ -158,6 +161,9 @@ class TriageTest(CliTestCase):
         self.assertIn("approved as docs", out)
         scaffold = (self.configs / "docs.toml").read_text()
         self.assertIn(CANDIDATE, scaffold)
+        # The crawler reads configs through the configs dir's group; the stores are the analyst's alone.
+        self.assertEqual(stat.S_IMODE((self.configs / "docs.toml").stat().st_mode), 0o640)
+        self.assertEqual(os.umask(0o022), 0o077, "the analyst's commands leave nothing open to others")
         self.assertIn("not valid", self.refused("config", "validate", "docs").replace("must be a CSS", "not valid"))
         self.assertEqual(self.cli("triage", "list").strip(), "0 candidates")
         source = self.table_do(lambda table: table.get("docs"))
@@ -408,11 +414,26 @@ class FakeInstance:
         self.closed = True
 
 
-class StatusTest(CliTestCase):
+class WriterCliTestCase(CliTestCase):
+    """The crawler's commands, which write through a writer serving the test's data dir."""
+
+    def setUp(self):
+        super().setUp()
+        self.writer = ThreadedWriter(self.data, self.configs)
+        self.settings_path.write_text(self.settings_path.read_text().replace(
+            str(self.root / "no-writer.sock"), str(self.writer.socket)))
+
+    def tearDown(self):
+        self.writer.stop()
+        super().tearDown()
+
+
+class StatusTest(WriterCliTestCase):
     def test_status_table(self):
         self.live_news()
         self.table_do(lambda table: table.add_candidates({CANDIDATE}, "news"))
-        (self.data / "crawl.log").write_text(
+        (self.root / "log").mkdir()
+        (self.root / "log" / "crawl.log").write_text(
             "2026-11-07 12:00:00,000 INFO onioncollect.tor_pool: tor 10051: success 0.50 over 20 fetches, last rotation never\n"
             "2026-11-07 12:01:00,000 INFO onioncollect.tor_pool: tor 10051: success 0.75 over 40 fetches, last rotation never\n"
         )
@@ -428,7 +449,7 @@ class StatusTest(CliTestCase):
         self.assertTrue(all(instance.closed for instance in instances))
 
 
-class GoLiveCommandTest(CliTestCase):
+class GoLiveCommandTest(WriterCliTestCase):
     def test_failed_check_exits_nonzero_and_stays_approved(self):
         self.table_do(lambda table: table.approve(NEWS, "news", "journalism-publishing", "n", "t", frozenset()))
         self.configs.mkdir()

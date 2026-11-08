@@ -3,7 +3,7 @@ import json
 
 from selectolax.lexbor import LexborHTMLParser
 
-from onioncollect import extractor, fingerprint, parser, source_config
+from onioncollect import extractor, fingerprint, matching, parser, source_config
 from onioncollect.config import Settings, load_config
 from onioncollect.db import DETAIL, LISTING
 from onioncollect.records import RecordStore
@@ -79,10 +79,10 @@ def diff_baseline(config, page_url: str, html: str, found: extractor.Extraction,
         if (before, then.field_items) != (after, found.field_items):
             print(f"  {name}: {before} of {then.field_items} items at baseline, {after} of {found.field_items} now"
                   + ("  LOST" if before and not after else ""))
-    near = fingerprint.distance(page_print(known), page_print(html))
-    print(f"  layout: {fingerprint.describe(near)} from the baseline"
-          + ("" if fingerprint.is_match(near) else f", past the {fingerprint.MIRROR_MAX_BITS}-bit mirror threshold"))
+    near = matching.distance(page_print(known), page_print(html))
+    print(f"  layout: {matching.describe(near)} from the baseline"
+          + ("" if matching.is_match(near) else f", past the {matching.MIRROR_MAX_BITS}-bit mirror threshold"))
 
 
-def page_print(html: str) -> fingerprint.Fingerprint:
+def page_print(html: str) -> matching.Fingerprint:
     return fingerprint.of_page(parser.visible_text(LexborHTMLParser(html)), LexborHTMLParser(html))

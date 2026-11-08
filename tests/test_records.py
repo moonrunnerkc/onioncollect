@@ -7,7 +7,7 @@ from pathlib import Path
 
 from onioncollect import redact
 from onioncollect.db import stamp
-from onioncollect.fingerprint import Fingerprint
+from onioncollect.matching import Fingerprint
 from onioncollect.records import RecordStore, RefusedWrite
 from onioncollect.redact import Redacted
 from tests.fixtures import NEWS, NEWS_MIRROR, SALT
@@ -69,53 +69,6 @@ class AddTest(RecordStoreTestCase):
         self.assertEqual(json.loads(row["hashes"]), list(summary.hashes))
 
 
-class StorageRefusalTest(RecordStoreTestCase):
-    """Section 17's storage refusal test: the store's own detector refuses what the gate missed."""
-
-    async def assert_nothing_written(self):
-        self.assertEqual(await self.rows("SELECT * FROM records"), [])
-        self.assertEqual(await self.rows("SELECT * FROM records_fts"), [])
-        self.assertEqual(await self.rows("SELECT * FROM snapshots"), [])
-        self.assertEqual(list(self.store.snapshot_dir.rglob("*.html")), [])
-        for path in self.files():
-            self.assertNotIn(b"SynthPassw0rd", path.read_bytes(), path.name)
-
-    async def test_add_refuses_a_secret_in_a_value(self):
-        with self.assertRaises(RefusedWrite):
-            await self.add(fields=record(body=f"leaked {SECRET}"))
-        await self.assert_nothing_written()
-
-    async def test_add_refuses_a_secret_in_a_field_name(self):
-        with self.assertRaises(RefusedWrite):
-            await self.add(fields={SECRET: "x"})
-        await self.assert_nothing_written()
-
-    async def test_add_detail_refuses_and_leaves_the_record_untouched(self):
-        await self.add()
-        with self.assertRaises(RefusedWrite):
-            await self.store.add_detail("news", "/blog/15", {"body": SECRET}, CLEAN)
-        (row,) = await self.rows("SELECT fields FROM records")
-        self.assertNotIn("body", json.loads(row["fields"]))
-
-    async def test_snapshot_refused_before_any_file_exists(self):
-        with self.assertRaises(RefusedWrite):
-            await self.store.save_snapshot("news", "/", "listing", f"<p>{SECRET}</p>")
-        await self.assert_nothing_written()
-
-    async def test_every_kind_the_detector_knows_is_refused(self):
-        for text in ("card 4111 1111 1111 1111", "ssn 123-45-6789", "key AKIAabcdefGHIJ1234567890xyz",
-                     "admin:Hunter2Synthetic", "contact bob@example.com"):
-            with self.subTest(text=text), self.assertRaises(RefusedWrite):
-                await self.add(fields=record(body=text))
-        await self.assert_nothing_written()
-
-    async def test_hashes_must_be_keyed_digests(self):
-        for hashes in (("plaintext",), ("A" * 64,), ("0" * 63,)):
-            with self.subTest(hashes=hashes), self.assertRaisesRegex(RefusedWrite, "keyed"):
-                await self.add(summary=Redacted("", {"email": 1}, hashes, 1))
-        await self.assert_nothing_written()
-
-
 class DetailAndSearchTest(RecordStoreTestCase):
     async def test_detail_merges_by_follow_path_and_reaches_the_index(self):
         await self.add()
@@ -165,10 +118,10 @@ class SnapshotAndSweepTest(RecordStoreTestCase):
         self.assertEqual(digest, again)
         path = self.store.snapshot_path(digest)
         self.assertEqual(path.read_text(), "<p>hello</p>")
-        # The group may read (the analyst's, in the guest); nobody else may, and only the crawler writes.
-        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
+        # The analyst's alone: the crawler reaches the stores only through the writer.
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         for directory in (self.root, self.store.snapshot_dir, path.parent):
-            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o750, directory)
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700, directory)
         self.assertEqual(len(await self.rows("SELECT * FROM snapshots")), 2)
 
     async def test_latest_snapshot_by_kind(self):

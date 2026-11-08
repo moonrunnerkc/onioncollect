@@ -4,20 +4,20 @@ import asyncio
 import logging
 from collections import defaultdict
 
-from onioncollect import lifecycle, onion, scheduler
+from onioncollect import onion, scheduler
 from onioncollect.config import Settings
 from onioncollect.fetcher import Fetcher, FetchResult, Sessions
 from onioncollect.pages import signed_in
 from onioncollect.source_config import SourceConfig
-from onioncollect.sources import SourceTable
+from onioncollect.writer_client import Writer
 
 log = logging.getLogger(__name__)
 
 
 class Logins:
-    def __init__(self, settings: Settings, sources: SourceTable):
+    def __init__(self, settings: Settings, writer: Writer):
         self.settings = settings
-        self.sources = sources
+        self.writer = writer
         self.sessions = Sessions()
         self.locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         # Each source's login outcome for its run under way: None when signed in, else the error every page of
@@ -52,7 +52,7 @@ class Logins:
             return posted.error if posted.error not in (None, "redirect") else "auth_rejected"
         path = config.path_for(posted.redirect_to)
         if path is None:
-            await self.sources.add_redirect_target(source_id, onion.host_of(posted.redirect_to))
+            await self.writer.add_redirect_target(source_id, onion.host_of(posted.redirect_to))
             return "auth_rejected"
         landed = await fetcher.fetch(source_id, path)
         if landed.error is not None:
@@ -60,7 +60,7 @@ class Logins:
         excluded, matched = await asyncio.to_thread(signed_in, landed, config.auth.success_selector,
                                                     self.settings.safety_patterns)
         if excluded:
-            await self.sources.change_state(source_id, lifecycle.DISABLED, f"safety: {excluded}")
+            await self.writer.disable_for_safety(source_id)
             log.warning("%s disabled: body tripped %s", source_id, excluded)
             return "excluded_body"
         return None if matched else "auth_rejected"

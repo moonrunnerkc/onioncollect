@@ -1,4 +1,4 @@
-# Stage 1: copy to the guest's /home/crawler/configs/testonion.toml after `triage approve`, with the hostname
+# Stage 1: copy to the guest's /var/lib/onioncollect/configs/testonion.toml after `triage approve`, with the hostname
 # `make testonion` printed in place of HOSTNAME, then run `golive testonion`. Public pages only, no login.
 id = "testonion"
 hosts = ["HOSTNAME"]

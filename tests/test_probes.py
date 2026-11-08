@@ -7,7 +7,8 @@ from unittest import mock
 import httpx
 
 from onioncollect import probes
-from onioncollect.db import Frontier, open_collect
+from onioncollect.db import open_collect
+from onioncollect.runs import RunLog
 from onioncollect.fetcher import Fetcher
 from onioncollect.sources import SourceTable
 from tests.fixtures import NEWS, NEWS_CONFIG, NEWS_MIRROR, make_live, news_config, throwaway_settings
@@ -15,6 +16,23 @@ from tests.test_db import Clock
 from tests.test_fetcher import HTML, FetcherTestCase, TrackingStream
 
 TWO_HOSTS = news_config(NEWS_CONFIG.replace(f'["{NEWS}"]', f'["{NEWS}", "{NEWS_MIRROR}"]'))
+
+
+class Direct:
+    """The writer ops a prober uses, straight against the stores, so the test's clock drives them. The crawler
+    tests run the same calls through the socket."""
+
+    def __init__(self, table: SourceTable, runs: RunLog):
+        self.table, self.runs = table, runs
+
+    async def resolve(self, source_id):
+        return await self.table.resolve(source_id)
+
+    async def due_probes(self, interval):
+        return await self.runs.due_probes(interval)
+
+    async def probe_result(self, host, up):
+        await self.runs.record_probe(host, up)
 
 
 class Captured(logging.Handler):
@@ -32,10 +50,10 @@ class ProbeTest(unittest.IsolatedAsyncioTestCase):
         self.clock = Clock()
         self.db = await open_collect(Path(self.dir.name) / "collect.db")
         self.table = SourceTable(self.db, clock=self.clock)
-        self.frontier = Frontier(self.db, per_source=2, clock=self.clock)
         await make_live(self.table)
         await self.table.add_mirror(NEWS_MIRROR, "news", "second address", "t", frozenset())
-        self.prober = probes.Prober(throwaway_settings(), self.table, self.frontier, clock=self.clock)
+        self.prober = probes.Prober(throwaway_settings(), Direct(self.table, RunLog(self.db, clock=self.clock)),
+                                    clock=self.clock)
         self.config = TWO_HOSTS
         self.requested = []
 
@@ -122,7 +140,7 @@ class ProbeFetcherControlsTest(FetcherTestCase):
     async def asyncSetUp(self):
         await super().asyncSetUp()
         await self.table.add_mirror(NEWS_MIRROR, "news", "second address", "t", frozenset())
-        self.prober = probes.Prober(throwaway_settings(max_body_bytes=1000), self.table, Frontier(self.db, per_source=2))
+        self.prober = probes.Prober(throwaway_settings(max_body_bytes=1000), Direct(self.table, RunLog(self.db)))
 
     async def test_a_binary_answer_is_refused_before_a_byte_of_its_body_is_read(self):
         stream = TrackingStream([b"PK\x03\x04" * 100])

@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,15 +18,16 @@ COLLECTING = tuple(sorted(lifecycle.COLLECTING))
 # One statement, so no other claim can interleave. `due` keeps only rows whose source still has a free
 # lease slot; the window numbers each source's candidates so a batch never takes more of one source than
 # its free slots (a correlated count alone would read the pre-update table and let a batch overfill).
-# The join on sources is the approval gate at the queue: a row whose source is not collecting waits.
-CLAIM = f"""
+# :collecting, the writer's list of live and degraded sources as JSON, is the approval gate at the queue: a row
+# whose source is not collecting waits. The fetcher checks the state again before any request.
+CLAIM = """
 WITH busy AS (
     SELECT source_id, COUNT(*) AS leased FROM urls WHERE status = 'leased' GROUP BY source_id
 ), due AS (
     SELECT u.source_id, u.path, u.kind, u.page, u.discovered_at, COALESCE(b.leased, 0) AS leased
-    FROM urls u JOIN sources s ON s.id = u.source_id LEFT JOIN busy b ON b.source_id = u.source_id
+    FROM urls u LEFT JOIN busy b ON b.source_id = u.source_id
     WHERE u.status = 'queued' AND u.next_due <= :now AND COALESCE(b.leased, 0) < :per_source
-      AND s.state IN {COLLECTING}
+      AND u.source_id IN (SELECT value FROM json_each(:collecting))
     ORDER BY u.page, u.discovered_at
     LIMIT :pool
 ), picked AS (
@@ -141,52 +143,49 @@ class Database:
 
 async def open_collect(path: Path, read_only: bool = False) -> Database:
     database = Database()
-    await database.open(path, schema.SOURCES, schema.FRONTIER, read_only=read_only)
+    await database.open(path, schema.SOURCES, schema.RUNS, read_only=read_only)
+    return database
+
+
+async def open_frontier(path: Path) -> Database:
+    database = Database()
+    await database.open(path, schema.FRONTIER)
     return database
 
 
 class Frontier:
+    """The crawler's queue of paths, in its own state dir. Run totals and metrics are the writer's (runs.RunLog)."""
+
     def __init__(self, database: Database, per_source: int, clock: Callable[[], datetime] = lambda: datetime.now(UTC)):
         self.db = database
         self.per_source = per_source
         self.clock = clock
 
-    async def due_sources(self) -> list[str]:
-        rows = await self.db.rows(
-            f"SELECT id FROM sources s WHERE state IN {COLLECTING} AND (next_run IS NULL OR next_run <= ?)"
-            " AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.source_id = s.id AND r.finished_at IS NULL) ORDER BY id",
-            (stamp(self.clock()),),
-        )
-        return [row["id"] for row in rows]
-
-    async def start_run(self, source_id: str, seeds: tuple[str, ...]) -> int:
+    async def queue_seeds(self, source_id: str, run_id: int, seeds: tuple[str, ...]) -> None:
         now = stamp(self.clock())
         async with self.db.write() as db:
-            cursor = await db.execute("INSERT INTO runs (source_id, started_at) VALUES (?, ?)", (source_id, now))
-            run_id = cursor.lastrowid
             await db.executemany(QUEUE_LISTING, [(source_id, path, 1, run_id, now, now) for path in seeds])
-        return run_id
 
-    async def claim(self, n: int) -> list[Task]:
+    async def claim(self, n: int, collecting: list[str]) -> list[Task]:
         now = self.clock()
-        params = {"now": stamp(now), "lease": stamp(now + LEASE), "n": n, "per_source": self.per_source, "pool": n * 50}
+        params = {"now": stamp(now), "lease": stamp(now + LEASE), "n": n, "per_source": self.per_source, "pool": n * 50,
+                  "collecting": json.dumps(collecting)}
         async with self.db.write() as db:
             rows = await db.execute_fetchall(CLAIM, params)
         return [Task(*row) for row in rows]
 
-    async def complete(self, task: Task, metric: PageMetric, listing: list[tuple[str, int]], details: list[str]) -> None:
+    async def complete(self, task: Task, status: int | None, listing: list[tuple[str, int]], details: list[str]) -> None:
         now = stamp(self.clock())
         async with self.db.write() as db:
             await db.execute(
                 "UPDATE urls SET status = 'done', retries = 0, lease_until = NULL, last_fetched = ?, last_code = ?"
                 " WHERE source_id = ? AND path = ?",
-                (now, metric.status, task.source_id, task.path),
+                (now, status, task.source_id, task.path),
             )
             await db.executemany(QUEUE_LISTING, [(task.source_id, path, page, task.run_id, now, now) for path, page in listing])
             await db.executemany(QUEUE_DETAIL, [(task.source_id, path, 0, task.run_id, now, now) for path in details])
-            await self._record(db, task, metric, now, up=True)
 
-    async def fail(self, task: Task, metric: PageMetric, retries: int, next_due: datetime | None) -> None:
+    async def fail(self, task: Task, status: int | None, retries: int, next_due: datetime | None) -> None:
         now = stamp(self.clock())
         due = None if next_due is None else stamp(next_due)
         async with self.db.write() as db:
@@ -194,77 +193,19 @@ class Frontier:
                 "UPDATE urls SET status = CASE WHEN ? IS NULL THEN 'failed' ELSE 'queued' END, retries = ?,"
                 " next_due = COALESCE(?, next_due), lease_until = NULL, last_fetched = ?, last_code = ?"
                 " WHERE source_id = ? AND path = ?",
-                (due, retries, due, now, metric.status, task.source_id, task.path),
+                (due, retries, due, now, status, task.source_id, task.path),
             )
-            await self._record(db, task, metric, now, up=metric.status is not None)
 
-    async def _record(self, db: aiosqlite.Connection, task: Task, metric: PageMetric, now: str, up: bool) -> None:
-        await db.execute(
-            "INSERT INTO page_metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (task.run_id, task.source_id, metric.host, task.kind, now, metric.status, metric.error, metric.elapsed,
-             metric.bytes, metric.items, metric.fields_resolved, metric.fields_declared, metric.redactions),
-        )
-        await db.execute(
-            "UPDATE runs SET pages = pages + ?, failures = failures + ?, items = items + ?, incomplete = incomplete + ?,"
-            " fields_resolved = fields_resolved + ?, fields_declared = fields_declared + ?,"
-            " below_expectation = below_expectation + ?, redactions = redactions + ?, records_new = records_new + ?"
-            " WHERE id = ?",
-            (int(metric.error is None), int(metric.error is not None), metric.items, metric.incomplete,
-             metric.fields_resolved, metric.fields_declared, int(metric.below_expectation), metric.redactions,
-             metric.records_new, task.run_id),
-        )
-        await db.executemany(
-            "INSERT INTO run_fields VALUES (?, ?, ?, ?, ?) ON CONFLICT (run_id, kind, field) DO UPDATE SET"
-            " resolved = resolved + excluded.resolved, declared = declared + excluded.declared",
-            [(task.run_id, task.kind, name, hits, metric.field_items) for name, hits in metric.field_hits.items()],
-        )
-        await self._sighted(db, metric.host, now, up)
+    async def open_in_run(self, run_id: int) -> int:
+        (count,), = await self.db.rows(
+            "SELECT COUNT(*) FROM urls WHERE run_id = ? AND status IN ('queued', 'leased')", (run_id,))
+        return count
 
-    async def _sighted(self, db: aiosqlite.Connection, host: str, now: str, up: bool) -> None:
-        column = "last_up" if up else "last_down"
-        await db.execute(f"UPDATE hosts SET {column} = ? WHERE host = ?", (now, host))
-        await db.execute("INSERT INTO uptime VALUES (?, ?, ?)", (host, now, int(up)))
-
-    async def due_probes(self, interval: timedelta) -> list[tuple[str, str]]:
-        """(source id, host) for each collecting source's hosts other than its active one that nothing has
-        reached or tried within `interval`."""
-        rows = await self.db.rows(
-            f"SELECT s.id, h.host FROM hosts h JOIN sources s ON s.id = h.source_id WHERE h.state = ?"
-            f" AND s.state IN {COLLECTING} AND h.host != s.active_host"
-            " AND NOT EXISTS (SELECT 1 FROM uptime u WHERE u.host = h.host AND u.checked_at >= ?) ORDER BY s.id, h.host",
-            (lifecycle.MEMBER, stamp(self.clock() - interval)),
-        )
-        return [(row["id"], row["host"]) for row in rows]
-
-    async def record_probe(self, host: str, up: bool) -> None:
-        async with self.db.write() as db:
-            await self._sighted(db, host, stamp(self.clock()), up)
-
-    async def finish_if_done(self, run_id: int, schedule: Callable[[aiosqlite.Row], datetime]) -> aiosqlite.Row | None:
-        """Closes a run once nothing of it is queued or leased. Returns the run the first time only."""
-        async with self.db.write() as db:
-            (open_rows,), = await db.execute_fetchall(
-                "SELECT COUNT(*) FROM urls WHERE run_id = ? AND status IN ('queued', 'leased')", (run_id,)
-            )
-            rows = await db.execute_fetchall(
-                "SELECT r.*, s.failed_runs FROM runs r JOIN sources s ON s.id = r.source_id"
-                " WHERE r.id = ? AND r.finished_at IS NULL", (run_id,)
-            )
-            if open_rows or not rows:
-                return None
-            run = rows[0]
-            await db.execute("UPDATE runs SET finished_at = ? WHERE id = ?", (stamp(self.clock()), run_id))
-            await db.execute(
-                "UPDATE sources SET next_run = ?, failed_runs = CASE WHEN ? THEN failed_runs + 1 ELSE 0 END WHERE id = ?",
-                (stamp(schedule(run)), run["pages"] == 0, run["source_id"]),
-            )
-            return run
-
-    async def pending(self) -> int:
+    async def pending(self, collecting: list[str]) -> int:
         """Pages of collecting sources still to fetch: queued (a retry included) or leased."""
         (count,), = await self.db.rows(
-            f"SELECT COUNT(*) FROM urls u JOIN sources s ON s.id = u.source_id"
-            f" WHERE u.status IN ('queued', 'leased') AND s.state IN {COLLECTING}"
+            "SELECT COUNT(*) FROM urls WHERE status IN ('queued', 'leased')"
+            " AND source_id IN (SELECT value FROM json_each(?))", (json.dumps(collecting),)
         )
         return count
 
@@ -276,20 +217,5 @@ class Frontier:
             )
             return cursor.rowcount
 
-    async def stats(self) -> dict:
-        now = self.clock()
-        (recent,), = await self.db.rows(
-            "SELECT COUNT(*) FROM uptime WHERE checked_at >= ?", (stamp(now - RATE_WINDOW),)
-        )
-        (fetches, ups), = await self.db.rows(
-            "SELECT COUNT(*), COALESCE(SUM(up), 0) FROM uptime WHERE checked_at >= ?", (stamp(now - timedelta(hours=1)),)
-        )
-        urls = await self.db.rows("SELECT status, COUNT(*) FROM urls GROUP BY status")
-        sources = await self.db.rows("SELECT state, COUNT(*) FROM sources GROUP BY state")
-        hosts = await self.db.rows("SELECT state, COUNT(*) FROM hosts GROUP BY state")
-        (open_runs,), = await self.db.rows("SELECT COUNT(*) FROM runs WHERE finished_at IS NULL")
-        return {
-            "urls": {row[0]: row[1] for row in urls}, "sources": {row[0]: row[1] for row in sources},
-            "hosts": {row[0]: row[1] for row in hosts}, "open_runs": open_runs,
-            "fetches_last_hour": fetches, "up_last_hour": ups, "fetches_recent": recent,
-        }
+    async def counts(self) -> dict[str, int]:
+        return {row[0]: row[1] for row in await self.db.rows("SELECT status, COUNT(*) FROM urls GROUP BY status")}

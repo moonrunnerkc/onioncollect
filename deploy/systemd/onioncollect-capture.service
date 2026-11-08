@@ -17,6 +17,8 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/analyst
+# It reads the stores; only the writer and the retention sweep write them.
+ReadOnlyPaths=/home/analyst/data
 PrivateTmp=yes
 PrivateDevices=yes
 PrivateNetwork=yes

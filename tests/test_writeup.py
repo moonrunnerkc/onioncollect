@@ -7,12 +7,11 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
 from onioncollect.db import open_collect
-from onioncollect.golive import Report, save_report
 from onioncollect.records import RecordStore
 from onioncollect.sources import SourceTable
 from tests.fixtures import (CANDIDATE, DECLINED, TESTONION, TESTONION_PASSWORD, TESTONION_USER, make_live,
@@ -106,9 +105,10 @@ class CaptureTest(unittest.TestCase):
         leak.write_text(json.dumps(result))
         self.settings = root / "settings.toml"
         self.settings.write_text(f'data_dir = "{self.data}"\nconfigs_dir = "{root / "configs"}"\n'
-                                 f'leak_test_result = "{leak}"\n')
+                                 f'log_dir = "{root / "log"}"\nleak_test_result = "{leak}"\n')
         asyncio.run(self.stores())
-        (self.data / "crawl.log").write_text(
+        (root / "log").mkdir()
+        (root / "log" / "crawl.log").write_text(
             "2026-11-08 09:00:00,000 INFO onioncollect.tor_pool: tor 10051: success 0.97 over 120 fetches,"
             " last rotation never\n"
             f"2026-11-08 09:01:00,000 INFO onioncollect.crawler: news run 3 started {TESTONION}\n"
@@ -125,8 +125,7 @@ class CaptureTest(unittest.TestCase):
         await table.decline(DECLINED, f"sells logins like {TESTONION_USER}:{TESTONION_PASSWORD} from {PLANTED_IPS[1]}",
                             "tester")
         for passed in (False, True):
-            await save_report(table, "testonion", Report([(passed, f"reachability: {TESTONION} answered")]),
-                              datetime.now(UTC))
+            await table.add_golive_report("testonion", passed, [(passed, f"reachability: {TESTONION} answered")])
         await store.close()
         await collect.close()
 

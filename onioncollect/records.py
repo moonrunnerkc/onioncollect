@@ -12,10 +12,11 @@ from typing import Callable
 
 from onioncollect import detect, schema, search
 from onioncollect.db import Database, stamp
-from onioncollect.fingerprint import Fingerprint, to_hex
+from onioncollect.matching import Fingerprint, to_hex
 from onioncollect.redact import Redacted
 
 KEYED_HASH = re.compile(r"[0-9a-f]{64}")
+SNAPSHOT_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
 class RefusedWrite(Exception):
@@ -52,12 +53,11 @@ class RecordStore:
 
     async def open(self, read_only: bool = False) -> None:
         if not read_only:
-            # Group-readable: in the guest the group is the analyst's, which reads and never writes.
+            # The analyst's alone. The crawler reaches the stores only through the writer.
             for directory in (self.root, self.snapshot_dir):
-                directory.mkdir(mode=0o750, parents=True, exist_ok=True)
-                # Only when wrong: a chmod would also clear the setgid bit that keeps new files in that group.
-                if stat.S_IMODE(directory.stat().st_mode) & 0o777 != 0o750:
-                    directory.chmod(0o750)
+                directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+                if stat.S_IMODE(directory.stat().st_mode) != 0o700:
+                    directory.chmod(0o700)
         await self.db.open(self.root / "records.db", schema.RECORDS, read_only=read_only)
 
     async def close(self) -> None:
@@ -131,7 +131,18 @@ class RecordStore:
     async def save_baselines(self, source_id: str, pages: list[tuple[str, str]]) -> None:
         """Golive's seed snapshots, together the source's known-good layout. They replace any earlier set."""
         await refuse_secrets(*(html for _, html in pages))
-        digests = [(path, self._write_snapshot(html)) for path, html in pages]
+        await self.mark_baselines(source_id, [(path, self._write_snapshot(html)) for path, html in pages])
+
+    async def stage_snapshot(self, html: str) -> str:
+        """A snapshot file with no row yet, for mark_baselines: the writer takes golive's seed pages one request
+        at a time."""
+        await refuse_secrets(html)
+        return self._write_snapshot(html)
+
+    async def mark_baselines(self, source_id: str, digests: list[tuple[str, str]]) -> None:
+        for _, digest in digests:
+            if not SNAPSHOT_DIGEST.fullmatch(digest) or not self.snapshot_path(digest).is_file():
+                raise RefusedWrite("a baseline names no staged snapshot")
         now = self.clock()
         async with self.db.write() as db:
             await db.execute("UPDATE snapshots SET baseline = 0 WHERE source_id = ?", (source_id,))
@@ -146,9 +157,9 @@ class RecordStore:
         digest = hashlib.sha256(data).hexdigest()
         target = self.snapshot_path(digest)
         if not target.exists():
-            target.parent.mkdir(mode=0o750, exist_ok=True)
+            target.parent.mkdir(mode=0o700, exist_ok=True)
             temp = target.with_suffix(".tmp")
-            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
             os.replace(temp, target)

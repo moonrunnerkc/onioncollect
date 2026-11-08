@@ -1,7 +1,8 @@
 """Section 9's scheduling as the timer runs it: cadence decides what is due, a failing source is retried sooner for
 a bounded number of runs and then slowed and handed to the health queue, one crawl at a time, and no crawl at all
 without a leak test from after the current deploy and under 36 hours old, or with a config that fails the loader.
-Selection itself is Frontier.due_sources (db.py), the multiplier scheduler.next_run, applied in Crawler.finish_run."""
+Selection itself is RunLog.due_sources (runs.py), the multiplier scheduler.next_run, applied in the writer's
+run_finish."""
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
@@ -45,9 +46,9 @@ class DueSelectionTest(CrawlerTestCase):
         return datetime.fromisoformat(row["next_run"]).replace(tzinfo=UTC)
 
     async def make_due(self):
-        await self.crawler.collect.conn.execute("UPDATE sources SET next_run = ? WHERE id = 'news'",
+        await self.stores.collect.conn.execute("UPDATE sources SET next_run = ? WHERE id = 'news'",
                                                 (stamp(datetime.now(UTC) - timedelta(seconds=1)),))
-        await self.crawler.collect.conn.commit()
+        await self.stores.collect.conn.commit()
 
     async def test_a_source_not_yet_due_is_not_fetched(self):
         await self.crawl({"/articles/": listing_page("A", "B")})
@@ -59,9 +60,9 @@ class DueSelectionTest(CrawlerTestCase):
         self.assertEqual(runs, 1)
 
     async def test_the_timer_run_with_nothing_due_builds_no_request_and_stops(self):
-        await self.crawler.collect.conn.execute("UPDATE sources SET next_run = ? WHERE id = 'news'",
+        await self.stores.collect.conn.execute("UPDATE sources SET next_run = ? WHERE id = 'news'",
                                                 (stamp(datetime.now(UTC) + CADENCE),))
-        await self.crawler.collect.conn.commit()
+        await self.stores.collect.conn.commit()
         await self.crawler.close()
         self.crawler.tor_pool = FakePool()
         built = []
@@ -79,11 +80,11 @@ class DueSelectionTest(CrawlerTestCase):
             wait = await self.next_run() - datetime.now(UTC)
             expected = quick if run <= scheduler.QUICK_RETRY_RUNS else CADENCE * scheduler.SLOWED_MULTIPLIER
             self.assertAlmostEqual(wait.total_seconds(), expected.total_seconds(), delta=60, msg=run)
-            items = [item["kind"] for item in await self.crawler.health.queue()]
+            items = [item["kind"] for item in await self.stores.health.queue()]
             self.assertEqual(items, [] if run <= scheduler.QUICK_RETRY_RUNS else [health.UNREACHABLE], run)
             self.assertEqual((await self.crawl({})).calls, [], f"run {run}: not due again before its time")
             await self.make_due()
-        self.assertEqual((await self.crawler.sources.get("news"))["state"], lifecycle.DEGRADED)
+        self.assertEqual((await self.stores.sources.get("news"))["state"], lifecycle.DEGRADED)
 
 
 class TimerModeTest(CrawlerTestCase):
@@ -120,7 +121,7 @@ class ConfigGateTest(CrawlerTestCase):
         self.assertFalse(pool.started)
 
     async def test_form_session_sources_are_named_at_the_start(self):
-        await make_live(self.crawler.sources, "testonion", TESTONION, "self-hosted")
+        await make_live(self.stores.sources, "testonion", TESTONION, "self-hosted")
         (self.root / "configs" / "testonion.toml").write_text(TESTONION_CONFIG)
         with self.assertLogs("onioncollect.crawler", logging.INFO) as logs:
             await self.crawler.check_configs()
@@ -144,7 +145,7 @@ class CrawlRunGateTest(CliTestCase):
         return message
 
     def test_a_second_crawl_exits_non_zero_and_builds_nothing(self):
-        settings = mock.Mock(data_dir=self.data)
+        settings = mock.Mock(state_dir=self.root / "state")
         with crawl_cli.run_lock(settings):
             with self.assertRaises(SystemExit) as caught:
                 self.cli("crawl", "run", "--until-idle")

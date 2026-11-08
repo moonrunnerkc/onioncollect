@@ -1,0 +1,44 @@
+# The write socket. As the analyst, which owns the stores: every write the crawler makes arrives here over
+# /run/onioncollect/writer.sock, from the crawler's uid only, and the storage layer's secret detector runs here, under
+# a different user from the redaction gate. The socket is analyst:onioncollect-ipc 0660, and onioncollect-ipc holds
+# the crawler alone. No network at all: its one socket is a unix one.
+[Unit]
+Description=onioncollect writer, the crawler's only way to the stores
+
+[Service]
+Type=simple
+User=analyst
+Group=analyst
+SupplementaryGroups=onioncollect-ipc
+WorkingDirectory=/opt/onioncollect/app
+ExecStart=/opt/onioncollect/venv/bin/python -s -E -m onioncollect.writer --data-dir /home/analyst/data --configs-dir /var/lib/onioncollect/configs
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=onioncollect
+RuntimeDirectoryMode=0755
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# The stores, and the configs dir for golive's --as-mirror-of, which adds hosts to a config.
+ReadWritePaths=/home/analyst/data /var/lib/onioncollect/configs
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

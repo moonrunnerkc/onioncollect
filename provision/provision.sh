@@ -6,12 +6,23 @@ export DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1
 
 STAGE=/etc/onioncrawl
 INSTANCES="1 2 3 4 5 6"
-CRAWLER_HOME=/home/crawler
+# The layout's paths, users and groups. tests/test_provision.py overrides them to run migrate_layout on a fake tree.
+CRAWLER=${CRAWLER:-crawler}
+ANALYST=${ANALYST:-analyst}
+CRAWLER_GROUP=${CRAWLER_GROUP:-crawler}
+ANALYST_GROUP=${ANALYST_GROUP:-analyst}
+IPC_GROUP=${IPC_GROUP:-onioncollect-ipc}
+CRAWLER_HOME=${CRAWLER_HOME:-/home/crawler}
+ANALYST_HOME=${ANALYST_HOME:-/home/analyst}
+SHARED=${SHARED:-/var/lib/onioncollect}
+LOG_DIR=${LOG_DIR:-/var/log/onioncollect}
+DATA_DIR=$ANALYST_HOME/data
+CONFIGS_DIR=$SHARED/configs
+STATE_DIR=$CRAWLER_HOME/state
 PASSWORD_FILE=$CRAWLER_HOME/control-password
 SALT_FILE=$CRAWLER_HOME/redaction-salt
 HASH_FILE=/etc/tor/onioncrawl-control.hash
 VENV=$CRAWLER_HOME/venv
-ANALYST_HOME=/home/analyst
 OPT=/opt/onioncollect
 TOR_KEY_FPR=A3C4F0F979CAA22CDBA8F512EE8CBC9E886DDD89
 TOR_KEYRING=/usr/share/keyrings/deb.torproject.org-keyring.gpg
@@ -115,17 +126,14 @@ create_crawler() {
         useradd --create-home --user-group --shell /bin/bash crawler
         log "crawler user created"
     fi
-    chmod 700 "$CRAWLER_HOME"
     for group in sudo adm; do
         id -nG crawler | tr ' ' '\n' | grep -qx "$group" && gpasswd -d crawler "$group"
     done
-    for dir in data configs; do
-        install -d -m 700 -o crawler -g crawler "$CRAWLER_HOME/$dir"
-    done
 }
 
-# The analyst reads the crawler's stores through the data dir's group and can write none of them. It gets no
-# firewall rule of its own, so the kill switch leaves it loopback only, like every user but Tor's.
+# The analyst owns the stores (mode 700) and runs the writer, which the crawler reaches over a unix socket whose
+# group, onioncollect-ipc, holds the crawler alone. The analyst gets no firewall rule of its own, so the kill switch
+# leaves it loopback only, like every user but Tor's.
 create_analyst() {
     if ! id analyst >/dev/null 2>&1; then
         useradd --create-home --user-group --shell /bin/bash analyst
@@ -135,21 +143,82 @@ create_analyst() {
     for group in sudo adm; do
         id -nG analyst | tr ' ' '\n' | grep -qx "$group" && gpasswd -d analyst "$group"
     done
-    chown crawler:analyst "$CRAWLER_HOME"
-    chmod 710 "$CRAWLER_HOME"
-    chgrp -R analyst "$CRAWLER_HOME/data"
-    chmod -R g-w,o-rwx "$CRAWLER_HOME/data"
-    chmod -R g+rX "$CRAWLER_HOME/data"
-    # New files take the analyst group from their directory.
-    find "$CRAWLER_HOME/data" -type d -exec chmod g+s {} +
+    if ! getent group "$IPC_GROUP" >/dev/null; then
+        groupadd --system "$IPC_GROUP"
+        log "$IPC_GROUP group created"
+    fi
+    id -nG crawler | tr ' ' '\n' | grep -qx "$IPC_GROUP" || usermod -aG "$IPC_GROUP" crawler
+    id -nG analyst | tr ' ' '\n' | grep -qx "$IPC_GROUP" && gpasswd -d analyst "$IPC_GROUP"
+    migrate_layout
+    # Triage refuses an excluded host, so the analyst keeps its own copy of the crawler's list.
+    if ! cmp -s "$CRAWLER_HOME/exclusions.txt" "$ANALYST_HOME/exclusions.txt"; then
+        install -m 600 -o analyst -g analyst "$CRAWLER_HOME/exclusions.txt" "$ANALYST_HOME/exclusions.txt"
+        log "analyst exclusions.txt copied from the crawler's"
+    fi
     local settings=$ANALYST_HOME/settings.toml rendered
     rendered=$(mktemp)
-    printf 'data_dir = "%s"\nconfigs_dir = "%s"\n' "$CRAWLER_HOME/data" "$CRAWLER_HOME/configs" > "$rendered"
+    printf 'data_dir = "%s"\nconfigs_dir = "%s"\nlog_dir = "%s"\nexclusions_file = "%s"\n' \
+        "$DATA_DIR" "$CONFIGS_DIR" "$LOG_DIR" "$ANALYST_HOME/exclusions.txt" > "$rendered"
     if ! cmp -s "$rendered" "$settings"; then
         install -m 600 -o analyst -g analyst "$rendered" "$settings"
         log "analyst settings.toml written"
     fi
     rm -f "$rendered"
+}
+
+# The layout the writer needs, from whatever an earlier one left. Stores to the analyst's data dir, the frontier
+# and run lock to the crawler's state dir, the crawl log to the log dir the analyst audits, configs to the shared
+# dir the crawler reads. Moves happen once; ownership and modes converge on every run.
+migrate_layout() {
+    local old=$CRAWLER_HOME/data name file
+    install -d -m 700 -o "$ANALYST" -g "$ANALYST_GROUP" "$DATA_DIR"
+    install -d -m 700 -o "$CRAWLER" -g "$CRAWLER_GROUP" "$STATE_DIR"
+    install -d -m 755 "$SHARED"
+    install -d -m 2750 -o "$ANALYST" -g "$IPC_GROUP" "$CONFIGS_DIR"
+    install -d -m 2750 -o "$CRAWLER" -g "$ANALYST_GROUP" "$LOG_DIR"
+    if [ -d "$old" ]; then
+        for name in collect.db collect.db-wal collect.db-shm records.db records.db-wal records.db-shm snapshots; do
+            if [ -e "$old/$name" ] && [ ! -e "$DATA_DIR/$name" ]; then
+                mv "$old/$name" "$DATA_DIR/"
+                log "$name moved to the analyst's data dir"
+            fi
+        done
+        for name in frontier.db frontier.db-wal frontier.db-shm; do
+            if [ -e "$old/$name" ] && [ ! -e "$STATE_DIR/$name" ]; then
+                mv "$old/$name" "$STATE_DIR/"
+                log "$name moved to the crawler's state dir"
+            fi
+        done
+        for file in "$old"/crawl.log*; do
+            if [ -e "$file" ] && [ ! -e "$LOG_DIR/$(basename "$file")" ]; then
+                mv "$file" "$LOG_DIR/"
+                log "$(basename "$file") moved to $LOG_DIR"
+            fi
+        done
+        rm -f "$old/run.lock"
+        if rmdir "$old" 2>/dev/null; then log "$old removed"; else log "$old kept: it holds files no store uses"; fi
+    fi
+    if [ -d "$CRAWLER_HOME/configs" ]; then
+        for file in "$CRAWLER_HOME"/configs/*.toml; do
+            if [ -e "$file" ] && [ ! -e "$CONFIGS_DIR/$(basename "$file")" ]; then
+                mv "$file" "$CONFIGS_DIR/"
+                log "config $(basename "$file") moved to $CONFIGS_DIR"
+            fi
+        done
+        if rmdir "$CRAWLER_HOME/configs" 2>/dev/null; then log "$CRAWLER_HOME/configs removed"; fi
+    fi
+    chown -R "$ANALYST:$ANALYST_GROUP" "$DATA_DIR"
+    chmod -R go-rwx "$DATA_DIR"
+    find "$DATA_DIR" -type d -perm -2000 -exec chmod g-s {} +
+    chown -R "$CRAWLER:$CRAWLER_GROUP" "$STATE_DIR"
+    chmod -R go-rwx "$STATE_DIR"
+    chown -R "$ANALYST:$IPC_GROUP" "$CONFIGS_DIR"
+    find "$CONFIGS_DIR" -type f -exec chmod 640 {} +
+    chown -R "$CRAWLER:$ANALYST_GROUP" "$LOG_DIR"
+    find "$LOG_DIR" -type f -exec chmod 640 {} +
+    # An earlier layout let the analyst's group into the crawler's home.
+    chown "$CRAWLER:$CRAWLER_GROUP" "$CRAWLER_HOME"
+    chmod 700 "$CRAWLER_HOME"
 }
 
 create_redaction_salt() {
@@ -243,8 +312,10 @@ write_settings() {
     cat > "$rendered" <<EOF
 control_password_file = "$PASSWORD_FILE"
 redaction_salt_file = "$SALT_FILE"
-data_dir = "$CRAWLER_HOME/data"
-configs_dir = "$CRAWLER_HOME/configs"
+data_dir = "$DATA_DIR"
+configs_dir = "$CONFIGS_DIR"
+state_dir = "$STATE_DIR"
+log_dir = "$LOG_DIR"
 exclusions_file = "$CRAWLER_HOME/exclusions.txt"
 safety_patterns_file = "$CRAWLER_HOME/safety-patterns.txt"
 EOF
@@ -286,6 +357,9 @@ install_kill_switch() {
         log "kill switch rules written and persisted"
     fi
 }
+
+# Sourced by tests/test_provision.py for migrate_layout alone.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
 
 install_tor_repo
 install_packages

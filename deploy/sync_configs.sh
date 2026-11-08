@@ -2,21 +2,22 @@
 # sync_configs.sh STAGED GUEST: install every staged collection config into the guest's configs dir. It never
 # deletes a guest config by default. With PRUNE_CONFIGS=1 it lists the guest configs this checkout lacks and
 # deletes them only after a typed "yes" on stdin. DRY_RUN=1 prints what it would do and changes nothing.
-# OWNER and GROUP (default crawler) own what it installs; the tests run it on a fake tree as themselves.
+# OWNER and GROUP own what it installs: the analyst, who writes configs, and onioncollect-ipc, the crawler's group,
+# which reads them. The tests run it on a fake tree as themselves.
 set -euo pipefail
 staged=$1
 guest=$2
-owner=${OWNER:-crawler}
-group=${GROUP:-crawler}
+owner=${OWNER:-analyst}
+group=${GROUP:-onioncollect-ipc}
 
 act() {
     if [ "${DRY_RUN:-0}" = 1 ]; then echo "would run: $*"; else "$@"; fi
 }
 
-act install -d -m 700 -o "$owner" -g "$group" "$guest"
+act install -d -m 2750 -o "$owner" -g "$group" "$guest"
 for file in "$staged"/*.toml; do
     [ -e "$file" ] || continue
-    act install -m 600 -o "$owner" -g "$group" "$file" "$guest/"
+    act install -m 640 -o "$owner" -g "$group" "$file" "$guest/"
     echo "config $(basename "$file") installed"
 done
 

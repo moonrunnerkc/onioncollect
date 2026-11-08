@@ -7,6 +7,9 @@ from onioncollect.sources import RefusedChange
 from tests.fixtures import NEWS_MIRROR, make_live, news_config
 from tests.test_db import CollectTestCase, metric
 
+# news's expectations, as the crawler hands them to the writer at a run's end.
+EXPECT = (news_config().min_items_per_page, news_config().required_fields, news_config().category)
+
 THIN = Finding(health.BELOW_EXPECTATION, 50, "2 complete items on 1 listing pages, expected 5 a page")
 DOWN = Finding(health.UNREACHABLE, 100, "nothing fetched in 4 runs in a row")
 
@@ -24,14 +27,14 @@ class QueueTestCase(CollectTestCase):
         """One run of news through the frontier, closed as the crawler closes it."""
         await self.db.conn.execute("UPDATE sources SET next_run = NULL")
         await self.db.conn.commit()
-        await self.frontier.start_run("news", ("/",))
-        (task,) = await self.frontier.claim(1)
+        await self.start_run("news", ("/",))
+        (task,) = await self.claim(1)
         for page in metrics:
             if page.error:
-                await self.frontier.fail(task, page, 9, None)
+                await self.fail(task, page, 9, None)
             else:
-                await self.frontier.complete(task, page, [], [])
-        return await self.frontier.finish_if_done(task.run_id, lambda row: self.clock.now)
+                await self.complete(task, page, [], [])
+        return await self.finish_if_done(task.run_id, lambda row: self.clock.now)
 
 
 class RaiseTest(QueueTestCase):
@@ -114,10 +117,10 @@ class WatchTest(QueueTestCase):
         self.assertEqual(row["snoozed_until_run"], 2)
         healthy = metric(items=5, field_hits={"title": 5, "url": 5}, field_items=5)
         self.clock.advance(minutes=1)
-        await self.queue.after_run(await self.finish_run(healthy), news_config())
+        await self.queue.after_run(await self.finish_run(healthy), *EXPECT)
         self.assertEqual(len(await self.queue.queue()), 1, "still snoozed after one run")
         self.clock.advance(minutes=1)
-        await self.queue.after_run(await self.finish_run(healthy), news_config())
+        await self.queue.after_run(await self.finish_run(healthy), *EXPECT)
         self.assertEqual(await self.queue.queue(), [])
         self.assertEqual(await self.state(), lifecycle.LIVE)
         log = await self.queue.log()
@@ -130,7 +133,7 @@ class WatchTest(QueueTestCase):
         await self.queue.watch(item, 1, "one bad night", "analyst")
         self.clock.advance(minutes=1)
         await self.queue.after_run(await self.finish_run(metric(items=1, field_hits={"title": 1, "url": 1},
-                                                                field_items=1)), news_config())
+                                                                field_items=1)), *EXPECT)
         (row,) = await self.queue.queue()
         self.assertEqual((row["id"], row["snoozed_until_run"], row["occurrences"]), (item, None, 2))
 
@@ -150,19 +153,19 @@ class AfterRunTest(QueueTestCase):
 
     async def test_raises_what_the_run_calls_for(self):
         run = await self.finish_run(metric(items=1, field_hits={"title": 1, "url": 1}, field_items=1))
-        (found,) = await self.queue.after_run(run, news_config())
+        (found,) = await self.queue.after_run(run, *EXPECT)
         self.assertEqual((found.kind, found.priority), (health.BELOW_EXPECTATION, 50))
         self.assertEqual(await self.state(), lifecycle.DEGRADED)
 
     async def test_a_parse_refusal_counts_from_the_metrics(self):
         run = await self.finish_run(metric(error="parse_refused"))
-        (found,) = await self.queue.after_run(run, news_config())
+        (found,) = await self.queue.after_run(run, *EXPECT)
         self.assertEqual(found.kind, health.PARSE_REFUSED)
 
     async def test_nothing_for_a_source_no_longer_collecting(self):
         run = await self.finish_run(metric(items=1, field_hits={"title": 1, "url": 1}, field_items=1))
         await self.table.change_state("news", lifecycle.DISABLED, "gone")
-        self.assertEqual(await self.queue.after_run(run, news_config()), [])
+        self.assertEqual(await self.queue.after_run(run, *EXPECT), [])
         self.assertEqual(await self.queue.queue(), [])
 
     async def test_run_metrics(self):

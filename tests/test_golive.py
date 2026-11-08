@@ -8,15 +8,13 @@ from unittest import mock
 
 from onioncollect import golive, health, lifecycle
 from onioncollect.config import write_config
-from onioncollect.db import open_collect
 from onioncollect.fetcher import FetchResult
-from onioncollect.health_queue import HealthQueue
-from onioncollect.records import RecordStore
-from onioncollect.sources import SourceTable
+from onioncollect.writer_client import Writer
 from tests.fixtures import (CANDIDATE, NEWS, NEWS_CONFIG, NEWS_MIRROR, OFF_SOURCE, headlines, listing_page, make_live,
                             leak_result_owned_by_root, news_config, testonion_config, throwaway_settings,
                             write_leak_result)
 from tests.test_fingerprint import print_of
+from tests.writer_harness import start_writer
 
 GOOD = listing_page("A", "B", "C")
 
@@ -55,10 +53,10 @@ class GoLiveTestCase(unittest.IsolatedAsyncioTestCase):
         leak_result_owned_by_root(self)
         self.settings = throwaway_settings(data_dir=root, configs_dir=root / "configs",
                                            leak_test_result=write_leak_result(root / "leak-test.json"))
-        self.collect = await open_collect(root / "collect.db")
-        self.sources = SourceTable(self.collect)
-        self.records = RecordStore(root, timedelta(days=180), timedelta(days=30))
-        await self.records.open()
+        self.harness = await start_writer(root, root / "configs")
+        self.collect, self.sources = self.harness.stores.collect, self.harness.stores.sources
+        self.records, self.queue = self.harness.stores.records, self.harness.stores.health
+        self.writer = Writer(self.harness.socket)
         await self.sources.approve(NEWS, "news", "journalism-publishing", "newsroom mirror", "tester", frozenset())
         ScriptedFetcher.instances = []
         patcher = mock.patch.object(golive, "Fetcher", ScriptedFetcher)
@@ -66,14 +64,12 @@ class GoLiveTestCase(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(patcher.stop)
 
     async def asyncTearDown(self):
-        await self.records.close()
-        await self.collect.close()
+        await self.harness.stop()
         self.tmp.cleanup()
 
     async def go(self, pages, instances=2, config=None, **decision):
         tors = [mock.Mock(pages=pages) for _ in range(instances)]
-        return await golive.go_live("news", config or news_config(), self.settings, self.sources, self.records, tors,
-                                    **decision)
+        return await golive.go_live("news", config or news_config(), self.settings, self.writer, tors, **decision)
 
     async def state(self) -> str:
         return (await self.sources.get("news"))["state"]
@@ -139,13 +135,13 @@ class GoLiveTest(GoLiveTestCase):
         self.assertEqual([tuple(row) for row in rows], [("/archive/", 1), ("/articles/", 1)])
 
     async def test_a_pass_closes_the_items_a_reapproved_source_still_carries(self):
-        queue = HealthQueue(self.collect, self.sources)
+        queue = self.queue
         await queue.raise_item("news", health.Finding(health.BELOW_EXPECTATION, 40, "thin"), None)
         report = await self.go({"/articles/": GOOD})
         self.assertTrue(report.passed, report.lines)
         self.assertIn("1 open health items closed as fixed", report.lines[-1][1])
         (row,) = await queue.log()
-        self.assertEqual((row["disposition"], row["note"], row["decided_by"]), (health.FIXED, "passed go-live", "golive"))
+        self.assertEqual((row["disposition"], row["note"], row["decided_by"]), (health.FIXED, "passed go-live", self.harness.stores.crawler))
         self.assertEqual(await self.state(), lifecycle.LIVE)
 
     async def test_a_seed_redirecting_off_the_source_leaves_evidence_for_triage(self):
@@ -255,7 +251,7 @@ class RecheckTest(GoLiveTestCase):
 
     async def recheck(self, host, pages, config=None):
         tors = [mock.Mock(pages=pages) for _ in range(2)]
-        return await golive.recheck("news", host, config or self.config, self.settings, self.sources, self.records, tors)
+        return await golive.recheck("news", host, config or self.config, self.settings, self.writer, tors)
 
     async def test_a_sibling_passes_through_the_collecting_state_and_is_fingerprinted(self):
         report = await self.recheck(NEWS_MIRROR, {"/articles/": GOOD})

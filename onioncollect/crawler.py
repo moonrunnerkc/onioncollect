@@ -5,18 +5,16 @@ import random
 import signal
 from datetime import UTC, datetime, timedelta
 
-from onioncollect import health, lifecycle, mirrors, onion, scheduler
+from onioncollect import lifecycle, onion, scheduler, wire
 from onioncollect.config import Settings, load_config
-from onioncollect.db import DETAIL, LISTING, Frontier, PageMetric, Task, open_collect
+from onioncollect.db import DETAIL, LISTING, Frontier, PageMetric, Task, open_frontier
 from onioncollect.fetcher import Fetcher, FetchResult
-from onioncollect.health_queue import HealthQueue
 from onioncollect.pages import Inspection, inspect
 from onioncollect.probes import Prober
-from onioncollect.records import RecordStore, RefusedWrite
 from onioncollect.session import Logins
 from onioncollect.source_config import ConfigError, SourceConfig
-from onioncollect.sources import SourceTable
 from onioncollect.tor_pool import TorPool
+from onioncollect.writer_client import WriteRefused, Writer, WriterError, WriterUnavailable
 
 log = logging.getLogger(__name__)
 
@@ -30,29 +28,26 @@ class Crawler:
         self.settings = settings
         self.configs: dict[str, SourceConfig] = {}
         self.config_errors: dict[str, str] = {}
-        self.records = RecordStore(settings.data_dir, timedelta(days=settings.record_retention_days),
-                                   timedelta(days=settings.snapshot_retention_days))
+        self.writer = Writer(settings.writer_socket)
         self.tor_pool = TorPool(settings)
         self.stopping = asyncio.Event()
         self.detail_snapshots: set[int] = set()
 
     async def open(self) -> None:
-        self.collect = await open_collect(self.settings.data_dir / "collect.db")
-        self.frontier = Frontier(self.collect, self.settings.per_source_concurrency)
-        self.sources = SourceTable(self.collect)
-        self.health = HealthQueue(self.collect, self.sources)
-        self.prober = Prober(self.settings, self.sources, self.frontier)
-        self.logins = Logins(self.settings, self.sources)
-        await self.records.open()
+        self.settings.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.queue = await open_frontier(self.settings.state_dir / "frontier.db")
+        self.frontier = Frontier(self.queue, self.settings.per_source_concurrency)
+        self.prober = Prober(self.settings, self.writer)
+        self.logins = Logins(self.settings, self.writer)
         await self.frontier.release_stale_leases()
 
     async def close(self) -> None:
-        await self.collect.close()
-        await self.records.close()
+        await self.queue.close()
 
     async def run(self, until_idle: bool = False) -> None:
         await self.open()
         try:
+            await self.check_writer()
             await self.check_configs()
             await self.tor_pool.start()
             loop = asyncio.get_running_loop()
@@ -87,11 +82,18 @@ class Crawler:
             await job()
             await self.pause(seconds)
 
+    async def check_writer(self) -> None:
+        """Before Tor and any client: a crawl that cannot store what it fetches does not start."""
+        try:
+            await self.writer.ping()
+        except (WriterUnavailable, WriterError) as exc:
+            raise WriterUnavailable(f"crawl refused, {exc}") from None
+
     async def check_configs(self) -> None:
         """Every collecting source's config through the loader's full validation before anything starts. A config
         can change between runs with no golive (testonion's switch to form-session is one), so a crawl with any
         config that fails does not start at all. The form-session sources are named, so the switch shows."""
-        collecting = [row["id"] for row in await self.sources.sources() if row["state"] in lifecycle.COLLECTING]
+        collecting = await self.writer.collecting()
         broken = [source_id for source_id in collecting if await self.config_for(source_id) is None]
         if broken:
             raise ConfigError(f"configs that fail validation: {', '.join(broken)}")
@@ -99,21 +101,22 @@ class Crawler:
         log.info("crawler: form-session sources: %s", ", ".join(sessions) or "none")
 
     async def stop_when_idle(self) -> None:
-        if not await self.frontier.pending():
+        if not await self.frontier.pending(await self.writer.collecting()):
             log.info("crawler: no page left to fetch")
             self.stopping.set()
 
     async def start_due_runs(self) -> None:
-        for source_id in await self.frontier.due_sources():
+        for source_id in await self.writer.due_sources():
             config = await self.config_for(source_id)
             if config is not None:
-                run_id = await self.frontier.start_run(source_id, config.seeds)
+                run_id = await self.writer.run_start(source_id)
+                await self.frontier.queue_seeds(source_id, run_id, config.seeds)
                 log.info("%s run %d started", source_id, run_id)
 
     async def config_for(self, source_id: str) -> SourceConfig | None:
         try:
             config = load_config(self.settings.configs_dir, source_id)
-            source = await self.sources.resolve(source_id)
+            source = await self.writer.resolve(source_id)
             if not set(config.hosts) <= source.hosts or config.category != source.category:
                 raise ConfigError("hosts or category differ from what was approved")
         except ConfigError as exc:
@@ -128,11 +131,11 @@ class Crawler:
 
     async def worker(self, worker_id: int) -> None:
         tor = self.tor_pool.assign(worker_id)
-        fetcher = Fetcher(self.settings, tor, self.sources, self.configs, lifecycle.COLLECTING,
+        fetcher = Fetcher(self.settings, tor, self.writer, self.configs, lifecycle.COLLECTING,
                           sessions=self.logins.sessions)
         try:
             while not self.stopping.is_set():
-                tasks = await self.frontier.claim(1)
+                tasks = await self.frontier.claim(1, await self.writer.collecting())
                 if not tasks:
                     await self.pause(IDLE_SLEEP)
                     continue
@@ -168,11 +171,11 @@ class Crawler:
             inspect, result, task.kind, config, self.settings.safety_patterns, self.settings.redaction_salt
         )
         metric.bytes = len(result.body)
-        discovered = await self.sources.add_candidates(found.discovered, task.source_id)
+        discovered = await self.writer.add_candidates(found.discovered, task.source_id)
         if found.excluded:
             metric.error = "excluded_body"
-            await self.sources.change_state(task.source_id, lifecycle.DISABLED, f"safety: {found.excluded}")
-            await self.frontier.fail(task, metric, task.retries, None)
+            await self.writer.disable_for_safety(task.source_id)
+            await self.failed(task, metric, task.retries, None)
             log.warning("%s disabled: body tripped %s", task.source_id, found.excluded)
             return
         if found.gated or found.refused:
@@ -187,13 +190,13 @@ class Crawler:
         metric.below_expectation = task.kind == LISTING and extraction.items - extraction.incomplete < config.min_items_per_page
         metric.redactions = found.events
         seed = task.kind == LISTING and task.page == 1
-        await self.records.save_fingerprint(result.host, task.path, seed, found.fingerprint)
+        await self.writer.save_fingerprint(result.host, task.path, seed, found.fingerprint)
         if seed:
             # Ahead of storing, so a source whose seed page now matches a sibling's dedupes against it this page.
-            await mirrors.refresh(self.sources, self.records)
-        metric.records_new = await self.store(task, result.host, config, found)
+            await self.writer.mirrors_refresh()
+        metric.records_new = await self.store(task, result.host, found)
         listing = [(found.next_page, task.page + 1)] if found.next_page and task.page < config.max_pages else []
-        await self.frontier.complete(task, metric, listing, found.follows)
+        await self.done(task, metric, listing, found.follows)
         log.info(
             "%s %s status=%d bytes=%d items=%d fields=%d/%d new=%d redactions=%d discovered=%d elapsed=%.1fs",
             task.source_id, task.kind, result.status, metric.bytes, extraction.items, extraction.fields_resolved,
@@ -201,59 +204,63 @@ class Crawler:
         )
         if found.events:
             # Section 11: secret-shaped text on a live source is a top-priority health item.
-            await self.health.raise_item(task.source_id, health.redaction(f"{found.events} redaction events"), task.run_id)
+            await self.writer.redaction_events(task.source_id, found.events, task.run_id)
 
-    async def store(self, task: Task, host: str, config: SourceConfig, found: Inspection) -> int:
+    async def store(self, task: Task, host: str, found: Inspection) -> int:
+        """Records and the snapshot through the writer, which checks each again and raises the health item for
+        any it refuses. Every listing page is snapshotted, and one detail page a run: enough for `config test`."""
         new = 0
-        cluster = await self.sources.cluster_of(task.source_id)
         try:
-            if task.kind == DETAIL:
-                for record in found.records:
-                    await self.records.add_detail(task.source_id, task.path, record.fields, record.summary)
-            else:
-                for record in found.records:
-                    new += await self.records.add(
-                        task.source_id, config.category, record.content_hash, record.follow_path, record.fields,
-                        record.summary, host=host, cluster=cluster,
-                    )
-            # Every listing page, and one detail page a run: enough for `config test` to exercise both.
+            new = await self.writer.store_records(task, host, found.records)
             if task.kind == LISTING or task.run_id not in self.detail_snapshots:
                 if task.kind == DETAIL:
                     self.detail_snapshots.add(task.run_id)
-                await self.records.save_snapshot(task.source_id, task.path, task.kind, found.snapshot)
-        except RefusedWrite:
+                await self.writer.save_snapshot(task, found.snapshot)
+        except WriteRefused as exc:
             log.warning("%s write refused: a secret survived redaction", task.source_id)
-            await self.health.raise_item(task.source_id, health.redaction("write refused: a secret survived"), task.run_id)
+            if str(exc) == wire.OVERSIZE:
+                await self.writer.store_too_large(task.source_id, task.run_id)
         return new
+
+    async def done(self, task: Task, metric: PageMetric, listing: list[tuple[str, int]], details: list[str]) -> None:
+        # Two stores, two steps: a crash between them loses this one page's metrics, never a page.
+        await self.frontier.complete(task, metric.status, listing, details)
+        await self.writer.page_done(task, metric)
+
+    async def failed(self, task: Task, metric: PageMetric, retries: int, next_due: datetime | None) -> None:
+        await self.frontier.fail(task, metric.status, retries, next_due)
+        await self.writer.page_done(task, metric)
 
     async def handle_redirect(self, task: Task, result: FetchResult, metric: PageMetric, config: SourceConfig) -> None:
         target = result.redirect_to
         path = target and config.path_for(target)
         if path:
             listing = [(path, task.page)] if task.kind == LISTING else []
-            await self.frontier.complete(task, metric, listing, [path] if task.kind == DETAIL else [])
+            await self.done(task, metric, listing, [path] if task.kind == DETAIL else [])
         else:
             # Off the source: an onion becomes a candidate for triage, anything else is dropped.
-            discovered = await self.sources.add_redirect_target(task.source_id, onion.host_of(target)) if target else 0
+            discovered = await self.writer.add_redirect_target(task.source_id, onion.host_of(target)) if target else 0
             metric.error = "redirect_offsite"
-            await self.frontier.fail(task, metric, task.retries, None)
+            await self.failed(task, metric, task.retries, None)
             log.info("%s redirect off the source, discovered=%d", task.source_id, discovered)
 
     async def handle_failure(self, task: Task, metric: PageMetric, fetcher: Fetcher | None) -> None:
         retries = task.retries + scheduler.retry_cost(metric.error)
         due = scheduler.next_due_for_failure(retries, metric.error, self.settings.max_retries, datetime.now(UTC))
-        await self.frontier.fail(task, metric, retries, due)
+        await self.failed(task, metric, retries, due)
         log.info("%s %s error=%s elapsed=%.1fs", task.source_id, task.kind, metric.error, metric.elapsed)
         if fetcher is not None and scheduler.should_rotate(metric.error, fetcher.tor):
             await self.tor_pool.rotate_for(fetcher.tor)
 
     async def finish_run(self, task: Task, config: SourceConfig | None) -> None:
         # A source whose config broke mid-run still closes the run, or it would never be scheduled again.
-        now = datetime.now(UTC)
+        if await self.frontier.open_in_run(task.run_id):
+            return
         cadence = config.cadence if config is not None else CONFIG_RETRY
-        run = await self.frontier.finish_if_done(
-            task.run_id, lambda row: scheduler.next_run(cadence, row["failed_runs"], row["pages"] == 0, now)
-        )
+        expect = config and {"min_items": config.min_items_per_page, "required": list(config.required_fields),
+                             "category": config.category}
+        finished = await self.writer.run_finish(task.run_id, cadence.total_seconds(), expect)
+        run = finished["run"]
         if run is None:
             return
         self.detail_snapshots.discard(task.run_id)
@@ -264,5 +271,5 @@ class Crawler:
             task.source_id, task.run_id, run["pages"], run["failures"], run["items"], rate, run["below_expectation"],
             run["records_new"], run["redactions"],
         )
-        for finding in await self.health.after_run(run, config) if config is not None else ():
-            log.info("%s health item %s priority=%d", task.source_id, finding.kind, finding.priority)
+        for kind, priority in finished["findings"]:
+            log.info("%s health item %s priority=%d", task.source_id, kind, priority)

@@ -4,21 +4,22 @@ import contextlib
 import dataclasses
 import fcntl
 import logging
+import os
 import re
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from onioncollect import lifecycle
 from onioncollect.config import Settings, load_config
 from onioncollect.crawler import Crawler
-from onioncollect.db import RATE_WINDOW, Frontier, open_collect
-from onioncollect.golive import go_live, leak_tests, save_report
-from onioncollect.records import RecordStore
+from onioncollect.db import RATE_WINDOW, Frontier, open_frontier
+from onioncollect.golive import go_live, leak_tests
 from onioncollect.source_config import ConfigError
-from onioncollect.sources import SourceTable
+from onioncollect.sources import RefusedChange
 from onioncollect.tor_pool import CONTROL_ERRORS, TorPool
+from onioncollect.writer_client import WriteRefused, Writer, WriterError, WriterUnavailable
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 LOG_BYTES = 50 * 1024 * 1024
@@ -47,9 +48,10 @@ def add_commands(commands) -> None:
 
 @contextlib.contextmanager
 def run_lock(settings: Settings):
-    # Held for the whole of `run` and `golive`. Two crawls on one database would double every per-source
+    # Held for the whole of `run` and `golive`. Two crawls on one frontier would double every per-source
     # limit, and a go-live under a crawl would race it for the source's state.
-    with open(settings.data_dir / "run.lock", "w") as handle:
+    settings.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(settings.state_dir / "run.lock", "w") as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -65,11 +67,17 @@ def run_command(settings: Settings, args: argparse.Namespace) -> None:
         fresh, line = leak_tests(settings.leak_test_result, datetime.now(UTC))
         if not fresh:
             raise SystemExit(f"onioncollect: crawl refused, {line}")
-        configure_logging(settings.data_dir / "crawl.log")
+        # The log's directory is group-readable for the analyst's log audit; the crawler's other files sit in its
+        # mode 700 state dir, so this umask opens nothing else.
+        os.umask(0o027)
+        settings.log_dir.mkdir(parents=True, exist_ok=True)
+        configure_logging(settings.log_dir / "crawl.log")
         try:
             asyncio.run(Crawler(settings).run(args.until_idle))
         except ConfigError as exc:
             raise SystemExit(f"onioncollect: crawl refused, {exc}") from None
+        except WriterUnavailable as exc:
+            raise SystemExit(f"onioncollect: {exc}") from None
 
 
 def golive_command(settings: Settings, args: argparse.Namespace) -> None:
@@ -79,25 +87,21 @@ def golive_command(settings: Settings, args: argparse.Namespace) -> None:
         raise SystemExit(f"onioncollect: {exc}") from None
 
     async def check():
-        collect = await open_collect(settings.data_dir / "collect.db")
-        records = RecordStore(settings.data_dir, timedelta(days=settings.record_retention_days),
-                              timedelta(days=settings.snapshot_retention_days))
-        await records.open()
+        writer = Writer(settings.writer_socket)
+        # Before Tor: a go-live that could not record its outcome does not start.
+        await writer.ping()
         pool = TorPool(settings)
-        table = SourceTable(collect)
         try:
             await pool.start()
-            report = await go_live(args.id, config, settings, table, records, pool.instances,
-                                   args.confirm_new_source, args.as_mirror_of)
-            await save_report(table, args.id, report, datetime.now(UTC))
+            report = await go_live(args.id, config, settings, writer, pool.instances, args.confirm_new_source,
+                                   args.as_mirror_of)
+            await writer.save_report(args.id, report.passed, report.lines)
             return report
         finally:
             pool.stop()
-            await records.close()
-            await collect.close()
 
     with run_lock(settings):
-        report = asyncio.run(check())
+        report = through_writer(check)
     for ok, line in report.lines:
         print(f"{'PASS' if ok else 'FAIL'}  {line}")
     if not report.passed:
@@ -106,14 +110,16 @@ def golive_command(settings: Settings, args: argparse.Namespace) -> None:
 
 def status_command(settings: Settings, args: argparse.Namespace) -> None:
     async def read():
-        collect = await open_collect(settings.data_dir / "collect.db")
+        settings.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        queue = await open_frontier(settings.state_dir / "frontier.db")
         try:
-            return await Frontier(collect, settings.per_source_concurrency).stats()
+            urls = await Frontier(queue, settings.per_source_concurrency).counts()
         finally:
-            await collect.close()
+            await queue.close()
+        return urls, await Writer(settings.writer_socket).stats()
 
-    stats = asyncio.run(read())
-    urls, fetches = stats["urls"], stats["fetches_last_hour"]
+    urls, stats = through_writer(read)
+    fetches = stats["fetches_last_hour"]
     up = 100 * stats["up_last_hour"] / fetches if fetches else 0.0
     print("sources  " + "  ".join(f"{state} {stats['sources'].get(state, 0)}" for state in lifecycle.SOURCE_STATES)
           + f"  (open runs {stats['open_runs']})")
@@ -122,7 +128,7 @@ def status_command(settings: Settings, args: argparse.Namespace) -> None:
     print(f"fetches  {fetches} in the last hour, {up:.0f}% reached the host;"
           f" {stats['fetches_recent'] / RATE_WINDOW.total_seconds():.2f}/s over the last {RATE_WINDOW.seconds // 60} min")
     print("tor      port   circuit   built  streams  success, last logged")
-    logged = last_logged_health(settings.data_dir / "crawl.log")
+    logged = last_logged_health(settings.log_dir / "crawl.log")
     for instance in TorPool(settings).instances:
         try:
             instance.connect()
@@ -135,6 +141,16 @@ def status_command(settings: Settings, args: argparse.Namespace) -> None:
             instance.close()
         print(f"         {instance.socks_port}  {ready:8s} {circuits:6d} {streams:8d}  "
               f"{logged.get(instance.socks_port, 'none yet')}")
+
+
+def through_writer(action):
+    """Runs a coroutine that writes through the writer; a writer that is down or refuses ends the command."""
+    try:
+        return asyncio.run(action())
+    except (WriterUnavailable, WriterError, WriteRefused) as exc:
+        raise SystemExit(f"onioncollect: {exc}") from None
+    except RefusedChange as exc:
+        raise SystemExit(f"onioncollect: not changed, {exc}") from None
 
 
 def last_logged_health(path: Path) -> dict[int, str]:

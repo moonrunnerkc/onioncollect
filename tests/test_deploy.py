@@ -20,18 +20,31 @@ CLI = f"{PYTHON} -s -E -m onioncollect --settings"
 
 EXPECTED = {
     "onioncollect-crawl.service": ("crawler", f"{CLI} /home/crawler/settings.toml crawl run --until-idle"),
-    "onioncollect-retention.service": ("crawler", f"{CLI} /home/crawler/settings.toml retention sweep"),
+    "onioncollect-retention.service": ("analyst", f"{CLI} /home/analyst/settings.toml retention sweep"),
+    "onioncollect-writer.service": ("analyst", f"{PYTHON} -s -E -m onioncollect.writer --data-dir /home/analyst/data"
+                                               " --configs-dir /var/lib/onioncollect/configs"),
     "onioncollect-leak-test.service": ("root", "/bin/bash /opt/onioncollect/app/tests/live/leak_test.sh"),
-    "onioncollect-log-audit.service": ("analyst", f"{PYTHON} -s -E tests/live/log_audit.py --data /home/crawler/data"
-                                                  " --credentials %d /home/crawler/data/crawl.log /home/analyst/ui.log"),
-    "onioncollect-ui.service": ("analyst", f"{PYTHON} -s -E -m onioncollect.ui_main --data-dir /home/crawler/data"
-                                           f" --configs-dir /home/crawler/configs --port {ui.PORT}"),
+    "onioncollect-log-audit.service": ("analyst", f"{PYTHON} -s -E tests/live/log_audit.py --data /home/analyst/data"
+                                                  " --credentials %d /var/log/onioncollect/crawl.log /home/analyst/ui.log"),
+    "onioncollect-ui.service": ("analyst", f"{PYTHON} -s -E -m onioncollect.ui_main --data-dir /home/analyst/data"
+                                           f" --configs-dir /var/lib/onioncollect/configs --port {ui.PORT}"),
     "onioncollect-capture.service": ("analyst", f"{PYTHON} -s -E tools/writeup_capture.py --settings"
                                                 " /home/analyst/settings.toml --credentials %d"
                                                 " --out /home/analyst/writeup-capture"),
 }
 TIMERS = {"onioncollect-crawl.timer": "*:0/15", "onioncollect-retention.timer": "*-*-* 03:30",
           "onioncollect-leak-test.timer": "*-*-* 05:00"}
+# Where each unit may write. The stores are written by the writer and the retention sweep alone; the UI and the
+# capture write only the analyst's home outside them; the crawl, its state dir and its log.
+WRITES = {
+    "onioncollect-crawl.service": ["/home/crawler/state", "/var/log/onioncollect"],
+    "onioncollect-writer.service": ["/home/analyst/data", "/var/lib/onioncollect/configs"],
+    "onioncollect-retention.service": ["/home/analyst/data"],
+    "onioncollect-ui.service": ["/home/analyst"],
+    "onioncollect-capture.service": ["/home/analyst"],
+    "onioncollect-log-audit.service": [],
+}
+READ_ONLY = {"onioncollect-ui.service": "/home/analyst/data", "onioncollect-capture.service": "/home/analyst/data"}
 NEVER_SCHEDULED = ("golive", "triage", "sources", "deploy", "install.sh", "resolve", "records merge", "config ")
 
 
@@ -78,7 +91,8 @@ class UnitFilesTest(unittest.TestCase):
             for key in ("OnSuccess", "OnFailure", "Wants", "Requires"):
                 todo.extend(parsed["Unit"].get(key, "").split())
         self.assertEqual(reached, {"onioncollect-crawl.service", "onioncollect-retention.service",
-                                   "onioncollect-leak-test.service", "onioncollect-log-audit.service"})
+                                   "onioncollect-leak-test.service", "onioncollect-log-audit.service",
+                                   "onioncollect-writer.service"})
         for name in reached:
             command = unit(name)["Service"]["ExecStart"]
             for word in NEVER_SCHEDULED:
@@ -98,15 +112,17 @@ class UnitFilesTest(unittest.TestCase):
                 self.assertEqual(service["ProtectSystem"], "strict")
                 self.assertEqual(service["ProtectHome"], "read-only")
                 self.assertEqual(service["CapabilityBoundingSet"], "")
-                writes = service.get("ReadWritePaths", "").split()
-                self.assertEqual(writes, {"crawler": ["/home/crawler/data"], "analyst": ["/home/analyst"]}[user]
-                                 if name != "onioncollect-log-audit.service" else [], name)
+                self.assertEqual(service.get("ReadWritePaths", "").split(), WRITES[name], name)
+                self.assertEqual(service.get("ReadOnlyPaths"), READ_ONLY.get(name), name)
 
     def test_network_reach_per_unit(self):
         for name in EXPECTED:
             service = unit(name)["Service"]
             with self.subTest(unit=name):
-                if name in ("onioncollect-crawl.service", "onioncollect-ui.service"):
+                if name == "onioncollect-writer.service":
+                    self.assertEqual((service["PrivateNetwork"], service["RestrictAddressFamilies"],
+                                      service["IPAddressDeny"]), ("yes", "AF_UNIX", "any"))
+                elif name in ("onioncollect-crawl.service", "onioncollect-ui.service"):
                     self.assertEqual((service["IPAddressDeny"], service["IPAddressAllow"]), ("any", "localhost"))
                 elif name != "onioncollect-leak-test.service":
                     self.assertEqual(service["PrivateNetwork"], "yes")
@@ -122,6 +138,15 @@ class UnitFilesTest(unittest.TestCase):
                     self.assertNotIn("ui", command)
         self.assertIn("-m onioncollect.ui_main ", unit("onioncollect-ui.service")["Service"]["ExecStart"])
 
+    def test_the_crawl_needs_the_writer_and_the_writer_its_socket_dir(self):
+        crawl = unit("onioncollect-crawl.service")["Unit"]
+        self.assertEqual(crawl["Requires"], "onioncollect-writer.service")
+        self.assertIn("onioncollect-writer.service", crawl["After"].split())
+        writer = unit("onioncollect-writer.service")
+        self.assertEqual((writer["Service"]["RuntimeDirectory"], writer["Service"]["SupplementaryGroups"]),
+                         ("onioncollect", "onioncollect-ipc"))
+        self.assertEqual(writer["Install"]["WantedBy"], "multi-user.target", "enabled at boot")
+
     def test_the_credential_reaches_the_analyst_units_through_systemd_only(self):
         for name in ("onioncollect-log-audit.service", "onioncollect-capture.service"):
             service = unit(name)["Service"]
@@ -133,7 +158,9 @@ class UnitFilesTest(unittest.TestCase):
     def test_install_enables_the_timers_and_the_ui_and_leaves_the_crawl_to_make_deploy(self):
         install = (ROOT / "deploy" / "install.sh").read_text()
         self.assertIn('install -m 644 -o root -g root "$STAGE"/deploy/systemd/* /etc/systemd/system/', install)
-        self.assertIn("systemctl enable $TIMERS onioncollect-ui.service", install)
+        self.assertIn("systemctl enable $TIMERS onioncollect-ui.service onioncollect-writer.service", install)
+        self.assertIn("systemctl restart onioncollect-writer.service", install)
+        self.assertIn("getent group onioncollect-ipc >/dev/null || groupadd --system onioncollect-ipc", install)
         self.assertNotIn("start onioncollect-crawl.timer", install)
         makefile = (ROOT / "Makefile").read_text()
         deploy = makefile[makefile.index("\ndeploy: install"):].split("\n\n")[0]
@@ -171,7 +198,7 @@ class ConfigSyncTest(unittest.TestCase):
     def test_a_dry_run_changes_nothing_and_deletes_nothing_without_prune(self):
         out = self.sync(DRY_RUN="1")
         self.assertEqual(self.guest_files(), {"news.toml": "old news\n", "testonion.toml": "hand-installed\n"})
-        self.assertIn("would run: install -m 600", out)
+        self.assertIn("would run: install -m 640", out)
         self.assertIn("kept; PRUNE_CONFIGS=1", out)
         self.assertNotIn("rm", out)
 

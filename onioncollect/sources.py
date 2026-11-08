@@ -1,4 +1,5 @@
 import dataclasses
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Callable
@@ -243,6 +244,12 @@ class SourceTable:
                 # Its queued rows wait out of reach of claim; an open run would keep it off the schedule forever.
                 await db.execute("UPDATE runs SET finished_at = ? WHERE source_id = ? AND finished_at IS NULL",
                                  (now, source_id))
+
+    async def add_golive_report(self, source_id: str, passed: bool, lines: list[tuple[bool, str]]) -> None:
+        """Every golive's output, pass or fail, kept for the write-up's fail-then-pass example."""
+        async with self.db.write() as db:
+            await db.execute("INSERT INTO golive_reports (source_id, run_at, passed, lines) VALUES (?, ?, ?, ?)",
+                             (source_id, stamp(self.clock()), int(passed), json.dumps(lines)))
 
     async def get(self, source_id: str) -> dict | None:
         rows = await self.db.rows(f"SELECT {', '.join(SOURCE_COLUMNS)} FROM sources WHERE id = ?", (source_id,))

@@ -35,6 +35,7 @@ CREATE INDEX IF NOT EXISTS hosts_state ON hosts(state, first_seen);
 CREATE INDEX IF NOT EXISTS hosts_source ON hosts(source_id);
 """
 
+# The crawler's own queue, in its state dir: paths on approved hosts and their scheduling, never page text.
 FRONTIER = """
 CREATE TABLE IF NOT EXISTS urls (
     source_id TEXT NOT NULL, path TEXT NOT NULL, kind TEXT NOT NULL, page INTEGER NOT NULL, run_id INTEGER NOT NULL,
@@ -42,6 +43,12 @@ CREATE TABLE IF NOT EXISTS urls (
     lease_until TEXT, last_fetched TEXT, last_code INTEGER, discovered_at TEXT NOT NULL,
     PRIMARY KEY (source_id, path)
 );
+CREATE INDEX IF NOT EXISTS urls_claim ON urls(status, next_due);
+CREATE INDEX IF NOT EXISTS urls_run ON urls(run_id, status);
+"""
+
+# Run metrics, beside the source table in collect.db. Only the writer adds to them.
+RUNS = """
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY, source_id TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
     pages INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, items INTEGER NOT NULL DEFAULT 0,
@@ -60,8 +67,11 @@ CREATE TABLE IF NOT EXISTS run_fields (
     declared INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (run_id, kind, field)
 );
 CREATE TABLE IF NOT EXISTS uptime (host TEXT NOT NULL, checked_at TEXT NOT NULL, up INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS urls_claim ON urls(status, next_due);
-CREATE INDEX IF NOT EXISTS urls_run ON urls(run_id, status);
+-- Every path a run fetched, for the log audit: the analyst cannot read the crawler's frontier.
+CREATE TABLE IF NOT EXISTS visited_paths (
+    source_id TEXT NOT NULL, path TEXT NOT NULL, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+    PRIMARY KEY (source_id, path)
+);
 CREATE INDEX IF NOT EXISTS runs_source ON runs(source_id, finished_at);
 CREATE INDEX IF NOT EXISTS page_metrics_source ON page_metrics(source_id, fetched_at);
 CREATE INDEX IF NOT EXISTS page_metrics_run ON page_metrics(run_id);

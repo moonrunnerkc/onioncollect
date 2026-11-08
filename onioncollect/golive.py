@@ -3,23 +3,21 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from onioncollect import fingerprint, health, lifecycle, mirrors, onion, source_config
-from onioncollect.config import Settings, config_path, write_config
-from onioncollect.db import LISTING, stamp
+from onioncollect import lifecycle, matching, onion, source_config
+from onioncollect.config import Settings, config_path
+from onioncollect.db import LISTING
 from onioncollect.fetcher import Fetcher
-from onioncollect.health_queue import HealthQueue
 from onioncollect.pages import inspect
-from onioncollect.records import RecordStore, RefusedWrite
 from onioncollect.session import Logins
 from onioncollect.source_config import ConfigError, SourceConfig
-from onioncollect.sources import PinnedHost, Source, SourceTable
+from onioncollect.sources import PinnedHost, RefusedChange, Source
 from onioncollect.tor_pool import TorInstance
+from onioncollect.writer_client import WriteRefused, Writer
 
 REACHABILITY_INSTANCES = 2
 LEAK_TEST_MAX_AGE = timedelta(hours=36)
 DEPLOY_STAMP = "deploy-stamp"
 LEAK_TESTS = ("clearnet-block", "dns-block", "packet-capture", "redirect-trap")
-PASSED_GOLIVE = "passed go-live"
 ROOT = 0
 
 
@@ -81,21 +79,13 @@ def leak_tests(path: Path, now: datetime) -> tuple[bool, str]:
     return True, f"leak tests: all {len(LEAK_TESTS)} passed {age.total_seconds() / 3600:.0f} h ago, run by {run_by}"
 
 
-async def save_report(sources: SourceTable, source_id: str, report: Report, now: datetime) -> None:
-    """Every golive's output, pass or fail, kept for the write-up's fail-then-pass example."""
-    async with sources.db.write() as db:
-        await db.execute("INSERT INTO golive_reports (source_id, run_at, passed, lines) VALUES (?, ?, ?, ?)",
-                         (source_id, stamp(now), int(report.passed), json.dumps(report.lines)))
-
-
-async def go_live(source_id: str, config: SourceConfig, settings: Settings, sources: SourceTable,
-                  records: RecordStore, instances: list[TorInstance], confirm_new_source: bool = False,
-                  mirror_of: str | None = None) -> Report:
+async def go_live(source_id: str, config: SourceConfig, settings: Settings, writer: Writer,
+                  instances: list[TorInstance], confirm_new_source: bool = False, mirror_of: str | None = None) -> Report:
     """Section 14. Any failed check leaves the source approved; only a clean pass flips it to live, and a
     pass that confirms the source as a mirror folds it into that source instead."""
     report = Report()
-    source = await sources.resolve(source_id)
-    row = await sources.get(source_id)
+    source = await writer.resolve(source_id)
+    row = await writer.get(source_id)
     if not report.check(source is not None and source.state == lifecycle.APPROVED,
                         f"state is approved (found {source.state if source else 'no source'})"):
         return report
@@ -109,41 +99,38 @@ async def go_live(source_id: str, config: SourceConfig, settings: Settings, sour
                              and bool(row["note"].strip()), f"policy: {source.category}, reviewer note on file")
             and report.check(*leak_tests(settings.leak_test_result, datetime.now(UTC)))):
         return report
-    fetchers = [Fetcher(settings, tor, sources, {source_id: config}, lifecycle.UNDER_TEST) for tor in instances]
-    sampled = await reach_and_sample(source_id, config, settings, sources, records, fetchers, report)
+    fetchers = [Fetcher(settings, tor, writer, {source_id: config}, lifecycle.UNDER_TEST) for tor in instances]
+    sampled = await reach_and_sample(source_id, config, settings, writer, fetchers, report)
     if not sampled:
         return report
-    matched = await mirrors.source_matches(source_id, sources, records)
+    matched = await writer.source_matches(source_id)
     if mirror_of is not None:
-        await fold(source, mirror_of, dict(matched).get(mirror_of), settings, sources, records, report)
+        await fold(source, mirror_of, dict(matched).get(mirror_of), settings, writer, report)
         return report
-    named = ", ".join(f"{other} ({fingerprint.describe(near)})" for other, near in matched)
+    named = ", ".join(f"{other} ({matching.describe(near)})" for other, near in matched)
     if not report.check(not matched or confirm_new_source,
                         "mirror: no other source matches" if not matched else
                         f"mirror: matches {named}, confirmed as a new source" if confirm_new_source else
                         f"mirror: matches {named}; rerun with --confirm-new-source or --as-mirror-of {matched[0][0]}"):
         return report
     try:
-        await records.save_baselines(source_id, sampled)
-    except RefusedWrite:
+        # Baselines, the state change to live, and closing any items a reapproved source still carries.
+        closed = await writer.went_live(source_id, sampled)
+    except WriteRefused:
         report.check(False, "baseline snapshot refused: a secret survived redaction")
         return report
-    await sources.change_state(source_id, lifecycle.LIVE)
-    await mirrors.refresh(sources, records)
-    # A source back from `sources reapprove` may still carry the items that sent it there; this pass fixes them.
-    closed = await HealthQueue(sources.db, sources).close_source(source_id, health.FIXED, PASSED_GOLIVE, "golive")
     report.check(True, f"baseline: {len(sampled)} snapshots written, {source_id} is live"
                        + (f"; {closed} open health items closed as fixed" if closed else ""))
     return report
 
 
-async def recheck(source_id: str, host: str, config: SourceConfig, settings: Settings, sources: SourceTable,
-                  records: RecordStore, instances: list[TorInstance]) -> Report:
+async def recheck(source_id: str, host: str, config: SourceConfig, settings: Settings, writer: Writer,
+                  instances: list[TorInstance]) -> Report:
     """Checks 1, 4 and 5 for a source already collecting, against one host of its own set: what the fixed
     and mirror-swapped dispositions must pass. Fetches go through the collecting state and the host set,
     exactly as the crawler's do."""
     report = Report()
-    source = await sources.resolve(source_id)
+    source = await writer.resolve(source_id)
     if not report.check(source is not None and source.state in lifecycle.COLLECTING,
                         f"state is live or degraded (found {source.state if source else 'no source'})"):
         return report
@@ -155,7 +142,7 @@ async def recheck(source_id: str, host: str, config: SourceConfig, settings: Set
                                                     f"auth: a form-session source logs in on its active host only,"
                                                     f" {source.active_host}"):
         return report
-    view, logins = PinnedHost(sources, host), Logins(settings, sources)
+    view, logins = PinnedHost(writer, host), Logins(settings, writer)
     fetchers = [Fetcher(settings, tor, view, {source_id: config}, lifecycle.COLLECTING, sessions=logins.sessions)
                 for tor in instances]
     if config.auth is not None:
@@ -165,7 +152,7 @@ async def recheck(source_id: str, host: str, config: SourceConfig, settings: Set
             for fetcher in fetchers:
                 await fetcher.close()
             return report
-    await reach_and_sample(source_id, config, settings, sources, records, fetchers, report)
+    await reach_and_sample(source_id, config, settings, writer, fetchers, report)
     return report
 
 
@@ -177,8 +164,8 @@ def hosts_check(report: Report, config: SourceConfig, source: Source) -> bool:
                         + (f"; not approved: {', '.join(unapproved)}" if unapproved else ""))
 
 
-async def reach_and_sample(source_id: str, config: SourceConfig, settings: Settings, sources: SourceTable,
-                           records: RecordStore, fetchers: list[Fetcher], report: Report) -> list[tuple[str, str]] | None:
+async def reach_and_sample(source_id: str, config: SourceConfig, settings: Settings, writer: Writer,
+                           fetchers: list[Fetcher], report: Report) -> list[tuple[str, str]] | None:
     """Checks 4 and 5."""
     try:
         reached = [await fetcher.fetch(source_id, config.seeds[0]) for fetcher in fetchers[:REACHABILITY_INSTANCES]]
@@ -188,14 +175,14 @@ async def reach_and_sample(source_id: str, config: SourceConfig, settings: Setti
                             f"reachability: {answered} of {REACHABILITY_INSTANCES} instances"
                             + (f" ({errors})" if errors else "")):
             return None
-        return await sample(source_id, config, settings, sources, records, fetchers[0], report)
+        return await sample(source_id, config, settings, writer, fetchers[0], report)
     finally:
         for fetcher in fetchers:
             await fetcher.close()
 
 
-async def fold(source: Source, mirror_of: str, near: tuple[int, int] | None, settings: Settings, sources: SourceTable,
-               records: RecordStore, report: Report) -> None:
+async def fold(source: Source, mirror_of: str, near: tuple[int, int] | None, settings: Settings, writer: Writer,
+               report: Report) -> None:
     if not report.check(near is not None, f"mirror: {source.id} does not match {mirror_of}, so it is not its mirror"):
         return
     # The new config text is proven before anything changes, so a refusal leaves both sources as they were.
@@ -204,29 +191,32 @@ async def fold(source: Source, mirror_of: str, near: tuple[int, int] | None, set
     except (OSError, ConfigError) as exc:
         report.check(False, f"mirror: {mirror_of}'s config: {exc}")
         return
-    moved = await sources.merge(source.id, mirror_of, frozenset({lifecycle.APPROVED}), f"mirror of {mirror_of}")
-    write_config(settings.configs_dir, mirror_of, text)
-    await mirrors.refresh(sources, records)
-    report.check(True, f"mirror: matches {mirror_of} ({fingerprint.describe(near)}); {', '.join(moved)} added to"
+    try:
+        # The writer checks the text adds only these hosts, then merges, writes the config and reclusters.
+        moved = await writer.fold(source.id, mirror_of, text)
+    except RefusedChange as exc:
+        report.check(False, f"mirror: {exc}")
+        return
+    report.check(True, f"mirror: matches {mirror_of} ({matching.describe(near)}); {', '.join(moved)} added to"
                        f" {mirror_of} and its config, which keeps its state; {source.id} is disabled as its mirror")
 
 
-async def sample(source_id: str, config: SourceConfig, settings: Settings, sources: SourceTable, records: RecordStore,
-                 fetcher: Fetcher, report: Report) -> list[tuple[str, str]] | None:
+async def sample(source_id: str, config: SourceConfig, settings: Settings, writer: Writer, fetcher: Fetcher,
+                 report: Report) -> list[tuple[str, str]] | None:
     snapshots = []
     for path in config.seeds:
         result = await fetcher.fetch(source_id, path)
         if result.redirect_to and not config.path_for(result.redirect_to):
-            await sources.add_redirect_target(source_id, onion.host_of(result.redirect_to))
+            await writer.add_redirect_target(source_id, onion.host_of(result.redirect_to))
         if not report.check(result.error is None, f"seed {len(snapshots) + 1}: status {result.status}"
                             + (f", {result.error}" if result.error else "")):
             return None
         found = inspect(result, LISTING, config, settings.safety_patterns, settings.redaction_salt)
-        await sources.add_candidates(found.discovered, source_id)
+        await writer.add_candidates(found.discovered, source_id)
         if found.excluded:
-            await sources.change_state(source_id, lifecycle.DISABLED, f"safety: {found.excluded}")
+            await writer.disable_for_safety(source_id)
         elif not found.gated and not found.refused:
-            await records.save_fingerprint(result.host, path, True, found.fingerprint)
+            await writer.save_fingerprint(result.host, path, True, found.fingerprint)
         complete = found.extraction.items - found.extraction.incomplete
         ok = not (found.excluded or found.gated or found.refused) and complete >= config.min_items_per_page \
             and found.events == 0
