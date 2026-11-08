@@ -1,5 +1,6 @@
 # Section 12's search UI, as the analyst, on 127.0.0.1:8470 only. Reach it with an SSH forward through Lima's
-# ssh config. It reads the stores and never writes or fetches; the unit lets it bind its one port and nothing else.
+# ssh config. Its own entry point, never cli.py, so the process holds no network library. It reads the stores and
+# never writes or fetches; the unit lets it bind its one port and nothing else.
 [Unit]
 Description=onioncollect search UI
 After=network.target
@@ -9,7 +10,7 @@ Type=simple
 User=analyst
 Group=analyst
 WorkingDirectory=/opt/onioncollect/app
-ExecStart=/opt/onioncollect/venv/bin/python -s -E -m onioncollect --settings /home/analyst/settings.toml ui --port 8470
+ExecStart=/opt/onioncollect/venv/bin/python -s -E -m onioncollect.ui_main --data-dir /home/crawler/data --configs-dir /home/crawler/configs --port 8470
 Restart=on-failure
 RestartSec=10
 UMask=0077

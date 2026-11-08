@@ -24,7 +24,7 @@ The full design is [docs/build-guide.md](docs/build-guide.md). What collecting t
 | Leak tests | The four Tor leak tests run live in the guest: [tests/live/leak_test.sh](tests/live/leak_test.sh), daily on a timer and at the end of every deploy. A crawl and `golive` both refuse a result older than 36 hours or older than the current deploy. [PASTE: latest leak-test.json from the capture bundle] |
 | Boundary tests | Section 17's five, mapped to their tests in the docstring of [tests/test_network_boundary.py](tests/test_network_boundary.py), plus `UIContainmentTest` for the search UI |
 | CI | [.github/workflows/ci.yml](.github/workflows/ci.yml) runs the whole unit and boundary suite. [PASTE: CI badge or link to a green run] |
-| Search UI | [onioncollect/ui.py](onioncollect/ui.py) and [onioncollect/views.py](onioncollect/views.py): read-only, standard library, 127.0.0.1 only |
+| Search UI | [onioncollect/ui.py](onioncollect/ui.py) and [onioncollect/views.py](onioncollect/views.py): read-only, standard library, 127.0.0.1 only. Started by its own entry point, [onioncollect/ui_main.py](onioncollect/ui_main.py), never through the CLI, so the process loads no network library ([tests/test_ui_entry.py](tests/test_ui_entry.py)) |
 | Write-up | [docs/writeup.md](docs/writeup.md) |
 
 ## Running it
@@ -32,7 +32,10 @@ The full design is [docs/build-guide.md](docs/build-guide.md). What collecting t
 Everything runs in a hardened Lima VM (section 5 of the guide). `make provision` builds it, `make deploy` installs
 the code and the systemd units and ends by running the leak tests, and the crawl then runs on a quarter-hour timer
 that fetches only what each source's cadence says is due. The search UI runs as the `analyst` user on 127.0.0.1:8470
-inside the guest; reach it with an SSH forward through Lima's ssh config:
+inside the guest, started by `onioncollect-ui.service` as
+`python -m onioncollect.ui_main --data-dir DIR --configs-dir DIR --port 8470`. It has its own entry point, not a
+CLI subcommand, so the UI process imports only the UI, its views and search, and the standard library. Reach it
+with an SSH forward through Lima's ssh config:
 
 ```
 ssh -F ~/.lima/node1/ssh.config -N -L 8470:127.0.0.1:8470 lima-node1

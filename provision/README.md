@@ -47,7 +47,9 @@ Roll back to the snapshot: `limactl stop node1 && cp -c ~/.lima/node1/disk.snaps
   `/home/crawler/configs` (mode 700) and a `/home/crawler/redaction-salt` (mode 600) that is never
   regenerated, since a new salt would orphan every keyed hash already stored. The crawler owns all
   three. The `analyst` user reads the data dir through its group (2750 crawler:analyst) and runs the
-  search UI and the read-only commands with `/home/analyst/settings.toml`, which names no secret file.
+  read-only commands with `/home/analyst/settings.toml`, which names no secret file, and the search UI through
+  its own entry point, `python -m onioncollect.ui_main --data-dir /home/crawler/data --configs-dir
+  /home/crawler/configs --port 8470` (`onioncollect-ui.service`), which never imports the CLI or a network library.
   It has no firewall rule of its own, so it reaches loopback only. The local socket service the
   crawler writes through is not provisioned yet; until it is, the commands that write run as crawler.
 - **Root-owned runtime.** `/opt/onioncollect/venv` (same hashes as the crawler's venv) and

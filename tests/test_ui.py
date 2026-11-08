@@ -1,7 +1,6 @@
 """The search UI: read-only stores, everything escaped, literal search terms, ids checked before any path, and the
 users it refuses. UIContainmentTest in test_network_boundary covers what it can reach."""
 import asyncio
-import dataclasses
 import http.client
 import io
 import logging
@@ -17,7 +16,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
-from onioncollect import cli, health, ui
+from onioncollect import health, ui, ui_main
 from onioncollect.config import Settings
 from onioncollect.db import open_collect
 from onioncollect.health_queue import HealthQueue
@@ -59,7 +58,7 @@ class UITestCase(unittest.TestCase):
         self.settings = throwaway_settings(data_dir=root / "data", configs_dir=root / "configs")
         self.settings.data_dir.mkdir()
         self.digest = build_stores(self.settings)
-        self.app = ui.App(self.settings)
+        self.app = ui.App(self.settings.data_dir, self.settings.configs_dir)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -160,7 +159,7 @@ class NotFoundTest(UITestCase):
             def __truediv__(self, other):
                 raise AssertionError("a path was built")
 
-        app = ui.App(dataclasses.replace(self.settings, data_dir=NoPath()))
+        app = ui.App(NoPath(), self.settings.configs_dir)
         with mock.patch.object(ui.Stores, "rows", side_effect=AssertionError("a query ran")):
             for key in ("..", "..%2F..%2Fsettings.toml", self.digest.upper(), self.digest[:-1], self.digest + "0",
                         "%2e%2e", f"{self.digest}.html", "0" * 63 + "g"):
@@ -190,7 +189,7 @@ class SourcePageTest(UITestCase):
 class ServerTest(UITestCase):
     def setUp(self):
         super().setUp()
-        self.server = ui.UIServer(self.settings, 0)
+        self.server = ui.UIServer(self.settings.data_dir, self.settings.configs_dir, 0)
         threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -235,17 +234,12 @@ class ServerTest(UITestCase):
 
 
 class WhoMayRunItTest(UITestCase):
-    def setUp(self):
-        super().setUp()
-        self.settings_path = Path(self.tmp.name) / "settings.toml"
-        self.settings_path.write_text(f'data_dir = "{self.settings.data_dir}"\nconfigs_dir = "{self.settings.configs_dir}"\n')
-
     def refused(self, uid: int, name: str) -> str:
         user = mock.Mock(pw_name=name)
         with mock.patch("os.geteuid", return_value=uid), mock.patch("pwd.getpwuid", return_value=user), \
                 mock.patch.object(ui, "UIServer", side_effect=AssertionError("listened")), \
                 self.assertRaises(SystemExit) as caught, redirect_stdout(io.StringIO()):
-            cli.main(["--settings", str(self.settings_path), "ui"])
+            ui_main.main(["--data-dir", str(self.settings.data_dir), "--configs-dir", str(self.settings.configs_dir)])
         return str(caught.exception)
 
     def test_refuses_root_the_crawler_and_anyone_who_can_write_the_stores(self):
@@ -258,7 +252,7 @@ class WhoMayRunItTest(UITestCase):
         for path in everything:
             path.chmod(0o550 if path.is_dir() else 0o440)
         try:
-            self.assertIsNone(ui.refusal(self.settings, "analyst"))
+            self.assertIsNone(ui.refusal(self.settings.data_dir, os.geteuid(), "analyst"))
             self.assertEqual(stat.S_IMODE(self.settings.data_dir.stat().st_mode), 0o550)
         finally:
             for path in reversed(everything):

@@ -13,7 +13,8 @@ Section 17's leak and boundary tests, by where they run:
                                   test_session (one login a run, the session gone after the run and after a crash,
                                   the credential nowhere under the data dir through the redaction gate and through
                                   a storage refusal)
-  the search UI reads, never fetches  UIContainmentTest, below; test_ui for the read-only connection
+  the search UI reads, never fetches  UIContainmentTest, below; test_ui for the read-only connection;
+                                  test_ui_entry for its entry point's import closure, static and loaded
 """
 import ast
 import re
@@ -275,7 +276,8 @@ class UIContainmentTest(unittest.TestCase):
     the Tor pool nor a session, and nothing in it opens a socket but that listener."""
 
     UI = PACKAGE / "ui.py"
-    NETWORK = {"fetcher", "tor_pool", "session", "probes", "crawler", "golive", "crawl_cli", "health_cli", "cli"}
+    NETWORK = {"fetcher", "tor_pool", "session", "probes", "crawler", "golive", "crawl_cli", "health_cli", "cli",
+               "config"}
     OUTSIDE = ("httpx", "httpx_socks", "python_socks", "stem", "aiosqlite")
 
     def test_ui_imports_exactly_these(self):
@@ -285,12 +287,10 @@ class UIContainmentTest(unittest.TestCase):
                 modules.update(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom):
                 modules.add(node.module if node.module != "onioncollect" else "onioncollect.*")
-        self.assertEqual(modules, {"argparse", "json", "logging", "os", "pwd", "re", "sqlite3", "sys", "time",
-                                   "datetime", "http.server", "logging.handlers", "pathlib", "urllib.parse",
-                                   "onioncollect.*", "onioncollect.config"})
-        self.assertEqual({name for name in imports_of(self.UI) if name.startswith("onioncollect.")} - {
-            "onioncollect.config"}, {"onioncollect.lifecycle", "onioncollect.search", "onioncollect.views",
-                                     "onioncollect.config.Settings", "onioncollect.config.config_path"})
+        self.assertEqual(modules, {"json", "logging", "os", "re", "sqlite3", "sys", "time", "datetime", "http.server",
+                                   "logging.handlers", "pathlib", "urllib.parse", "onioncollect.*"})
+        self.assertEqual({name for name in imports_of(self.UI) if name.startswith("onioncollect.")},
+                         {"onioncollect.lifecycle", "onioncollect.search", "onioncollect.views"})
 
     def test_nothing_the_ui_reaches_can_fetch(self):
         reached = package_modules_reached_from("ui")

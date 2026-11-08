@@ -24,7 +24,8 @@ EXPECTED = {
     "onioncollect-leak-test.service": ("root", "/bin/bash /opt/onioncollect/app/tests/live/leak_test.sh"),
     "onioncollect-log-audit.service": ("analyst", f"{PYTHON} -s -E tests/live/log_audit.py --data /home/crawler/data"
                                                   " --credentials %d /home/crawler/data/crawl.log /home/analyst/ui.log"),
-    "onioncollect-ui.service": ("analyst", f"{CLI} /home/analyst/settings.toml ui --port {ui.PORT}"),
+    "onioncollect-ui.service": ("analyst", f"{PYTHON} -s -E -m onioncollect.ui_main --data-dir /home/crawler/data"
+                                           f" --configs-dir /home/crawler/configs --port {ui.PORT}"),
     "onioncollect-capture.service": ("analyst", f"{PYTHON} -s -E tools/writeup_capture.py --settings"
                                                 " /home/analyst/settings.toml --credentials %d"
                                                 " --out /home/analyst/writeup-capture"),
@@ -111,6 +112,15 @@ class UnitFilesTest(unittest.TestCase):
                     self.assertEqual(service["PrivateNetwork"], "yes")
         service = unit("onioncollect-ui.service")["Service"]
         self.assertEqual((service["SocketBindAllow"], service["SocketBindDeny"]), (f"tcp:{ui.PORT}", "any"))
+        self.assertEqual(service["RestrictAddressFamilies"], "AF_INET AF_UNIX")
+
+    def test_the_ui_starts_from_its_own_entry_point_and_never_through_the_cli(self):
+        for path in sorted(UNITS.glob("*.service")):
+            command = unit(path.name)["Service"]["ExecStart"].split()
+            with self.subTest(unit=path.name):
+                if "onioncollect" in command:
+                    self.assertNotIn("ui", command)
+        self.assertIn("-m onioncollect.ui_main ", unit("onioncollect-ui.service")["Service"]["ExecStart"])
 
     def test_the_credential_reaches_the_analyst_units_through_systemd_only(self):
         for name in ("onioncollect-log-audit.service", "onioncollect-capture.service"):

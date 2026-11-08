@@ -4,7 +4,7 @@ import os
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-from onioncollect import config_cli, crawl_cli, fingerprint, health, health_cli, lifecycle, mirrors, source_config, ui
+from onioncollect import config_cli, crawl_cli, fingerprint, health, health_cli, lifecycle, mirrors, source_config
 from onioncollect.config import Settings, config_path, write_config
 from onioncollect.health_queue import HealthQueue
 from onioncollect.records import RecordStore
@@ -102,7 +102,6 @@ def build_parser() -> argparse.ArgumentParser:
     crawl_cli.add_commands(commands)
     config_cli.add_commands(commands)
     health_cli.add_commands(commands)
-    ui.add_commands(commands)
     # The analyst's commands by default; the crawler's own subcommands override this. Commands that only read
     # set `reader` and open the stores read-only.
     parser.set_defaults(crawl=False, reader=False)

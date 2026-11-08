@@ -1,11 +1,9 @@
 """Section 12's search UI: a small local web page over the three stores, run as the analyst and reached through
 an SSH forward to 127.0.0.1. Standard library only. It reads through read-only SQLite connections and the
-snapshot files; it never writes and never fetches. Its one socket is its own listener."""
-import argparse
+snapshot files; it never writes and never fetches. Its one socket is its own listener. ui_main.py starts it."""
 import json
 import logging
 import os
-import pwd
 import re
 import sqlite3
 import sys
@@ -17,12 +15,12 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from onioncollect import lifecycle, search, views
-from onioncollect.config import Settings, config_path
 
 ADDRESS = "127.0.0.1"
 LOCAL_NAMES = {ADDRESS, "localhost"}
 PORT = 8470
 CRAWLER = "crawler"
+STORES = ("collect.db", "records.db")
 RECORD_ID = re.compile(r"[1-9][0-9]{0,11}")
 SNAPSHOT_ID = re.compile(r"[0-9a-f]{64}")
 HISTORY_RUNS = 30
@@ -45,35 +43,17 @@ class Answer(Exception):
         self.status, self.detail = status, detail
 
 
-def add_commands(commands) -> None:
-    ui = commands.add_parser("ui", help="the read-only search UI on 127.0.0.1, as the analyst")
-    ui.add_argument("--port", type=int, default=PORT)
-    ui.set_defaults(command=ui_command, reader=True)
-
-
-def refusal(settings: Settings, user: str) -> str | None:
-    """Why this user may not run the UI: the crawler, or anyone who could write the stores it shows."""
+def refusal(data_dir: Path, uid: int, user: str) -> str | None:
+    """Why this user may not run the UI: root, the crawler, or anyone who could write the stores it shows."""
+    if uid == 0:
+        return "refusing to run as root"
     if user == CRAWLER:
         return "the UI runs as the analyst, never as the crawler"
-    stores = [settings.data_dir, *(settings.data_dir / name for name in ("collect.db", "records.db", "snapshots"))]
+    stores = [data_dir, *(data_dir / name for name in (*STORES, "snapshots"))]
     writable = [str(path) for path in stores if path.exists() and os.access(path, os.W_OK)]
     if writable:
         return f"this user can write {', '.join(writable)}; the UI runs only as a user that cannot"
     return None
-
-
-def ui_command(settings: Settings, args: argparse.Namespace) -> None:
-    if why := refusal(settings, pwd.getpwuid(os.geteuid()).pw_name):
-        raise SystemExit(f"onioncollect: {why}")
-    configure_logging(Path.home() / "ui.log")
-    server = UIServer(settings, args.port)
-    log.info("ui listening on port %d", server.server_address[1])
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
 
 
 def configure_logging(path: Path) -> None:
@@ -88,11 +68,11 @@ def configure_logging(path: Path) -> None:
 class Stores:
     """A read-only connection per request, so a crawl's writes show as they land and nothing here can write."""
 
-    def __init__(self, settings: Settings):
-        self.settings = settings
+    def __init__(self, data_dir: Path):
+        self.data_dir = data_dir
 
     def open(self, name: str) -> sqlite3.Connection:
-        db = sqlite3.connect(f"{(self.settings.data_dir / name).resolve().as_uri()}?mode=ro", uri=True)
+        db = sqlite3.connect(f"{(self.data_dir / name).resolve().as_uri()}?mode=ro", uri=True)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA query_only = ON")
         return db
@@ -109,9 +89,9 @@ class App:
     """Route to page. Returns (route name, status, html, rows shown); the route name and the counts are what
     gets logged, never the query or anything a page shows."""
 
-    def __init__(self, settings: Settings):
-        self.settings = settings
-        self.stores = Stores(settings)
+    def __init__(self, data_dir: Path, configs_dir: Path):
+        self.data_dir, self.configs_dir = data_dir, configs_dir
+        self.stores = Stores(data_dir)
 
     def answer(self, target: str) -> tuple[str, int, str, int]:
         parts = urlsplit(target)
@@ -181,7 +161,7 @@ class App:
         snapshots = self.stores.rows("records.db", "SELECT digest, path, kind, taken_at, baseline FROM snapshots"
                                                    " WHERE source_id = ? ORDER BY taken_at DESC LIMIT ?",
                                      (key, LATEST_SNAPSHOTS))
-        path = str(config_path(self.settings.configs_dir, key))
+        path = str(self.configs_dir / f"{key}.toml")
         return key, views.source_page(found[0], path, runs, items, snapshots), len(runs)
 
     def snapshot(self, key: str) -> tuple[str, str, int]:
@@ -193,7 +173,7 @@ class App:
         if not meta:
             raise Answer(404, "No such snapshot.")
         try:
-            body = (self.settings.data_dir / "snapshots" / key[:2] / f"{key}.html").read_text(errors="replace")
+            body = (self.data_dir / "snapshots" / key[:2] / f"{key}.html").read_text(errors="replace")
         except FileNotFoundError:
             raise Answer(404, "That snapshot has passed its retention clock.") from None
         return f"Snapshot {key[:12]}", views.snapshot_page(meta, body), 1
@@ -263,6 +243,6 @@ class Handler(BaseHTTPRequestHandler):
 class UIServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, settings: Settings, port: int):
+    def __init__(self, data_dir: Path, configs_dir: Path, port: int):
         super().__init__((ADDRESS, port), Handler)
-        self.app = App(settings)
+        self.app = App(data_dir, configs_dir)
