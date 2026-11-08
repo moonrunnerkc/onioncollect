@@ -5,7 +5,34 @@
 set -uo pipefail
 
 WINDOW=${LEAK_WINDOW_SECONDS:-300}
+# Golive's check 3 reads this. Root writes it, mode 644, so the crawler can read it and never forge it.
+RESULT_FILE=/var/lib/onioncollect/leak-test.json
+# Written by make deploy. The result records the one it ran under; golive and the crawl refuse a result that
+# names any other, so code deployed after a leak test never runs until the tests run again.
+STAMP_FILE=/var/lib/onioncollect/deploy-stamp
 source "$(dirname "$0")/capture.sh"
+
+# Each test's outcome as a JSON object, in the order they are judged; a test never judged is missing, and
+# golive refuses a result that lacks any of the four.
+TESTS=""
+# judged NAME COMMAND...: runs one test's reporting command and keeps its outcome under NAME.
+judged() {
+    local before=$FAILED passed=true
+    FAILED=0
+    "${@:2}"
+    [ "$FAILED" = 0 ] || passed=false
+    TESTS+="${TESTS:+, }{\"name\": \"$1\", \"passed\": $passed}"
+    FAILED=$(( before | FAILED ))
+}
+
+write_result() {
+    printf '{"run_at": "%s", "run_by": "%s", "deploy_stamp": "%s", "tests": [%s]}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" "${SUDO_USER:-root}" "$(tr -cd '0-9A-Za-z:. -' < "$STAMP_FILE" 2>/dev/null)" \
+        "$TESTS" > "$WORK/result.json"
+    install -d -m 755 -o root -g root "$(dirname "$RESULT_FILE")"
+    install -m 644 -o root -g root "$WORK/result.json" "$RESULT_FILE"
+    echo "result written to $RESULT_FILE"
+}
 
 # Section 15 test 1. The kill switch ends in DROP, so a blocked attempt gets no reply and curl gives up
 # at -m 5: exit 28 is the expected result and only exit 0 fails here. The pass rests on evidence of the
@@ -47,14 +74,14 @@ journalctl -k --since "@$T1_START" -o cat --no-pager | grep "onioncrawl-lt3: " >
 echo "      judged after the capture closes"
 
 echo "test 2: DNS block (as crawler)"
-if dns_blocked; then report "test 2 DNS block" pass; else report "test 2 DNS block" fail; fi
+if dns_blocked; then judged dns-block report "test 2 DNS block" pass; else judged dns-block report "test 2 DNS block" fail; fi
 
 echo "test 4: redirect trap, mocked 302 to https://example.com (as crawler, inside the capture)"
 if as_crawler bash -c "cd $APP && $PY -m unittest tests.test_fetcher.RedirectTrapTest" >"$WORK/t4.txt" 2>&1; then
-    report "test 4 redirect trap ($(grep -o 'Ran [0-9]* tests' "$WORK/t4.txt"))" pass
+    judged redirect-trap report "test 4 redirect trap ($(grep -o 'Ran [0-9]* tests' "$WORK/t4.txt"))" pass
 else
     cat "$WORK/t4.txt"
-    report "test 4 redirect trap" fail
+    judged redirect-trap report "test 4 redirect trap" fail
 fi
 
 echo "test 3: traffic during the window comes from the fetcher probe (steps 2 to 4)"
@@ -82,7 +109,8 @@ T1_LOOKUP=$(grep -cE "DPT=53 .*UID=$RESOLVER_UID " "$WORK/t1flows.txt")
 T1_LOOKUP_WIRE=$(captured "port 53")
 echo "      example.com: kernel log lines for uid systemd-resolve -> port 53: $T1_LOOKUP, captured DNS packets: $T1_LOOKUP_WIRE"
 [ "$T1_LOOKUP" -gt 0 ] && [ "$T1_LOOKUP_WIRE" = 0 ] || T1=fail
-report "test 1 clearnet block" "$T1"
+judged clearnet-block report "test 1 clearnet block" "$T1"
 
-capture_judge "test 3 packet capture: only tor talks to the network"
+judged packet-capture capture_judge "test 3 packet capture: only tor talks to the network"
+write_result
 exit $FAILED

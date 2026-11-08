@@ -1,125 +1,287 @@
 import asyncio
+import json
+import logging
 import tempfile
 import time
 import unittest
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
-from onioncrawl import crawler as crawler_module
-from onioncrawl.config import Settings
-from onioncrawl.crawler import Crawler
-from onioncrawl.db import stamp
-from onioncrawl.fetcher import FetchResult
-from onioncrawl.safety import parse_patterns
-from tests.test_onion import AHMIA, DUCKDUCKGO, TORPROJECT
+from onioncollect import health, lifecycle, pages, scheduler
+from onioncollect import fetcher as fetcher_module
+from onioncollect.crawler import Crawler
+from onioncollect.db import DETAIL, LISTING
+from onioncollect.fetcher import Fetcher, FetchResult
+from onioncollect.pages import inspect
+from onioncollect.records import RefusedWrite
+from tests.fixtures import (CANDIDATE, DECLINED, NEWS, NEWS_CONFIG, NEWS_MIRROR, OFF_SOURCE, detail_page, headlines,
+                            listing_page, make_live, throwaway_settings)
+from tests.test_onion import AHMIA, DUCKDUCKGO
 
-PATTERNS = "child_exploitation \\bforbiddenterm\\b\ncredential_dump zzcredzz\ncard_number 4111111111111111\n"
-TITLE = "Secret Title Words"
-PAGE = f"<title>{TITLE}</title><p>hello there</p><a href='/inner/path?q=secret'>x</a><!-- {TORPROJECT} -->".encode()
-
-
-def ok(url: str, body: bytes = PAGE, final_url: str | None = None, status: int = 200) -> FetchResult:
-    return FetchResult(url=url, final_url=final_url or url, status=status, headers={"content-type": "text/html"},
-                       body=body, elapsed=1.5)
+# Synthetic credentials. Each plaintext below must never be found anywhere under the data directory.
+PLAINTEXT = ("SynthPassw0rd!", "bob.synthetic@example.org", "4111 1111 1111 1111")
+LEAKY = "<p>bob.synthetic@example.org:SynthPassw0rd!</p><p>card 4111 1111 1111 1111</p>"
 
 
 class FakeTor:
-    def __init__(self, rate=1.0):
-        self.rate = rate
-
     def success_rate(self):
-        return self.rate
+        return 1.0
 
 
-FETCHER = mock.Mock(tor=FakeTor())
+class ScriptedFetcher:
+    """Stands in for the network: one canned result per path, every call recorded."""
+
+    def __init__(self, pages, hosts=None):
+        self.pages = pages
+        self.hosts = hosts or {}
+        self.calls = []
+        self.tor = FakeTor()
+
+    async def fetch(self, source_id: str, path: str) -> FetchResult:
+        self.calls.append((source_id, path))
+        host = self.hosts.get(source_id, NEWS)
+        page = self.pages.get(path)
+        if isinstance(page, FetchResult):
+            return page
+        if page is None:
+            return FetchResult(source_id, path, host=host, url=f"http://{host}{path}", error="timeout", elapsed=0.1)
+        return FetchResult(source_id, path, host=host, url=f"http://{host}{path}", status=200,
+                           headers={"content-type": "text/html"}, body=page, elapsed=0.4)
 
 
-class CrawlerTest(unittest.IsolatedAsyncioTestCase):
+class CrawlerTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name)
-        self.settings = Settings(
-            control_password="x", exclusions=frozenset({DUCKDUCKGO}), safety_patterns=parse_patterns(PATTERNS),
-            data_dir=root / "data", tor_instances=((10051, 11051),),
-        )
-        (root / "data").mkdir()
+        self.root = Path(self.tmp.name)
+        (self.root / "configs").mkdir()
+        (self.root / "data").mkdir()
+        (self.root / "configs" / "news.toml").write_text(NEWS_CONFIG)
+        self.settings = throwaway_settings(data_dir=self.root / "data", configs_dir=self.root / "configs",
+                                           tor_instances=((10051, 11051),), max_retries=1)
         self.crawler = Crawler(self.settings)
-        await self.crawler.frontier.open(root / "data" / "crawl.db")
+        await self.crawler.open()
+        await make_live(self.crawler.sources)
 
     async def asyncTearDown(self):
-        await self.crawler.frontier.close()
+        await self.crawler.close()
         self.tmp.cleanup()
 
-    async def claim(self, url: str):
-        await self.crawler.frontier.seed([url])
-        (task,) = await self.crawler.frontier.claim(1)
-        return task
-
-    async def status_of(self, url: str) -> str:
-        (status,), = await self.rows("SELECT status FROM urls WHERE url = ?", url)
-        return status
+    async def crawl(self, pages, hosts=None) -> ScriptedFetcher:
+        """One scheduler pass, then workers until nothing is claimable."""
+        fetcher = ScriptedFetcher(pages, hosts)
+        await self.crawler.start_due_runs()
+        while tasks := await self.crawler.frontier.claim(1):
+            await self.crawler.handle(tasks[0], fetcher)
+        return fetcher
 
     async def rows(self, sql: str, *params):
-        return list(await self.crawler.frontier.db.execute_fetchall(sql, params))
+        return await self.crawler.collect.rows(sql, params)
 
-    def stored_files(self) -> list[Path]:
-        return list((self.settings.data_dir / "pages").rglob("*.gz"))
+    async def records(self):
+        return await self.crawler.records.db.rows("SELECT * FROM records ORDER BY id")
 
-    async def test_success_saves_and_completes(self):
-        task = await self.claim(f"http://{AHMIA}/")
-        with self.assertLogs("onioncrawl.crawler", "INFO") as logs:
-            await self.crawler.handle_success(task, ok(task.url), FETCHER)
-        self.assertEqual(len(self.stored_files()), 1)
-        self.assertEqual(await self.rows("SELECT status FROM urls WHERE url = ?", task.url), [("done",)])
-        self.assertEqual(await self.rows("SELECT COUNT(*) FROM pages"), [(1,)])
-        self.assertEqual(logs.output, [
-            f"INFO:onioncrawl.crawler:{AHMIA} status=200 bytes={len(PAGE)} links=1 onions=1 changed=yes elapsed=1.5s"
-        ])
+    def everything_on_disk(self) -> bytes:
+        return b"".join(path.read_bytes() for path in self.root.rglob("*") if path.is_file())
 
-    async def test_listed_host_is_excluded_and_never_queued(self):
-        self.assertIn(DUCKDUCKGO, self.crawler.exclusions)
-        self.assertEqual(await self.rows("SELECT state FROM hosts WHERE host = ?", DUCKDUCKGO), [("excluded",)])
-        await self.crawler.frontier.seed([f"http://{DUCKDUCKGO}/"])
-        self.assertEqual(await self.rows("SELECT COUNT(*) FROM urls WHERE host = ?", DUCKDUCKGO), [(0,)])
 
-    async def test_body_trigger_excludes_host_and_keeps_links(self):
-        await self.crawler.frontier.seed([f"http://{AHMIA}/other"])
-        task = await self.claim(f"http://{AHMIA}/")
-        body = PAGE + b" forbiddenterm 4111111111111111"
-        with self.assertLogs("onioncrawl.crawler") as logs:
-            await self.crawler.handle_success(task, ok(task.url, body), FETCHER)
-        self.assertEqual(self.stored_files(), [])
-        self.assertEqual(await self.rows("SELECT COUNT(*) FROM pages"), [(0,)])
-        self.assertEqual(await self.rows("SELECT DISTINCT status FROM urls WHERE host = ?", AHMIA), [("parked",)])
-        self.assertEqual(await self.rows("SELECT COUNT(*) FROM urls WHERE host = ?", TORPROJECT), [(1,)])
-        self.assertEqual(logs.output, [f"WARNING:onioncrawl.crawler:{AHMIA} excluded: child_exploitation"])
-        self.assertIn(AHMIA, self.crawler.exclusions)
+class ApprovalGateTest(CrawlerTestCase):
+    """Section 17, test 1: candidates, declined hosts and sources not live are never fetched."""
 
-    async def test_second_in_flight_page_of_an_excluded_host_is_not_saved(self):
-        await self.crawler.frontier.seed([f"http://{AHMIA}/a", f"http://{AHMIA}/b"])
-        first, second = await self.crawler.frontier.claim(2)
-        await self.crawler.handle_success(first, ok(first.url, PAGE + b" zzcredzz"), FETCHER)
-        await self.crawler.handle_success(second, ok(second.url), FETCHER)
-        self.assertEqual(self.stored_files(), [])
-        self.assertEqual(await self.rows("SELECT state FROM hosts WHERE host = ?", AHMIA), [("excluded",)])
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        table = self.crawler.sources
+        await table.change_state("news", lifecycle.DISABLED, "reviewer pulled it")
+        await table.approve(AHMIA, "directory", "directories", "listing index", "tester", frozenset())
+        await table.add_candidates({CANDIDATE, DECLINED}, None)
+        await table.decline(DECLINED, "sells data", "tester")
+        (self.root / "configs" / "directory.toml").write_text(
+            NEWS_CONFIG.replace('"news"', '"directory"').replace(NEWS, AHMIA).replace("journalism-publishing", "directories"))
 
-    async def test_host_excluded_while_the_body_is_inspected_is_not_saved(self):
-        task = await self.claim(f"http://{AHMIA}/")
-        real_inspect = crawler_module.inspect
+    async def test_scheduler_starts_nothing_and_writes_nothing_beyond_the_source_table(self):
+        fetcher = await self.crawl({"/articles/": listing_page("A", "B")})
+        self.assertEqual(fetcher.calls, [])
+        for table in ("urls", "runs", "page_metrics", "uptime"):
+            (count,), = await self.rows(f"SELECT COUNT(*) FROM {table}")
+            self.assertEqual(count, 0, table)
+        self.assertEqual(await self.records(), [])
+        self.assertEqual(list((self.root / "data" / "snapshots").rglob("*")), [])
 
-        def inspect_while_another_worker_excludes(result, patterns):
-            self.crawler.exclusions.add(AHMIA)
-            return real_inspect(result, patterns)
+    async def test_direct_fetcher_calls_build_no_request(self):
+        built = []
+        configs = {"news": mock.Mock(hosts=(NEWS,), scheme="http"), "directory": mock.Mock(hosts=(AHMIA,), scheme="http")}
+        with mock.patch.object(fetcher_module, "AsyncProxyTransport", side_effect=lambda **kw: built.append(kw)):
+            fetcher = Fetcher(self.settings, mock.Mock(), self.crawler.sources, configs, lifecycle.COLLECTING)
+            for source_id in ("news", "directory", CANDIDATE, DECLINED, "nothing-here"):
+                result = await fetcher.fetch(source_id, "/")
+                self.assertEqual(result.error, "not_approved", source_id)
+        self.assertEqual(built, [])
 
-        with mock.patch.object(crawler_module, "inspect", inspect_while_another_worker_excludes):
-            await self.crawler.handle_success(task, ok(task.url), FETCHER)
-        self.assertEqual(self.stored_files(), [])
-        self.assertEqual(await self.status_of(task.url), "parked")
+
+class FrontierContainmentTest(CrawlerTestCase):
+    """Section 17, test 2: off-source onion links become candidates and reach no frontier."""
+
+    async def test_off_source_links_land_in_the_candidate_table_only(self):
+        await self.crawler.sources.approve(DUCKDUCKGO, "search", "privacy-services", "search", "tester", frozenset())
+        links = "".join(f"<a href='http://{host}/x'>x</a>" for host in (AHMIA, OFF_SOURCE, DUCKDUCKGO))
+        page = listing_page("A", "B", extra=links + f"<p>mirror at {CANDIDATE}</p>")
+        await self.crawl({"/articles/": page, "/articles/1": detail_page("one"), "/articles/2": detail_page("two")})
+        candidates = await self.crawler.sources.hosts(lifecycle.CANDIDATE)
+        self.assertEqual({row["host"] for row in candidates}, {AHMIA, OFF_SOURCE, CANDIDATE})
+        self.assertEqual({row["found_on"] for row in candidates}, {"news"})
+        queued = await self.rows("SELECT source_id, path FROM urls ORDER BY path")
+        self.assertEqual([tuple(row) for row in queued],
+                         [("news", "/articles/"), ("news", "/articles/1"), ("news", "/articles/2")])
+
+    async def test_redirect_off_the_source_is_recorded_not_followed(self):
+        moved = FetchResult("news", "/articles/", host=NEWS, status=302, error="redirect",
+                            redirect_to=f"http://{OFF_SOURCE}/articles/")
+        fetcher = await self.crawl({"/articles/": moved})
+        self.assertEqual(fetcher.calls, [("news", "/articles/")])
+        self.assertEqual([row["host"] for row in await self.crawler.sources.hosts(lifecycle.CANDIDATE)], [OFF_SOURCE])
+        (status,), = await self.rows("SELECT status FROM urls WHERE path = '/articles/'")
+        self.assertEqual(status, "failed")
+        self.assertEqual(await self.crawler.sources.redirected_from([OFF_SOURCE]), {OFF_SOURCE: ["news"]})
+
+    async def test_redirect_within_the_source_is_queued_as_its_own_fetch(self):
+        (self.root / "configs" / "news.toml").write_text(NEWS_CONFIG.replace('["/articles/"]', '["/articles"]'))
+        moved = FetchResult("news", "/articles", host=NEWS, status=301, error="redirect",
+                            redirect_to=f"http://{NEWS}/articles/")
+        fetcher = await self.crawl({"/articles": moved, "/articles/": listing_page("A", "B"),
+                                    "/articles/1": detail_page("one"), "/articles/2": detail_page("two")})
+        self.assertEqual(fetcher.calls[:2], [("news", "/articles"), ("news", "/articles/")])
+        self.assertEqual(len(await self.records()), 2)
+
+
+class RedactionGateTest(CrawlerTestCase):
+    """Section 17, test 3: tags and hashes reach disk, plaintext never does, and a top-priority health item
+    is raised."""
+
+    async def test_synthetic_credentials_are_redacted_everywhere_on_disk(self):
+        # An item already at the most the shortfall formula gives, on a heavier category, to rank against.
+        await self.crawler.sources.approve(AHMIA, "directory", "directories", "listing index", "tester", frozenset())
+        await self.crawler.health.raise_item("directory", health.Finding(health.UNREACHABLE, 100, "down"), None)
+        with self.assertLogs("onioncollect.crawler", logging.INFO) as logs:
+            await self.crawl({"/articles/": listing_page("A " + LEAKY, "B", extra=LEAKY),
+                              "/articles/1": detail_page(LEAKY), "/articles/2": detail_page("two")})
+        records = await self.records()
+        self.assertEqual(len(records), 2)
+        self.assertIn("[email_password]", records[0]["fields"])
+        self.assertIn("[card]", records[0]["fields"])
+        self.assertIn('"email_password": 2', records[0]["redactions"])
+        disk = self.everything_on_disk()
+        for secret in PLAINTEXT:
+            self.assertNotIn(secret.encode(), disk, secret)
+        (events,), = await self.rows("SELECT redactions FROM runs")
+        self.assertGreater(events, 0)
+        top, *rest = await self.crawler.health.queue()
+        self.assertEqual((top["source_id"], top["kind"], top["priority"]), ("news", health.REDACTION, health.REDACTION_PRIORITY))
+        self.assertTrue(all(item["priority"] < top["priority"] for item in rest))
+        self.assertEqual((await self.crawler.sources.get("news"))["state"], lifecycle.DEGRADED)
+        self.assertFalse(any("WARNING" in line for line in logs.output), "the item replaced the warning line")
+        for secret in PLAINTEXT:
+            self.assertNotIn(secret, "\n".join(logs.output))
+
+    async def test_refused_write_is_logged_without_the_record_and_raised(self):
+        with mock.patch.object(self.crawler.records, "add", side_effect=RefusedWrite("x")):
+            with self.assertLogs("onioncollect.crawler", logging.WARNING) as logs:
+                await self.crawl({"/articles/": listing_page("A", "B")})
+        self.assertIn("news write refused", "\n".join(logs.output))
+        (item,) = [item for item in await self.crawler.health.queue() if item["kind"] == health.REDACTION]
+        self.assertEqual(item["detail"], "write refused: a secret survived")
+
+
+class CollectionTest(CrawlerTestCase):
+    async def test_pagination_detail_and_run_close(self):
+        pages = {
+            "/articles/": listing_page("A", "B", next_href="/articles/?page=2"),
+            "/articles/?page=2": listing_page("A", "B", next_href="/articles/?page=3"),
+            "/articles/?page=3": listing_page("A", "B", next_href="/articles/?page=4"),
+            **{f"/articles/{n}": detail_page(f"story {n}") for n in (1, 2)},
+        }
+        fetcher = await self.crawl(pages)
+        listings = [path for _, path in fetcher.calls if "page" in path or path == "/articles/"]
+        self.assertEqual(listings, ["/articles/", "/articles/?page=2", "/articles/?page=3"])
+        records = await self.records()
+        self.assertEqual(len(records), 2, "the three listing pages repeat the same two articles")
+        self.assertIn("story 1", records[0]["fields"])
+        run, = await self.rows("SELECT * FROM runs")
+        self.assertIsNotNone(run["finished_at"])
+        self.assertEqual((run["pages"], run["failures"], run["below_expectation"]), (5, 0, 0))
+        source = await self.crawler.sources.get("news")
+        self.assertGreater(source["next_run"], run["finished_at"])
+        kinds = await self.crawler.records.db.rows("SELECT kind, COUNT(*) FROM snapshots GROUP BY kind ORDER BY kind")
+        self.assertEqual([tuple(row) for row in kinds], [(DETAIL, 1), (LISTING, 3)])
+
+    async def test_second_run_refreshes_records_and_skips_known_details(self):
+        pages = {"/articles/": listing_page("A", "B"), "/articles/1": detail_page("one"), "/articles/2": detail_page("two")}
+        await self.crawl(pages)
+        await self.crawler.collect.conn.execute("UPDATE sources SET next_run = NULL")
+        await self.crawler.collect.conn.commit()
+        fetcher = await self.crawl(pages)
+        self.assertEqual(fetcher.calls, [("news", "/articles/")])
+        self.assertEqual(len(await self.records()), 2)
+        (runs,), = await self.rows("SELECT COUNT(*) FROM runs WHERE finished_at IS NOT NULL")
+        self.assertEqual(runs, 2)
+
+    async def test_thin_page_is_below_expectation(self):
+        await self.crawl({"/articles/": listing_page("only one"), "/articles/1": detail_page("x")})
+        run, = await self.rows("SELECT below_expectation, items FROM runs")
+        self.assertEqual(tuple(run), (1, 1))
+
+    async def test_run_that_fetched_nothing_counts_as_failed(self):
+        await self.crawl({})
+        run, = await self.rows("SELECT pages, failures, finished_at FROM runs")
+        self.assertEqual((run["pages"], run["failures"]), (0, 1))
+        self.assertIsNotNone(run["finished_at"])
+        self.assertEqual((await self.crawler.sources.get("news"))["failed_runs"], 1)
+
+    async def test_body_tripping_the_safety_check_disables_the_source_and_stores_nothing(self):
+        with self.assertLogs("onioncollect.crawler", logging.WARNING):
+            await self.crawl({"/articles/": listing_page("A forbiddenterm", "B")})
+        source = await self.crawler.sources.get("news")
+        self.assertEqual((source["state"], source["reason"]), ("disabled", "safety: child_exploitation"))
+        self.assertEqual(await self.crawler.records.counts(), {"records": 0, "snapshots": 0})
+        (open_runs,), = await self.rows("SELECT COUNT(*) FROM runs WHERE finished_at IS NULL")
+        self.assertEqual(open_runs, 0)
+
+    async def test_gated_page_stores_nothing(self):
+        gate = b"<html><head><title>Checking your browser</title></head><body>wait</body></html>"
+        await self.crawl({"/articles/": gate})
+        self.assertEqual(await self.crawler.records.counts(), {"records": 0, "snapshots": 0})
+        (error,), = await self.rows("SELECT error FROM page_metrics")
+        self.assertEqual(error, "gated")
+
+    async def test_broken_config_is_not_scheduled_and_logged_once(self):
+        (self.root / "configs" / "news.toml").write_text(NEWS_CONFIG.replace('item = "article"', 'item = "//x"'))
+        with self.assertLogs("onioncollect.crawler", logging.ERROR) as logs:
+            await self.crawl({})
+            await self.crawl({})
+        self.assertEqual(len(logs.output), 1)
+        (runs,), = await self.rows("SELECT COUNT(*) FROM runs")
+        self.assertEqual(runs, 0)
+
+    async def test_config_naming_an_unapproved_host_is_not_scheduled(self):
+        (self.root / "configs" / "news.toml").write_text(
+            NEWS_CONFIG.replace(f'["{NEWS}"]', f'["{NEWS}", "{OFF_SOURCE}"]'))
+        with self.assertLogs("onioncollect.crawler", logging.ERROR):
+            fetcher = await self.crawl({})
+        self.assertEqual(fetcher.calls, [])
+
+    async def test_logs_never_carry_paths_titles_or_text(self):
+        pages = {"/articles/": listing_page("Secret Title Words", "Other " + LEAKY,
+                                            extra=f"<a href='http://{AHMIA}/q?s=1'>x</a>"),
+                 "/articles/1": detail_page("story")}
+        with self.assertLogs("onioncollect", logging.DEBUG) as logs:
+            await self.crawl(pages)
+        text = "\n".join(logs.output)
+        for forbidden in ("/articles", "Secret Title", "q?s=1", AHMIA, *PLAINTEXT):
+            self.assertNotIn(forbidden, text)
+        self.assertIn("news listing status=200", text)
 
     async def test_hostile_body_does_not_stall_the_loop(self):
-        task = await self.claim(f"http://{AHMIA}/")
-        body = b" ".join(b"word%d" % n for n in range(200_000))
+        await self.crawler.start_due_runs()
+        (task,) = await self.crawler.frontier.claim(1)
+        fetcher = ScriptedFetcher({"/articles/": b"<p>" + b"a" * 1_999_000 + b"</p>"})
         # The test runner's debug mode logs every slow step, which is itself slow enough to blur the measure.
         asyncio.get_running_loop().set_debug(False)
         gaps, done = [], asyncio.Event()
@@ -135,82 +297,122 @@ class CrawlerTest(unittest.IsolatedAsyncioTestCase):
         ticking = asyncio.create_task(ticker())
         await asyncio.sleep(0.01)
         started = time.perf_counter()
-        await self.crawler.handle_success(task, ok(task.url, body), FETCHER)
+        await self.crawler.handle(task, fetcher)
         took = time.perf_counter() - started
         done.set()
         await ticking
         self.assertLess(max(gaps), took / 2)
 
-    async def test_redirect_onto_an_excluded_host_parks_the_url_and_spares_the_origin(self):
-        task = await self.claim(f"http://{AHMIA}/go")
-        result = FetchResult(url=task.url, final_url=task.url, status=302, error="redirect_excluded", elapsed=3.0)
-        with self.assertLogs("onioncrawl.crawler") as logs:
-            await self.crawler.handle_failure(task, result, FETCHER)
-        self.assertEqual(await self.status_of(task.url), "parked")
-        self.assertEqual(await self.rows("SELECT state FROM hosts WHERE host = ?", AHMIA), [("up",)])
-        self.assertNotIn(AHMIA, self.crawler.exclusions)
-        self.assertEqual(logs.output, [f"INFO:onioncrawl.crawler:{AHMIA} error=redirect_excluded elapsed=3.0s"])
 
-    async def test_landing_on_a_host_excluded_mid_fetch_is_the_same_verdict(self):
-        task = await self.claim(f"http://{AHMIA}/go")
-        with self.assertLogs("onioncrawl.crawler") as logs:
-            await self.crawler.handle_success(task, ok(task.url, final_url=f"http://{DUCKDUCKGO}/landing"), FETCHER)
-        self.assertEqual(self.stored_files(), [])
-        self.assertEqual(await self.status_of(task.url), "parked")
-        self.assertEqual(await self.rows("SELECT state FROM hosts WHERE host = ?", AHMIA), [("up",)])
-        self.assertEqual(logs.output, [f"INFO:onioncrawl.crawler:{AHMIA} error=redirect_excluded elapsed=1.5s"])
+class HealthTest(CrawlerTestCase):
+    """Section 13's entry rules, raised as runs finish."""
 
-    async def test_gated_page_is_not_saved_and_recrawled_weekly(self):
-        task = await self.claim(f"http://{AHMIA}/")
-        gate = b"<title>DDoS protection</title><form><input type=password></form>"
-        await self.crawler.handle_success(task, ok(task.url, gate), FETCHER)
-        self.assertEqual(self.stored_files(), [])
-        (state,), = await self.rows("SELECT state FROM hosts WHERE host = ?", AHMIA)
-        (due,), = await self.rows("SELECT next_due FROM urls WHERE url = ?", task.url)
-        self.assertEqual(state, "gated")
-        self.assertGreater(datetime.fromisoformat(due).replace(tzinfo=UTC), datetime.now(UTC) + timedelta(days=6))
+    async def again(self, pages):
+        await self.crawler.collect.conn.execute("UPDATE sources SET next_run = NULL")
+        await self.crawler.collect.conn.commit()
+        return await self.crawl(pages)
 
-    async def test_failure_logs_host_and_error_and_rotates_a_sick_instance(self):
-        task = await self.claim(f"http://{AHMIA}/deep/path?q=1")
-        fetcher = mock.Mock(tor=FakeTor(rate=0.2))
-        result = FetchResult(url=task.url, final_url=task.url, error="tor_unreachable", elapsed=20.0)
-        with mock.patch.object(self.crawler.tor_pool, "rotate_for", mock.AsyncMock()) as rotate, \
-                self.assertLogs("onioncrawl.crawler") as logs:
-            await self.crawler.handle_failure(task, result, fetcher)
-        rotate.assert_awaited_once_with(fetcher.tor)
-        self.assertEqual(logs.output, [f"INFO:onioncrawl.crawler:{AHMIA} error=tor_unreachable elapsed=20.0s"])
-        self.assertEqual(await self.rows("SELECT status, retries FROM urls"), [("queued", 1)])
+    async def items(self):
+        return [(item["kind"], item["priority"]) for item in await self.crawler.health.queue()]
 
-    async def test_host_dies_after_spread_failures(self):
-        task = await self.claim(f"http://{AHMIA}/")
-        start = datetime.now(UTC) - timedelta(hours=30)
-        for hours in (0, 6, 12, 18):
-            await self.crawler.frontier.db.execute(
-                "INSERT INTO uptime VALUES (?, ?, 0)", (AHMIA, stamp(start + timedelta(hours=hours)))
-            )
-        result = FetchResult(url=task.url, final_url=task.url, error="timeout", elapsed=45.0)
-        with self.assertLogs("onioncrawl.crawler") as logs:
-            await self.crawler.handle_failure(task, result, mock.Mock(tor=FakeTor()))
-        self.assertEqual(await self.rows("SELECT state FROM hosts WHERE host = ?", AHMIA), [("dead",)])
-        self.assertEqual(await self.rows("SELECT status FROM urls"), [("parked",)])
-        self.assertIn(f"INFO:onioncrawl.crawler:{AHMIA} marked dead", logs.output)
+    async def test_a_thin_run_raises_by_how_far_below_and_degrades_the_source(self):
+        await self.crawl({"/articles/": listing_page("only one"), "/articles/1": detail_page("x")})
+        self.assertEqual(await self.items(), [(health.BELOW_EXPECTATION, 50)])
+        self.assertEqual((await self.crawler.sources.get("news"))["state"], lifecycle.DEGRADED)
+        fetcher = await self.again({"/articles/": listing_page("only one")})
+        self.assertEqual(fetcher.calls, [("news", "/articles/")], "a degraded source still collects")
+        (item,) = await self.crawler.health.queue()
+        self.assertEqual(item["occurrences"], 2)
 
-    async def test_host_that_answered_is_not_counted_down(self):
-        task = await self.claim(f"http://{AHMIA}/file.pdf")
-        result = FetchResult(url=task.url, final_url=task.url, status=200, error="not_text", elapsed=2.0)
-        await self.crawler.handle_failure(task, result, mock.Mock(tor=FakeTor()))
-        self.assertEqual(await self.rows("SELECT state, consecutive_failures FROM hosts WHERE host = ?", AHMIA), [("up", 0)])
-        self.assertEqual(await self.rows("SELECT status FROM urls"), [("parked",)])
+    async def test_a_required_field_lost_across_the_run(self):
+        page = b"<html><body>" + b"<article><time datetime='2026-11-07'>x</time></article>" * 3 + b"</body></html>"
+        await self.crawl({"/articles/": page})
+        self.assertEqual(await self.items(), [(health.REQUIRED_FIELD_LOST, 100)])
+        (item,) = await self.crawler.health.queue()
+        self.assertEqual(item["detail"], "title, url resolved on none of 3 items")
 
-    async def test_logs_never_carry_paths_queries_or_titles(self):
-        task = await self.claim(f"http://{AHMIA}/inner/path?q=secret")
-        with self.assertLogs("onioncrawl", "DEBUG") as logs:
-            await self.crawler.handle_success(task, ok(task.url), FETCHER)
-            await self.crawler.handle_failure(task, FetchResult(url=task.url, final_url=task.url, error="timeout"),
-                                              mock.Mock(tor=FakeTor()))
-        joined = "\n".join(logs.output)
-        for leak in ("/inner", "path", "secret", "Secret", TITLE, "hello"):
-            self.assertNotIn(leak, joined)
+    async def test_per_field_hits_are_kept_per_run(self):
+        await self.crawl({"/articles/": listing_page("A", "B"), "/articles/1": detail_page("one"),
+                          "/articles/2": b"<html><body>gone</body></html>"})
+        rows = await self.rows("SELECT kind, field, resolved, declared FROM run_fields ORDER BY kind, field")
+        self.assertEqual([tuple(row) for row in rows], [("detail", "body", 1, 2), ("listing", "published", 2, 2),
+                                                        ("listing", "title", 2, 2), ("listing", "url", 2, 2)])
+
+    async def test_unreachable_only_once_the_quick_retries_are_spent(self):
+        for run in range(1, scheduler.QUICK_RETRY_RUNS + 2):
+            await self.again({})
+            raised = await self.items()
+            self.assertEqual(raised, [] if run <= scheduler.QUICK_RETRY_RUNS else [(health.UNREACHABLE, 100)], run)
+        (item,) = await self.crawler.health.queue()
+        self.assertEqual(item["detail"], "nothing fetched in 4 runs in a row, last error timeout")
+
+    async def test_a_body_over_the_tag_cap_is_never_parsed(self):
+        # Step 5 measured lexbor at 30 s on this body.
+        body = b"<div>" * 200_000
+        result = FetchResult("news", "/articles/", host=NEWS, url=f"http://{NEWS}/articles/", status=200, body=body)
+        started = time.perf_counter()
+        with mock.patch.object(pages, "LexborHTMLParser", side_effect=AssertionError("parsed")):
+            found = inspect(result, LISTING, self.crawler.configs.get("news") or await self.crawler.config_for("news"),
+                            self.settings.safety_patterns, self.settings.redaction_salt)
+        self.assertLess(time.perf_counter() - started, 1.0)
+        self.assertTrue(found.refused)
+        fetcher = await self.crawl({"/articles/": body})
+        self.assertEqual(fetcher.calls, [("news", "/articles/")], "a refusal is not retried")
+        (error,), = await self.rows("SELECT error FROM page_metrics")
+        self.assertEqual(error, "parse_refused")
+        self.assertEqual(await self.crawler.records.counts(), {"records": 0, "snapshots": 0})
+        self.assertEqual(await self.crawler.records.seed_fingerprints(), {})
+        self.assertEqual(await self.items(), [(health.PARSE_REFUSED, 100)])
+
+    async def test_a_disabled_source_raises_nothing_more(self):
+        with self.assertLogs("onioncollect.crawler", logging.WARNING):
+            await self.crawl({"/articles/": listing_page("A forbiddenterm")})
+        self.assertEqual(await self.items(), [])
+
+
+class MirrorClusterTest(CrawlerTestCase):
+    """Two live sources serving the same pages from two addresses: one cluster, one row per article."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        await make_live(self.crawler.sources, "paper", NEWS_MIRROR)
+        (self.root / "configs" / "paper.toml").write_text(
+            NEWS_CONFIG.replace('id = "news"', 'id = "paper"').replace(NEWS, NEWS_MIRROR))
+        self.pages = {"/articles/": listing_page(*headlines("monday")),
+                      **{f"/articles/{n}": detail_page(f"story {n} body") for n in range(1, 6)}}
+
+    async def test_fingerprints_are_stored_per_host_and_path_with_the_seed_marked(self):
+        await self.crawl(self.pages, {"paper": NEWS_MIRROR})
+        rows = await self.crawler.records.db.rows("SELECT host, path, seed FROM fingerprints ORDER BY host, path")
+        self.assertEqual({(row["host"], row["path"]) for row in rows if row["seed"]}, {(NEWS, "/articles/"),
+                                                                                       (NEWS_MIRROR, "/articles/")})
+        self.assertEqual(len(rows), 12)
+
+    async def test_records_dedupe_across_the_cluster_from_the_first_run(self):
+        await self.crawl(self.pages, {"paper": NEWS_MIRROR})
+        self.assertEqual(await self.crawler.sources.cluster_of("news"), ("news", "paper"))
+        records = await self.records()
+        self.assertEqual(len(records), 5)
+        self.assertTrue(all("body" in json.loads(row["fields"]) for row in records))
+        sightings = await self.crawler.records.db.rows("SELECT record_id, host, source_id FROM record_hosts")
+        self.assertEqual(len(sightings), 10)
+        self.assertEqual({(row["host"], row["source_id"]) for row in sightings}, {(NEWS, "news"), (NEWS_MIRROR, "paper")})
+        (found,) = await self.crawler.records.search('"monday story 3"', source="paper")
+        self.assertEqual(found["sources"], ["news", "paper"])
+
+    async def only_due(self, source_id: str) -> None:
+        await self.crawler.collect.conn.execute(
+            "UPDATE sources SET next_run = CASE WHEN id = ? THEN NULL ELSE '2999-01-01' END", (source_id,))
+        await self.crawler.collect.conn.commit()
+
+    async def test_a_template_only_match_is_two_sources_with_their_own_rows(self):
+        await self.only_due("news")
+        await self.crawl(self.pages)
+        await self.only_due("paper")
+        await self.crawl(self.pages | {"/articles/": listing_page(*headlines("tuesday"))}, {"paper": NEWS_MIRROR})
+        self.assertEqual(await self.crawler.sources.cluster_of("paper"), ("paper",))
+        self.assertEqual(len(await self.records()), 10)
+        self.assertEqual({row["source_id"] for row in await self.records()}, {"news", "paper"})
 
 
 if __name__ == "__main__":

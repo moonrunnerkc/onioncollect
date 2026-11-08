@@ -1,0 +1,27 @@
+# Stage 1: copy to the guest's /home/crawler/configs/testonion.toml after `triage approve`, with the hostname
+# `make testonion` printed in place of HOSTNAME, then run `golive testonion`. Public pages only, no login.
+id = "testonion"
+hosts = ["HOSTNAME"]
+category = "self-hosted"
+cadence = "6h"
+seeds = ["/"]
+
+[listing]
+item = "article.note"
+
+[listing.fields]
+title = "h2 a"
+url = "h2 a@href"
+
+[detail]
+follow = "url"
+
+[detail.fields]
+body = "div.body"
+
+[expect]
+min_items_per_page = 2
+required_fields = ["title", "url"]
+
+[auth]
+type = "none"

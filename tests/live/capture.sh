@@ -16,7 +16,8 @@ trap capture_cleanup EXIT
 report() {
     if [ "$2" = pass ]; then echo "PASS  $1"; else echo "FAIL  $1"; FAILED=1; fi
 }
-as_crawler() { sudo -u crawler -H "$@"; }
+# runuser, not sudo: root drops to the crawler with no setuid binary, so the daily timer's NoNewPrivileges holds.
+as_crawler() { runuser -u crawler -- env HOME=/home/crawler "$@"; }
 drop_count() { iptables -L OUTPUT -v -n -x | awk '$3 == "DROP" {print $1}'; }
 # Counts packets in the finished capture that match a tcpdump filter.
 captured() { tcpdump -r "$WORK/cap.pcap" -nn "$1" 2>/dev/null | wc -l; }

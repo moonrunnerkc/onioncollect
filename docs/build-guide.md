@@ -1,112 +1,171 @@
-# Breach Exposure Monitor — Build Guide
+# Onion Collection Platform: Build Guide
 
 ## 1. What you're building
 
-A breach-exposure monitoring pipeline for companies you are authorized to monitor. It tells you, with evidence, when a client's data appears to be exposed or offered somewhere it shouldn't be, and it routes that to a human for confirmation and reporting. It is a detection and alerting system, not a collection system. Nothing about it acquires, accumulates, or retains stolen data.
+A darknet collection platform, scaled down to one operator, that runs lawfully end to end. It takes a source from candidate to live collection, extracts structured records from it over Tor, keeps those records in a searchable store, watches the health of every live source, and routes failures to a triage queue. The targets are benign public onion services only: news organizations' onion mirrors, SecureDrop instances, the Tor Project, Debian, Proton, DuckDuckGo, and the legitimate directories that list them. Nothing in the pipeline ever touches stolen data, because nothing in the approved source set hosts any.
 
-Three ideas define the whole design, and every later section serves them:
+Three ideas define the design, and every later section serves them:
 
-1. Feeds first, crawler last. Most exposure is detectable through lawful, structured sources that already do the hard work. The Tor component is a narrow last mile for a curated set of sources those feeds don't cover, not the center of the product.
-2. Scoped, not exploratory. The system watches a known source list for a known target list (your clients). It never discovers or indexes where data is sold, and it never builds a map of that ecosystem.
-3. Ephemeral by default, findings only. Pages are processed in memory and discarded. The only thing that ever reaches disk is a redacted finding tied to an authorized target. There is no page corpus, no credential store, no dump archive, because the code has nowhere to put one.
+1. Approved sources only. Discovery is real and runs continuously, but a discovered host is a candidate, not a target. Nothing is fetched until a human has reviewed it against the source policy and approved it. The approval gate is enforced in code.
+2. Collection is the product. Each source gets a declarative config (seeds, selectors, pagination, cadence) that turns pages into structured records. Records persist, are indexed, and are searchable. Health of every config is measured on every run.
+3. Operator safety is a hard boundary. All egress is Tor, enforced by the firewall, not by the code. A redaction gate runs before every write so that even an approved page can't put a credential or a person's data on disk.
 
-The output is a stream of confirmed findings of the form "client X appears exposed on source Y as of time Z, claim is N records of type T, here is redacted evidence," suitable for notifying the client and, where warranted, the affected company, a CERT, or law enforcement.
+The output is a running system you can point a hiring manager at: a source list with lifecycle states, configs with hit-rate history, a searchable index of extracted records, a health queue with dispositions, and a test suite that proves the boundaries hold.
 
-This replaces the earlier general-crawler plan. The Tor plumbing from that plan carries over intact; its purpose is now operator safety while monitoring, and its outputs feed the matcher instead of a page store.
+This replaces the earlier breach-exposure-monitor plan. The Tor plumbing carries over intact. The feeds-first strategy, the client target list, and the match-gated storage are gone; they were designed for a product sold to clients, and this project is built to demonstrate collection capability instead.
 
 ## 2. Hard non-goals, enforced in code
 
-These are the lines that separate breach-exposure monitoring from trafficking. Each is enforced by the code or the OS, not by discipline, so a bug or a bad night can't cross them.
+These lines keep the project lawful without relying on discipline. Each is enforced by the code or the OS so a bug or a bad night can't cross them.
 
 | Non-goal | How the code prevents it |
 | --- | --- |
-| Never download a dump or any non-text payload | Text-only, Content-Type allowlist (`text/html`, `application/xhtml`, `text/plain`), 2 MB read cap. Binaries and archives are refused before the body is read. |
-| Never persist a page that doesn't match an authorized target | Storage is match-gated. A fetched body lives in memory only; if the matcher finds no authorized-target hit, the body is dropped and nothing but scheduling metadata (host reachable, when) is kept. |
-| Never store plaintext credentials or PII | The redaction gate runs before any write. The storage layer has no method that accepts a raw body, and it rejects any write whose payload still contains a detectable secret pattern. |
-| Never validate, replay, or submit a credential | No login, no form submission, no auth flows anywhere in the codebase. "Does this credential still work" is not a feature and is banned at review. This is account compromise under the CFAA regardless of intent. |
-| Never engage a seller or marketplace | No posting, no messaging, no purchase, no account creation. The system reads public listing text and nothing else. |
-| Never leave Tor, never follow a clearnet link | Firewall drops all non-Tor egress from the crawler user; only `.onion` hosts are ever fetched; redirects are checked, not followed. (Carried over from the original plan.) |
+| Never fetch a host that isn't approved | The fetcher takes a source id, not a URL. It resolves the source, refuses any state other than `live` or `go-live-check`, and refuses any URL whose host isn't in that source's host set. Discovered links are written to the candidate table and nowhere else. |
+| Never collect outside the benign-source policy | Approval is a CLI action that requires a policy category and a reviewer note. The policy categories are an enum; "leak site," "market," and "forum requiring an account you don't own" aren't in it. |
+| Never download a dump or any non-text payload | Text-only Content-Type allowlist (`text/html`, `application/xhtml+xml`, `text/plain`), 2 MB read cap. Binaries and archives are refused before the body is read. |
+| Never store a plaintext credential or PII | The redaction gate runs before any write. The storage layer rejects any payload that still trips the secret detector, as a second independent check. |
+| Never validate, replay, or submit a credential to a third party | The only auth code path is bound to the self-hosted test onion in section 15. Any auth attempt against another host raises before a request is built. No form submission, no account creation, no messaging anywhere else in the codebase. |
+| Never engage anyone | No posting, no messaging, no purchase. The system sends GET requests and, for the self-hosted onion only, one POST to its own login form. |
+| Never leave Tor, never follow a clearnet link | Firewall drops all non-Tor egress from the crawler user; only validated v3 `.onion` hosts are ever fetched; redirects are recorded, not followed. |
 
-Treat the match-gated storage and the redaction gate the way you treat the firewall: controls that make every other mistake survivable.
+Treat the approval gate and the redaction gate the way you treat the firewall: controls that make every other mistake survivable.
 
-## 3. Authorization, lawful basis, and data handling
+## 3. Source policy
 
-This is a product that touches other people's data, so the paperwork is part of the architecture, not an afterthought. None of the below is legal advice; have counsel review before you operate this commercially, especially around CFAA, ECPA, and state stolen-data-possession statutes in Colorado and any client's jurisdiction.
+One page, version-controlled, applied at triage. It's the rubric that decides what gets approved and it's the document you show when someone asks how you kept this lawful.
 
-What has to exist before the first run:
+Approved categories:
 
-1. Written authorization per client, with an explicit scope: which company names, which domains, which brands. The target list is a contractual artifact, not a config convenience. You monitor only what a signed client has authorized.
-2. A documented lawful basis for processing (contractual necessity plus legitimate interest is the usual pairing) and a retention policy. Redacted findings get a retention clock; expired findings are deleted. You keep evidence of exposure, not a growing library of it.
-3. An incidental-data procedure. You will see third parties' data that isn't your client's. The rule: do not persist it, record only the source and timestamp if anything, and report through a proper channel (the affected org, a sector ISAC, IC3/FBI, or a CERT) if it's clearly actionable. You never collect it "just in case."
-4. A handling and access policy for the findings DB: who can read it, encryption at rest, access logging, and a breach plan for your own system. A breach-monitoring tool that gets breached is the worst headline available to you.
+- Journalism and publishing: onion mirrors operated by news organizations, their SecureDrop instances.
+- Software and infrastructure: Tor Project, Debian and other distro mirrors, package archives, documentation sites.
+- Privacy services with public onion front ends: mail providers, search engines, messaging projects.
+- Directories and indexes whose purpose is listing the above.
+- Your own hosted onion services (section 15).
 
-For Aftermath's buyers this section is also the sales asset. Compliance customers diligence exactly this, and "here is our authorization model and our data-minimization proof" is more convincing than any feature.
+Declined, always, with the reason recorded: anything selling or distributing data, credentials, or goods; forums or markets that require an account you don't own; anything whose primary content is other people's personal data; anything the reviewer can't categorize.
+
+Retention: page snapshots 30 days, extracted records 180 days, health and uptime history indefinitely. A retention sweep runs nightly and is tested.
+
+Nothing here is legal advice. Accessing public onion services is no different in kind from accessing public websites, but if this ever becomes a commercial service, have counsel review the policy and your handling procedures first.
 
 ## 4. Architecture overview
 
-The pipeline, left to right:
-
 ```
-feeds ─────────────┐
-                    ├─► normalizer ─► matcher ─► redaction gate ─► findings DB ─► review queue ─► reporter
-scoped Tor crawler ─┘                   │
-                                        └─ (no match) ─► discard body
+source list ──► scheduler ──► tor pool / fetcher ──► extractor ──► redaction gate ──► records DB + FTS index
+    ▲                              │                      │
+    │                              │                      └─► link discovery ──► candidate table ──► triage (human) ──► approve / decline
+    │                              │
+    └── go-live checks             └─► health metrics ──► health queue ──► disposition (fix / mirror swap / disable)
 ```
-
-Feeds and the crawler are just two kinds of source that produce the same thing: candidate records of "some text, from some source, at some time." Everything after the normalizer is identical regardless of where the text came from, which keeps the sensitive logic (matching, redaction, storage) in one place you can audit.
 
 Component responsibilities:
 
-- Feed adapters pull structured exposure data from lawful providers and emit normalized candidates. No Tor involved.
-- The scoped crawler fetches pages from a curated source list over Tor and emits the same normalized candidates. Its frontier is seeded only from the source list; it does not expand into discovered markets.
-- The matcher tests each candidate against the authorized target list. No hit, no persistence.
-- The redaction gate converts a hit into a redacted finding: claims and counts kept, secrets replaced by type plus count plus salted hash.
-- The findings DB stores only redacted findings. The review queue is a status on those rows.
-- The reporter turns a human-confirmed finding into a client notification and, where warranted, an outbound report to the affected org or authorities.
+- Source list: every known onion host with a lifecycle state (section 7), its config, its policy category, and its mirror cluster.
+- Scheduler: picks which live sources are due, by cadence and by health, and hands source ids to workers.
+- Tor pool and fetcher: carried over from the original plan (sections 5 and 9). Fetches only what a source id resolves to.
+- Extractor: runs the source's config against the page, emits structured records and a selector hit-rate report.
+- Redaction gate: strips credential- and PII-looking spans before anything is written.
+- Records DB and FTS index: persistence plus full-text search over extracted records.
+- Link discovery: pulls onion links out of fetched pages into the candidate table. Nothing else.
+- Triage: a human reviews candidates against the policy, checks for mirrors, approves or declines.
+- Health queue: failed or degraded sources, ordered by priority and age, with dispositions.
+- Go-live checks: the gate between `approved` and `live`.
 
-## 5. Operator safety (the carried-over hardening, restated)
+## 5. Operator safety (carried over)
 
-Every anonymity control from the original plan stays, because accessing leak sources exposes the operator, not because you're hiding collection. Restated purpose, same mechanics:
+Every anonymity control from the original plan stays. Accessing onion services exposes the operator's network position, and the point of this section is that the operator never has to think about it.
 
-- Dedicated, full-disk-encrypted VM; two users; snapshot after setup.
+- Dedicated, full-disk-encrypted VM; two users (`crawler` for collection, `analyst` for triage, health, and search); snapshot after setup.
 - Six to ten Tor instances via `tor-instance-create`, each `ClientOnly 1`, `SafeLogging 1`, `IsolateSOCKSAuth`, per-instance system user.
-- The firewall kill-switch: iptables OUTPUT allows loopback, SSH replies, and the Tor UIDs only, then DROP; ip6tables OUTPUT policy DROP. The crawler user cannot send a packet off the box.
+- The firewall kill-switch: iptables OUTPUT allows loopback, SSH replies, and the Tor UIDs only, then DROP; ip6tables OUTPUT policy DROP. The crawler user can't send a packet off the box.
 - Pinned reproducible dependencies with hashes.
+- Data directory on the encrypted disk, mode 700, owned by `analyst`; the crawler writes through a small local socket service so it never holds the DB file open. Analyst tooling never needs the crawler's circuits.
 
-The full environment setup (sections 3.1 to 3.4 of the original plan) is unchanged. The one addition: the findings DB and evidence store live on the encrypted disk with directory mode 700, and the review/reporter tooling runs under a separate user from the crawler so that analyst access to findings never needs the crawler's circuits.
+The full environment setup (sections 3.1 to 3.4 of the original plan) is unchanged.
 
-## 6. Feed ingestion (build this first)
+## 6. Collection configs
 
-This is where 80% of the value comes from, and none of it touches an onion site.
+This is the artifact a collections analyst produces daily, so it's the center of the codebase. One TOML file per source under `configs/`, version-controlled, validated against a schema on load. TOML rather than YAML because the standard library's `tomllib` reads it, which keeps the dependency count at five.
 
-1. Have I Been Pwned domain search. HIBP's domain-search API returns which breaches include addresses on a domain you control or are authorized for. It requires domain verification, which is exactly the authorization gate you want anyway. This alone covers a large share of "is my client's email estate in a known breach." Reasoning: lawful, structured, verification-gated, and it's the baseline every client expects.
-2. Commercial CTI feeds. SpyCloud, Flashpoint, Recorded Future, DeHashed, IntelX and similar already crawl markets and forums under their own legal frameworks and sell normalized output, usually with APIs. Build one adapter against whichever you license; keep the adapter interface generic so swapping providers is a config change. Reasoning: you buy the risky collection as a service from entities set up to do it legally, instead of reproducing it.
-3. A normalizer that maps each provider's schema onto your candidate shape: `source`, `observed_at`, `target_hint` (domain or org if the feed already attributes it), `text` (the listing or record description), `claim` (record count, data types), and `raw_secret_spans` (locations of credential/PII-looking substrings, for the redaction gate; never the values themselves past that stage).
+```toml
+id = "tor-project-blog"
+hosts = ["<56-char>.onion"]
+category = "software-infrastructure"
+cadence = "6h"
+seeds = ["/blog/"]
 
-Build and ship this feeds-only version first. It's a complete, useful product on its own, and it has no Tor surface at all. The crawler is an enhancement you add once this is solid.
+[pagination]
+next = "a.pagination-next"
+max_pages = 5
 
-## 7. The two watchlists
+[listing]
+item = "article.post-preview"
 
-Two curated lists, both version-controlled, both reviewed.
+[listing.fields]
+title = "h2 a"
+url = "h2 a@href"
+published = "time@datetime"
 
-- Source list. Specific leak forums, paste sites, and onion sources you already know and have decided to monitor. This is the crawler's entire universe. New sources are added by a human after review, never discovered and auto-added. Reasoning: a curated source list is the difference between monitoring known places and indexing the ecosystem. The crawler's frontier is seeded from this list and from same-source links only; it does not queue hosts found in page text.
-- Target list. The company names, domains, brand terms, and authorized identifiers for each client under contract. Each entry references the authorizing client and contract. Reasoning: the target list is what gates persistence, so it's effectively your authorization boundary expressed as data.
+[detail]
+follow = "url"
 
-A deliberate change from the original crawler: `find_onions_in_text` and cross-host link discovery are removed. The crawler follows links only within a source already on the list, up to a shallow depth, to page through that source's own listings. It never adds a new host from page content.
+[detail.fields]
+body = "div.post-content"
+author = "span.author"
 
-## 8. The scoped crawler
+[expect]
+min_items_per_page = 3
+required_fields = ["title", "url"]
 
-Mechanically this is the original `tor_pool` / `fetcher` / frontier design, with three changes.
+[auth]
+type = "none"
+```
 
-What carries over unchanged: the Tor pool with per-instance health and NEWNYM rotation; the fetcher's anonymity-critical client config (SOCKS5 with `rdns=True`, per-host SOCKS username for circuit isolation, `http2=False`, `follow_redirects=False`, `trust_env=False`, fixed Tor Browser headers, cookies cleared in a `finally`); v3 onion validation; the 45 s budget, 2 MB cap, and Content-Type allowlist; WAL-mode SQLite frontier that survives crashes.
+Rules the schema enforces:
 
-The three changes:
+- `hosts` must all pass `is_v3_onion`, and every seed and followed URL must resolve to one of them.
+- Selectors are CSS with an optional `@attr` suffix. No XPath, no regex-on-HTML, no eval of any kind.
+- `follow` may only reference a field extracted from the same host set. Off-host links go to discovery, never to the frontier.
+- `expect` is what the go-live check and the health monitor measure against. A config without expectations can't go live.
+- `auth.type` is `none` for every source except the self-hosted onion in section 15, and the loader rejects any other combination.
 
-1. The frontier is seeded only from the source list, and `add_discovered` accepts only URLs whose host is already on the source list. Off-source links are dropped silently. This is the code expression of "scoped, not exploratory."
-2. `handle_success` no longer stores the page. It hands the in-memory body to the normalizer, then the matcher. If there's no authorized-target match, the body is discarded; only the host's reachability and timestamp are written (for recrawl scheduling). There is no `PageStore`, no `pages/` directory, no raw-HTML on disk.
-3. Recrawl cadence is driven by source volatility (a busy forum's index pages are checked often; a static paste rarely) rather than by content-change detection, since you're not keeping content to diff. Uptime history stays; it's useful and harmless.
+Keep the configs in data, not code. Adding, tuning, or disabling a source is a reviewed file change, not a deploy.
 
-The `onion.py` validation gate, including `is_v3_onion`, stays exactly as speced; it's still the only thing that lets a host through:
+## 7. Source lifecycle and discovery
+
+Every onion host the system has ever seen is a row in the source table with one of these states:
+
+- `candidate`: discovered or requested, not yet reviewed. Never fetched.
+- `approved`: reviewed against the policy, has a config, hasn't passed go-live checks. Fetched only by the go-live command.
+- `live`: collecting on cadence.
+- `degraded`: live but failing expectations; still collecting, in the health queue.
+- `disabled`: taken out of rotation by a human, with a reason. Not fetched.
+- `declined`: reviewed and rejected, with a policy reason. Never fetched, and re-discovery doesn't resurrect it.
+
+Discovery runs on every fetched page: extract v3 onion hosts from links and text, drop anything already in the table, insert the rest as `candidate` with the referring source and first-seen time. That's the whole discovery feature. It never queues a fetch, never expands the frontier, never auto-approves. It exists so triage has a steady stream of real sourcing requests to work, which is the first responsibility in the posting.
+
+Triage is a CLI session under the `analyst` user: show candidates by age, show where each was found, show its mirror cluster if any (section 8), approve with a category and note, or decline with a reason. The approve action also scaffolds a config file for the analyst to fill in.
+
+## 8. Mirrors and duplicates
+
+Legitimate onion services run multiple addresses, rotate them, and get listed under stale ones. Collections teams spend real time on this, so make it a first-class feature.
+
+- Fingerprint every fetched page two ways: a content hash of normalized visible text, and a structure hash of the DOM shape (tag sequence with attributes stripped). Store both per page.
+- Cluster hosts whose fingerprints match above a threshold across their seed pages. Two hosts in a cluster are mirrors of one logical source.
+- At triage, show "candidate matches live source X" so the analyst can approve it as a mirror of X (adds it to X's host set) instead of as a new source.
+- In the health queue, when a live source fails reachability, show the cluster's other hosts with their last-seen status and offer a mirror swap as a disposition.
+- Dedup extracted records across a cluster by content hash so the index doesn't carry the same article from three addresses.
+
+## 9. The fetcher and Tor pool (carried over)
+
+Mechanically this is the original `tor_pool` / `fetcher` design. What carries over unchanged: the Tor pool with per-instance health and NEWNYM rotation; the anonymity-critical client config (SOCKS5 with `rdns=True`, per-host SOCKS username for circuit isolation, `http2=False`, `follow_redirects=False`, `trust_env=False`, fixed Tor Browser headers, cookies cleared in a `finally`); the 45 s budget, 2 MB cap, and Content-Type allowlist; WAL-mode SQLite frontier that survives crashes.
+
+Two changes:
+
+1. The fetcher's public interface takes a source id and a path, never a bare URL. It resolves the source, checks state, checks the host set, builds the URL, and only then opens a circuit. There is no code path that fetches an arbitrary URL.
+2. Scheduling is cadence-driven with a health multiplier: a source that's failing is retried sooner for a bounded number of attempts, then handed to the health queue and slowed down. Uptime history is kept per host for mirror selection.
+
+The `onion.py` validation gate stays exactly as speced; it's still the only thing that lets a host into the table at all:
 
 ```python
 def is_v3_onion(host):
@@ -122,74 +181,115 @@ def is_v3_onion(host):
     return version == 3 and checksum == expected
 ```
 
-## 9. The matcher
+## 10. The extractor
 
-A single stage that tests a normalized candidate against the target list and returns the matched target plus the spans that matched, or nothing.
+Runs the source's config against a fetched page and produces two things: records and a hit-rate report.
 
-- Match on domains, company names, and authorized brand terms, with normalization for the obvious evasions (spacing, common substitutions) but no fuzzy sprawl that would pull in unrelated orgs. Precision matters more than recall here; a false "your client is exposed" is expensive.
-- A match carries the target's authorizing client, so everything downstream is already scoped to who's allowed to see it.
-- No match means the candidate ends here and its body is dropped. This is the gate that keeps the system from retaining anything about anyone you're not authorized to monitor.
+- Records: one per matched `listing.item`, with each field resolved by its selector. Missing required fields mark the record incomplete; incomplete records are counted but not stored.
+- Hit-rate report: items found vs `min_items_per_page`, fields resolved vs fields declared, per page. This is written to health metrics on every run and is how layout changes get caught before a source goes fully dark.
+- `detail.follow` enqueues the referenced URL on the same source's frontier, host-checked, up to the configured depth.
+- Parsing is `selectolax` or `lxml` over the in-memory body. Nothing about extraction touches disk until the redaction gate has run.
 
-Keep the matcher rules in data (the target list), not code, so adding a client is a reviewed list change, not a deploy.
+## 11. The redaction gate
 
-## 10. The redaction gate
+Carried over from the earlier plan and repositioned as defense in depth. With a benign source set it should almost never fire, which is exactly why it has to be there: if it does fire, something about the source or the policy is wrong, and you want to know before the data is on disk.
 
-The load-bearing change, and the reason the system can prove a breach without holding one.
+- Every record field and every page snapshot passes through the detector before write. Detected spans (email:password and user:password pairs, long credential-shaped tokens, card-number patterns, national-ID patterns, bulk email lists) are replaced with a type tag, a count, and a salted hash.
+- Any redaction event on a live source raises a health-queue item at top priority, because a source that's publishing credentials doesn't belong in the approved set.
+- The storage layer runs the same detector independently and refuses any write that still trips it. Two detectors, one rule.
+- Per-deployment salt, kept with the same care as the Tor control password.
 
-On a match, you build a finding that captures the shape of the exposure and none of the payload:
+## 12. Storage and search
 
-- Kept in clear: source, observed-at timestamp, matched target and client, the seller's or poster's claims (record count, data types, price if stated), and the surrounding listing text with secrets stripped out.
-- Replaced: every credential- or PII-looking span is swapped, before anything is written, for a tag plus a count plus a salted hash. So a sample block of 500 logins becomes "500 email:password pairs, domain acme.com, sample hashes [...]." You store the hashes, never the values.
+Three stores, all under the `analyst` user on the encrypted disk.
 
-Why hashes and counts are enough: you can confirm the exposure is real and quantify it, you can later check a hash against a client's own known accounts to see whether live credentials are implicated, and you can deduplicate findings across sources, all without your database ever containing a usable credential or a person's data. Use a per-deployment salt kept with the same care as the Tor control password, so the hashes aren't reversible via precomputed tables and aren't portable if the DB leaks.
+- Source table (SQLite, WAL): hosts, state, category, config path, mirror cluster id, lifecycle timestamps, reviewer notes. Indexed by state and cluster.
+- Records DB (SQLite, WAL) with an FTS5 virtual table over the text fields: one row per extracted record, keyed by source, content hash, first-seen and last-seen. Dedup across a mirror cluster by content hash. Retention clock per section 3.
+- Snapshot store: redacted page bodies, content-addressed, 30-day retention, used for diffing a source against its last known-good layout when a config breaks.
 
-Detection patterns to redact: email:password and user:password pairs, long credential-shaped tokens, card-number patterns, national-ID patterns, and bulk email lists. When in doubt, redact; a missed secret is a stored secret, which is the one failure this gate exists to prevent. The storage layer runs the same detector as a second check and refuses any write that still trips it.
+Search is a CLI command and a small read-only local web UI under the `analyst` user: full-text query, filter by source, category, date range; results link to the source and the snapshot. This is the demo surface. It's a scaled-down version of what a collections product exists to feed.
 
-## 11. Storage
+## 13. Collection health queue
 
-Two small stores, both holding only redacted findings.
+Every run writes metrics per source: reachability, status code, timing, selector hit rate, items extracted, redaction events. The health queue is a view over those metrics plus a dispositions table.
 
-- Findings DB (SQLite, WAL). One row per confirmed-or-pending finding: id, client, target, source, observed_at, claim fields, status (`new`, `in_review`, `confirmed`, `dismissed`, `reported`), reviewer, and a pointer to the evidence artifact. Indexed by client and status for the review queue and reports.
-- Evidence store. The redacted listing text and the sample hashes for each finding, content-addressed, directory mode 700, retention clock applied. This is what you'd attach to a client notification or an authority report.
+A source enters the queue when it fails reachability past the retry budget, falls below `min_items_per_page`, loses a required field across a run, or trips the redaction gate. Queue ordering is priority then age, where priority is derived from category weight and how far below expectation the source fell.
 
-There is deliberately no raw-page store and no credential store. If a future requirement seems to need one, that's the signal to stop and reread section 2, not to add a table.
+Dispositions, each recorded with a note: `fixed` (config updated, passed go-live again), `mirror-swapped` (host set changed to a cluster sibling), `disabled` (with reason), `watching` (snoozed for N runs). Dispositions are the audit trail of how collections were kept healthy, which is most of what the posting describes.
 
-## 12. Review queue and reporting
+## 14. Go-live checks
 
-A human gate sits between detection and any outbound action, because automated breach claims are faked and recycled constantly, and a false alarm to a client or an authority costs you credibility you can't rebuild.
+A single command that gates a source from `approved` to `live`. It's the only thing other than the scheduler that can trigger a fetch, and it only fetches the source under test.
 
-- Review queue. Findings land as `new`. An analyst (running under the separate findings user, not the crawler) confirms or dismisses, with a note. Only `confirmed` findings can be reported.
-- Report format. Client, source, observed-at, the claim, the redacted evidence and sample hashes, and a confidence note. Enough for the client's security team to act, with nothing in it that would make the report itself a liability to send.
-- Channels. Client notification first. Where the finding implicates a company that isn't your client, or clearly rises to a crime, report through a proper channel (the affected org's disclosure contact, a sector ISAC, IC3/FBI, or a national CERT) per the handling procedure in section 3. Log every outbound report.
+1. Host validation: every host in the config passes `is_v3_onion`.
+2. Policy check: category is in the approved enum, reviewer note present.
+3. Firewall and leak tests pass (section 17); the command refuses to run if they don't.
+4. Reachability through at least two pool instances.
+5. Extraction sample: fetch the seeds, run the extractor, require hit rate at or above `expect`, zero redaction events.
+6. Mirror check: if the fingerprints match an existing cluster, require the analyst to confirm "new source" vs "add as mirror."
+7. Write the first snapshot as the known-good baseline and flip state to `live`.
 
-## 13. CLI
+Any step failing leaves the source `approved` and prints what to fix. The posting's "complete go-live checks before collection begins" is this command.
 
-Reoriented around the pipeline. Entry point `python -m breachmon <command>`, each refusing to run as root and checking data-dir ownership.
+## 15. Authenticated collection against a self-hosted onion
 
-- `feeds pull` — run the feed adapters, normalize, match, and queue findings. No Tor. This is the command you schedule most often.
-- `watchlist` — manage the source and target lists (`add`, `remove`, `list`), with each target change requiring a client/authorization reference. Rejects a target with no authorization on file.
-- `crawl run [--workers N]` — run the scoped Tor crawler against the source list, feeding the same matcher. Logs hosts, status codes, timings, and error names only; never listing text, never matched values.
-- `review` — work the queue: show `new` findings, confirm or dismiss with a note.
-- `report <finding-id>` — generate the report artifact for a confirmed finding and record the outbound channel.
-- `findings export [--client] [--since]` — redacted findings as JSON lines, for a client handoff or your own metrics. There is no command that exports raw pages or secrets, because none exist to export.
+The posting calls out sites that require authentication. The only lawful way to demonstrate that is against a service you own, so host one.
 
-## 14. Verification and leak tests
+- Stand up a v3 onion service on a separate box or container (not the crawler VM): a small web app with a login form, a session cookie, and a few pages that are only visible when logged in.
+- Add `auth.type = "form-session"` to the config schema with fields for the login path, the username and password field names, a success selector, and a credential reference (a secrets file, never in the config).
+- The fetcher's auth step is allowlisted by source id to this one onion. The allowlist is a constant in code, the auth step asserts membership before building the request, and the no-auth invariant test (section 17) greps for any other use.
+- The session cookie lives in memory for the duration of one source run and is cleared in the existing `finally`.
 
-Run the original four leak tests (clearnet block, DNS block, packet capture, redirect trap) before any crawl, unchanged; they still guard the Tor boundary. Add four that guard the new boundaries:
+This proves you can build, tune, and troubleshoot an authenticated collection config, which is the hard case in the job, without ever logging into a site that isn't yours. Personas, forum access, and chat-platform collection stay out of the repo entirely; that's interview conversation drawn from your own experience, not something a portfolio project should contain.
 
-1. Match gate. Feed the pipeline a page that matches no target and assert nothing is written beyond host reachability metadata, and the body is not on disk anywhere.
-2. Redaction gate. Feed a matching page containing synthetic credentials and assert the stored finding contains counts and hashes only, and that a grep of the entire data dir for the synthetic plaintext returns nothing.
-3. Storage refusal. Call the storage layer directly with a payload that still contains a secret pattern and assert it refuses the write.
-4. No-auth invariant. Grep the codebase for any HTTP method other than GET, any form submission, and any login flow, and assert there are none. Wire this into CI so a future change that adds one fails the build.
+## 16. CLI
 
-If any test fails, stop. The firewall, the match gate, and the redaction gate each have to hold on their own.
+Entry point `python -m onioncollect <command>`. Every command refuses to run as root, checks data-dir ownership, and checks which user it's running as (`crawler` for `crawl`, `analyst` for everything else).
 
-## 15. Build order
+- `crawl run [--workers N]`: run due live sources through the pool. Logs source ids, status codes, timings, hit rates, and error names only; never page text.
+- `triage`: work the candidate queue: show, approve (category, note, optionally as mirror of X), decline (reason). Approve scaffolds a config.
+- `config validate <id>`, `config test <id>`: schema check, then a dry extraction against the latest snapshot without fetching.
+- `golive <id>`: section 14.
+- `health`: show the queue by priority and age; `health resolve <id> --disposition … --note …`.
+- `mirrors <id>`: show the cluster, last-seen per host, fingerprint distances.
+- `search <query> [--source] [--category] [--since]`: FTS over records.
+- `sources list [--state]`, `sources disable <id> --reason`, `sources export`: lifecycle management and a JSON-lines dump of the source table for the write-up.
+- `retention sweep`: apply section 3's clocks; scheduled nightly.
 
-1. Feed adapters plus the normalizer, matcher, redaction gate, findings DB, and review CLI. This is a complete, Tor-free, shippable product. Prove the match gate and redaction gate with their tests here, before any onion traffic exists.
-2. The reporter and the authorization/handling paperwork. Now you can run a real client end to end on feeds alone.
-3. The environment hardening and Tor pool (carried over from the original plan), with the four original leak tests.
-4. The scoped crawler, wired into the same matcher, with its source-list-only frontier. Run the four new boundary tests before and after.
-5. Scale, schedule `feeds pull` and `crawl run`, and add metrics: findings per client, confirmed-vs-dismissed rate (your matcher precision), and time from observation to client notification.
+There is no command that fetches an arbitrary URL and no command that exports raw unredacted content, because neither exists.
 
-You have a useful, lawful product after step 2. Steps 3 and 4 extend coverage to sources the feeds miss, under the same guarantees.
+## 17. Verification and leak tests
+
+Run the original four leak tests (clearnet block, DNS block, packet capture, redirect trap) before any crawl, unchanged; they guard the Tor boundary. Add five that guard the new boundaries:
+
+1. Approval gate. Insert a `candidate` and a `declined` host, run the scheduler and a direct fetcher call for each, and assert zero requests were built and nothing was written beyond the source table.
+2. Frontier containment. Feed a live source a page full of off-host onion links and assert every one lands in the candidate table and none on any frontier.
+3. Redaction gate. Feed a live source a synthetic page containing fake credentials and assert the stored record and snapshot contain tags and hashes only, a grep of the whole data dir for the plaintext returns nothing, and a top-priority health item was raised.
+4. Storage refusal. Call the storage layer directly with a payload that still contains a secret pattern and assert it refuses the write.
+5. Auth containment. Grep the codebase for any non-GET request, any form submission, and any cookie jar use, and assert each occurrence is inside the auth step and that the step asserts the self-hosted allowlist. Wire this into CI so a future change that widens it fails the build.
+
+If any test fails, stop. The firewall, the approval gate, and the redaction gate each have to hold on their own.
+
+## 18. Build order
+
+1. Environment hardening and Tor pool (section 5), with the four original leak tests passing. Nothing else starts until these do.
+2. Source table, lifecycle states, `is_v3_onion`, and the fetcher with its source-id-only interface. Prove the approval gate and frontier containment tests here, before a second source exists.
+3. Config schema, loader, and extractor against two or three approved sources. Hit-rate metrics from the first run.
+4. Redaction gate, records DB, FTS index, snapshot store, retention sweep. Prove the redaction and storage refusal tests.
+5. Discovery into the candidate table, triage CLI, fingerprinting and mirror clustering.
+6. Health metrics, health queue, dispositions, go-live checks. Convert the existing sources to go through `golive` so the baseline snapshots exist.
+7. Self-hosted onion with login, `form-session` auth, auth containment test.
+8. Search UI, scheduling, and the write-up.
+
+Steps 1 through 4 give you a running collector with provable boundaries. Steps 5 and 6 are the collections-analyst workflow. Step 7 is the hard case the posting names. Step 8 is what you hand over.
+
+## 19. Presenting it
+
+The repo should answer the posting's bullets without a cover letter. Make these easy to find:
+
+- The source policy and a triage log with real approve and decline decisions, including declines with reasons.
+- A few configs with their hit-rate history, and at least one health item that went from `degraded` to `fixed` or `mirror-swapped` with the diff that fixed it.
+- The go-live command's output for a source that failed a check and then passed.
+- The auth config for the self-hosted onion and the containment test that bounds it.
+- The leak tests and boundary tests, green in CI.
+- A short write-up of what collecting from benign onion services taught you about mirror churn, layout drift, and circuit health. That's the "share what we're seeing" expectation, met with data you can publish.

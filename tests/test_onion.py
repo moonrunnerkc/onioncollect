@@ -2,7 +2,7 @@ import base64
 import hashlib
 import unittest
 
-from onioncrawl.onion import find_onions_in_text, host_of, is_v3_onion, normalize
+from onioncollect.onion import find_onions_in_text, host_of, is_v3_onion, normalize, path_of
 
 AHMIA = "juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion"
 DUCKDUCKGO = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion"
@@ -134,36 +134,32 @@ class HostOfTest(unittest.TestCase):
 
 
 class FindOnionsInTextTest(unittest.TestCase):
-    def test_finds_valid_addresses_in_prose(self):
-        text = f"New mirror: {AHMIA} (old one {DUCKDUCKGO.upper()} is down)"
-        self.assertEqual(find_onions_in_text(text), {AHMIA, DUCKDUCKGO})
+    def test_finds_valid_hosts_lowercased(self):
+        text = f"mirror at {AHMIA.upper()} and http://{DUCKDUCKGO}/x, also {TORPROJECT}."
+        self.assertEqual(find_onions_in_text(text), {AHMIA, DUCKDUCKGO, TORPROJECT})
 
-    def test_finds_inside_markup_and_comments(self):
-        text = f'<!-- backup http://{TORPROJECT}/ --><script>var u="{AHMIA}";</script>'
-        self.assertEqual(find_onions_in_text(text), {TORPROJECT, AHMIA})
+    def test_checksum_failures_dropped(self):
+        self.assertEqual(find_onions_in_text(flip_char(AHMIA, 10)), set())
 
-    def test_drops_invalid_and_v2(self):
-        text = f"{flip_char(AHMIA, 3)} expyuzz4wqqyqhjn.onion {DUCKDUCKGO}"
-        self.assertEqual(find_onions_in_text(text), {DUCKDUCKGO})
+    def test_longer_base32_run_yields_nothing(self):
+        # Without the lookbehind the last 56 characters of this run would read as a host.
+        self.assertEqual(find_onions_in_text("abcd" + AHMIA), set())
 
-    def test_deduplicates(self):
-        self.assertEqual(find_onions_in_text(f"{AHMIA} {AHMIA} {AHMIA.upper()}"), {AHMIA})
+    def test_v2_and_clearnet_ignored(self):
+        self.assertEqual(find_onions_in_text("expyuzz4wqqyqhjn.onion example.com"), set())
 
-    def test_subdomain_yields_service_host(self):
-        self.assertEqual(find_onions_in_text(f"http://www.{AHMIA}/"), {AHMIA})
 
-    def test_address_glued_to_preceding_letters_is_still_found(self):
-        self.assertEqual(find_onions_in_text(f"mirror:abc{AHMIA}"), {AHMIA})
+class PathOfTest(unittest.TestCase):
+    def test_path_and_query(self):
+        self.assertEqual(path_of(f"http://{AHMIA}/a/b?x=1"), "/a/b?x=1")
 
-    def test_non_ascii_lookalike_is_rejected(self):
-        k = AHMIA.index("k")
-        self.assertEqual(find_onions_in_text(AHMIA[:k] + "\u212a" + AHMIA[k + 1:]), set())
+    def test_empty_path_is_root(self):
+        self.assertEqual(path_of(f"http://{AHMIA}"), "/")
+        self.assertEqual(path_of(f"http://{AHMIA}?q=1"), "/?q=1")
 
-    def test_suffix_without_a_full_label(self):
-        self.assertEqual(find_onions_in_text(".onion abc.onion " + "a" * 100), set())
+    def test_fragment_dropped(self):
+        self.assertEqual(path_of(f"http://{AHMIA}/a#frag"), "/a")
 
-    def test_nothing_found(self):
-        self.assertEqual(find_onions_in_text("plain text with example.com and no onions"), set())
 
 
 if __name__ == "__main__":

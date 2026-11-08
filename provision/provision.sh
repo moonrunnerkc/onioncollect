@@ -8,8 +8,11 @@ STAGE=/etc/onioncrawl
 INSTANCES="1 2 3 4 5 6"
 CRAWLER_HOME=/home/crawler
 PASSWORD_FILE=$CRAWLER_HOME/control-password
+SALT_FILE=$CRAWLER_HOME/redaction-salt
 HASH_FILE=/etc/tor/onioncrawl-control.hash
 VENV=$CRAWLER_HOME/venv
+ANALYST_HOME=/home/analyst
+OPT=/opt/onioncollect
 TOR_KEY_FPR=A3C4F0F979CAA22CDBA8F512EE8CBC9E886DDD89
 TOR_KEYRING=/usr/share/keyrings/deb.torproject.org-keyring.gpg
 PACKAGES="tor deb.torproject.org-keyring python3-venv iptables iptables-persistent tcpdump bind9-dnsutils curl sqlite3"
@@ -116,7 +119,48 @@ create_crawler() {
     for group in sudo adm; do
         id -nG crawler | tr ' ' '\n' | grep -qx "$group" && gpasswd -d crawler "$group"
     done
-    install -d -m 700 -o crawler -g crawler "$CRAWLER_HOME/data"
+    for dir in data configs; do
+        install -d -m 700 -o crawler -g crawler "$CRAWLER_HOME/$dir"
+    done
+}
+
+# The analyst reads the crawler's stores through the data dir's group and can write none of them. It gets no
+# firewall rule of its own, so the kill switch leaves it loopback only, like every user but Tor's.
+create_analyst() {
+    if ! id analyst >/dev/null 2>&1; then
+        useradd --create-home --user-group --shell /bin/bash analyst
+        log "analyst user created"
+    fi
+    chmod 700 "$ANALYST_HOME"
+    for group in sudo adm; do
+        id -nG analyst | tr ' ' '\n' | grep -qx "$group" && gpasswd -d analyst "$group"
+    done
+    chown crawler:analyst "$CRAWLER_HOME"
+    chmod 710 "$CRAWLER_HOME"
+    chgrp -R analyst "$CRAWLER_HOME/data"
+    chmod -R g-w,o-rwx "$CRAWLER_HOME/data"
+    chmod -R g+rX "$CRAWLER_HOME/data"
+    # New files take the analyst group from their directory.
+    find "$CRAWLER_HOME/data" -type d -exec chmod g+s {} +
+    local settings=$ANALYST_HOME/settings.toml rendered
+    rendered=$(mktemp)
+    printf 'data_dir = "%s"\nconfigs_dir = "%s"\n' "$CRAWLER_HOME/data" "$CRAWLER_HOME/configs" > "$rendered"
+    if ! cmp -s "$rendered" "$settings"; then
+        install -m 600 -o analyst -g analyst "$rendered" "$settings"
+        log "analyst settings.toml written"
+    fi
+    rm -f "$rendered"
+}
+
+create_redaction_salt() {
+    # Keyed hashes in the records are only as private as this. It is never regenerated: a new salt
+    # would orphan every hash already stored.
+    if [ ! -s "$SALT_FILE" ]; then
+        (umask 077; head -c 48 /dev/urandom | base64 | tr -d '\n' > "$SALT_FILE")
+        log "redaction salt generated at $SALT_FILE"
+    fi
+    chown crawler:crawler "$SALT_FILE"
+    chmod 600 "$SALT_FILE"
 }
 
 create_control_password() {
@@ -177,13 +221,30 @@ install_venv() {
     log "venv installed with --require-hashes"
 }
 
+# The systemd units run from a root-owned copy of the code and this root-owned venv, so the user a unit runs as
+# cannot change what it runs. Same hashes as the crawler's venv.
+install_runtime() {
+    install -d -m 755 -o root -g root "$OPT"
+    [ -x "$OPT/venv/bin/python" ] || python3 -m venv "$OPT/venv"
+    local want have
+    want=$(sha256sum "$STAGE/requirements.txt" | cut -d' ' -f1)
+    have=$(cat "$OPT/venv/.requirements.sha256" 2>/dev/null || true)
+    [ "$want" = "$have" ] && return
+    open_egress
+    "$OPT/venv/bin/pip" install -q --require-hashes -r "$STAGE/requirements.txt"
+    echo "$want" > "$OPT/venv/.requirements.sha256"
+    log "root-owned venv installed at $OPT/venv with --require-hashes"
+}
+
 write_settings() {
     local settings=$CRAWLER_HOME/settings.toml
     local rendered
     rendered=$(mktemp)
     cat > "$rendered" <<EOF
 control_password_file = "$PASSWORD_FILE"
+redaction_salt_file = "$SALT_FILE"
 data_dir = "$CRAWLER_HOME/data"
+configs_dir = "$CRAWLER_HOME/configs"
 exclusions_file = "$CRAWLER_HOME/exclusions.txt"
 safety_patterns_file = "$CRAWLER_HOME/safety-patterns.txt"
 EOF
@@ -231,8 +292,11 @@ install_packages
 quiet_the_box
 create_crawler
 create_control_password
+create_redaction_salt
 configure_tor
 install_venv
+install_runtime
 write_settings
+create_analyst
 install_kill_switch
 log "converged"

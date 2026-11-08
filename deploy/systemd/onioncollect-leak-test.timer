@@ -1,0 +1,10 @@
+[Unit]
+Description=onioncollect Tor leak tests, daily
+
+[Timer]
+OnCalendar=*-*-* 05:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=onioncollect retention sweep, nightly
+
+[Timer]
+OnCalendar=*-*-* 03:30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

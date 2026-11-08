@@ -1,0 +1,189 @@
+"""What make deploy installs in the guest: the systemd units, read as files, and the config sync, run on a fake
+guest tree. The units must run each job as the right user from the root-owned copy, hardened, and no timer may
+reach golive, triage, sources or a deploy."""
+import configparser
+import grp
+import os
+import pwd
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+from onioncollect import ui
+
+ROOT = Path(__file__).resolve().parent.parent
+UNITS = ROOT / "deploy" / "systemd"
+SYNC = ROOT / "deploy" / "sync_configs.sh"
+PYTHON = "/opt/onioncollect/venv/bin/python"
+CLI = f"{PYTHON} -s -E -m onioncollect --settings"
+
+EXPECTED = {
+    "onioncollect-crawl.service": ("crawler", f"{CLI} /home/crawler/settings.toml crawl run --until-idle"),
+    "onioncollect-retention.service": ("crawler", f"{CLI} /home/crawler/settings.toml retention sweep"),
+    "onioncollect-leak-test.service": ("root", "/bin/bash /opt/onioncollect/app/tests/live/leak_test.sh"),
+    "onioncollect-log-audit.service": ("analyst", f"{PYTHON} -s -E tests/live/log_audit.py --data /home/crawler/data"
+                                                  " --credentials %d /home/crawler/data/crawl.log /home/analyst/ui.log"),
+    "onioncollect-ui.service": ("analyst", f"{CLI} /home/analyst/settings.toml ui --port {ui.PORT}"),
+    "onioncollect-capture.service": ("analyst", f"{PYTHON} -s -E tools/writeup_capture.py --settings"
+                                                " /home/analyst/settings.toml --credentials %d"
+                                                " --out /home/analyst/writeup-capture"),
+}
+TIMERS = {"onioncollect-crawl.timer": "*:0/15", "onioncollect-retention.timer": "*-*-* 03:30",
+          "onioncollect-leak-test.timer": "*-*-* 05:00"}
+NEVER_SCHEDULED = ("golive", "triage", "sources", "deploy", "install.sh", "resolve", "records merge", "config ")
+
+
+def unit(name: str) -> configparser.ConfigParser:
+    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    parser.optionxform = str
+    parser.read_string((UNITS / name).read_text())
+    return parser
+
+
+class UnitFilesTest(unittest.TestCase):
+    def test_exactly_these_units(self):
+        self.assertEqual({path.name for path in UNITS.iterdir()}, set(EXPECTED) | set(TIMERS))
+
+    def test_each_service_runs_as_its_user_and_runs_this(self):
+        for name, (user, command) in EXPECTED.items():
+            with self.subTest(unit=name):
+                service = unit(name)["Service"]
+                self.assertEqual(service["User"], user)
+                self.assertEqual(service["ExecStart"], command)
+                if user != "root":
+                    self.assertEqual(service["Group"], user)
+                    self.assertEqual(service["WorkingDirectory"], "/opt/onioncollect/app",
+                                     "root-owned code, never the crawler's writable copy")
+
+    def test_each_timer_fires_its_own_service_on_its_schedule(self):
+        for name, calendar in TIMERS.items():
+            with self.subTest(timer=name):
+                timer = unit(name)
+                self.assertEqual(timer["Timer"]["OnCalendar"], calendar)
+                self.assertNotIn("Unit", timer["Timer"])
+                self.assertIn(name.replace(".timer", ".service"), EXPECTED)
+                self.assertEqual(timer["Install"]["WantedBy"], "timers.target")
+
+    def test_no_timer_ever_reaches_golive_triage_sources_or_a_deploy(self):
+        reached = set()
+        todo = [name.replace(".timer", ".service") for name in TIMERS]
+        while todo:
+            name = todo.pop()
+            if name in reached:
+                continue
+            reached.add(name)
+            parsed = unit(name)
+            for key in ("OnSuccess", "OnFailure", "Wants", "Requires"):
+                todo.extend(parsed["Unit"].get(key, "").split())
+        self.assertEqual(reached, {"onioncollect-crawl.service", "onioncollect-retention.service",
+                                   "onioncollect-leak-test.service", "onioncollect-log-audit.service"})
+        for name in reached:
+            command = unit(name)["Service"]["ExecStart"]
+            for word in NEVER_SCHEDULED:
+                self.assertNotIn(word, command.split("settings.toml")[-1], (name, word))
+
+    def test_every_service_is_hardened(self):
+        for name, (user, _) in EXPECTED.items():
+            with self.subTest(unit=name):
+                service = unit(name)["Service"]
+                self.assertEqual(service["NoNewPrivileges"], "yes")
+                self.assertEqual(service["PrivateTmp"], "yes")
+                self.assertEqual(service["SystemCallArchitectures"], "native")
+                if user == "root":
+                    # iptables, tcpdump and the kernel log: see the unit's comment.
+                    self.assertEqual(service["ProtectSystem"], "full")
+                    continue
+                self.assertEqual(service["ProtectSystem"], "strict")
+                self.assertEqual(service["ProtectHome"], "read-only")
+                self.assertEqual(service["CapabilityBoundingSet"], "")
+                writes = service.get("ReadWritePaths", "").split()
+                self.assertEqual(writes, {"crawler": ["/home/crawler/data"], "analyst": ["/home/analyst"]}[user]
+                                 if name != "onioncollect-log-audit.service" else [], name)
+
+    def test_network_reach_per_unit(self):
+        for name in EXPECTED:
+            service = unit(name)["Service"]
+            with self.subTest(unit=name):
+                if name in ("onioncollect-crawl.service", "onioncollect-ui.service"):
+                    self.assertEqual((service["IPAddressDeny"], service["IPAddressAllow"]), ("any", "localhost"))
+                elif name != "onioncollect-leak-test.service":
+                    self.assertEqual(service["PrivateNetwork"], "yes")
+        service = unit("onioncollect-ui.service")["Service"]
+        self.assertEqual((service["SocketBindAllow"], service["SocketBindDeny"]), (f"tcp:{ui.PORT}", "any"))
+
+    def test_the_credential_reaches_the_analyst_units_through_systemd_only(self):
+        for name in ("onioncollect-log-audit.service", "onioncollect-capture.service"):
+            service = unit(name)["Service"]
+            self.assertEqual(service["LoadCredential"], "testonion.env:/etc/onioncollect/testonion.env")
+            self.assertEqual(service["SetCredential"], "testonion.env:")
+        crawl = unit("onioncollect-crawl.service")["Unit"]
+        self.assertEqual((crawl["OnSuccess"], crawl["OnFailure"]), ("onioncollect-log-audit.service",) * 2)
+
+    def test_install_enables_the_timers_and_the_ui_and_leaves_the_crawl_to_make_deploy(self):
+        install = (ROOT / "deploy" / "install.sh").read_text()
+        self.assertIn('install -m 644 -o root -g root "$STAGE"/deploy/systemd/* /etc/systemd/system/', install)
+        self.assertIn("systemctl enable $TIMERS onioncollect-ui.service", install)
+        self.assertNotIn("start onioncollect-crawl.timer", install)
+        makefile = (ROOT / "Makefile").read_text()
+        deploy = makefile[makefile.index("\ndeploy: install"):].split("\n\n")[0]
+        self.assertEqual(deploy.strip().splitlines()[1:], [
+            "\tlimactl shell $(VM) sudo bash /opt/onioncollect/app/tests/live/leak_test.sh",
+            "\tlimactl shell $(VM) sudo systemctl start onioncollect-crawl.timer"])
+
+
+class ConfigSyncTest(unittest.TestCase):
+    """deploy/sync_configs.sh on a fake guest tree: a guest config the checkout lacks is never deleted unless
+    PRUNE_CONFIGS=1 and a typed yes."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.staged, self.guest = root / "staged", root / "guest"
+        self.staged.mkdir()
+        self.guest.mkdir()
+        (self.staged / "news.toml").write_text("new news\n")
+        (self.guest / "news.toml").write_text("old news\n")
+        (self.guest / "testonion.toml").write_text("hand-installed\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def sync(self, answer: str = "", **env: str) -> str:
+        owner = {"OWNER": pwd.getpwuid(os.getuid()).pw_name, "GROUP": grp.getgrgid(os.getgid()).gr_name}
+        done = subprocess.run(["bash", str(SYNC), str(self.staged), str(self.guest)], input=answer, text=True,
+                              capture_output=True, env={"PATH": os.environ["PATH"]} | owner | env, check=True)
+        return done.stdout
+
+    def guest_files(self) -> dict[str, str]:
+        return {path.name: path.read_text() for path in self.guest.iterdir()}
+
+    def test_a_dry_run_changes_nothing_and_deletes_nothing_without_prune(self):
+        out = self.sync(DRY_RUN="1")
+        self.assertEqual(self.guest_files(), {"news.toml": "old news\n", "testonion.toml": "hand-installed\n"})
+        self.assertIn("would run: install -m 600", out)
+        self.assertIn("kept; PRUNE_CONFIGS=1", out)
+        self.assertNotIn("rm", out)
+
+    def test_a_dry_run_with_prune_and_yes_still_deletes_nothing(self):
+        out = self.sync("yes\n", DRY_RUN="1", PRUNE_CONFIGS="1")
+        self.assertIn("testonion.toml", self.guest_files())
+        self.assertIn(f"would run: rm -- {self.guest / 'testonion.toml'}", out)
+
+    def test_a_real_run_installs_and_keeps_the_guest_only_config(self):
+        out = self.sync("yes\n")
+        self.assertEqual(self.guest_files(), {"news.toml": "new news\n", "testonion.toml": "hand-installed\n"})
+        self.assertIn("kept", out)
+
+    def test_prune_deletes_only_after_a_typed_yes(self):
+        for answer in ("", "no\n", "y\n", "YES\n"):
+            with self.subTest(answer=answer):
+                self.assertIn("kept, nothing deleted", self.sync(answer, PRUNE_CONFIGS="1"))
+                self.assertIn("testonion.toml", self.guest_files())
+        out = self.sync("yes\n", PRUNE_CONFIGS="1")
+        self.assertIn("deleted testonion.toml", out)
+        self.assertEqual(self.guest_files(), {"news.toml": "new news\n"})
+
+
+if __name__ == "__main__":
+    unittest.main()

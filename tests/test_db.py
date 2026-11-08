@@ -3,12 +3,13 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from onioncrawl.db import Frontier, PageInfo, signed64, stamp, unstamp
-from tests.fixtures import LISTED, throwaway_settings
+from onioncollect import lifecycle
+from onioncollect.db import DETAIL, LISTING, Frontier, PageMetric, open_collect, stamp, unstamp
+from onioncollect.sources import SourceTable
+from tests.fixtures import EXCLUDED, NEWS, NEWS_MIRROR, make_live
 from tests.test_onion import build_address
 
-HOSTS = [build_address(bytes([n] * 32), 3) for n in range(1, 6)]
-A, B, C, D, E = HOSTS
+OTHER = build_address(bytes([0x11] * 32), 3)
 
 
 class Clock:
@@ -22,332 +23,288 @@ class Clock:
         self.now += timedelta(**delta)
 
 
-def page(sha: str = "a" * 64, links=(), text_onions=(), gated=False, title="t", simhash=1) -> PageInfo:
-    return PageInfo(
-        title=title, headings=[], links=set(links), text_onions=set(text_onions), sha256=sha, simhash=simhash,
-        server=None, gated=gated, word_count=10, http_code=200, size=100,
-    )
+def metric(**overrides) -> PageMetric:
+    return PageMetric(**{"host": NEWS, "elapsed": 1.0, "status": 200} | overrides)
 
 
-class FrontierTestCase(unittest.IsolatedAsyncioTestCase):
-    settings = throwaway_settings(per_host_concurrency=2, max_depth=2)
-
+class CollectTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.dir = tempfile.TemporaryDirectory()
-        self.path = Path(self.dir.name) / "crawl.db"
         self.clock = Clock()
-        self.frontier = Frontier(self.settings, clock=self.clock)
-        await self.frontier.open(self.path)
+        self.db = await open_collect(Path(self.dir.name) / "collect.db")
+        self.table = SourceTable(self.db, clock=self.clock)
+        self.frontier = Frontier(self.db, per_source=2, clock=self.clock)
 
     async def asyncTearDown(self):
-        await self.frontier.close()
+        await self.db.close()
         self.dir.cleanup()
 
-    async def rows(self, sql: str, *params) -> list[tuple]:
-        return list(await self.frontier.db.execute_fetchall(sql, params))
+    async def rows(self, sql: str, *params) -> list:
+        return await self.db.rows(sql, params)
 
-    async def status_of(self, url: str) -> str:
-        (status,), = await self.rows("SELECT status FROM urls WHERE url = ?", url)
-        return status
+    async def status_of(self, path: str, source_id: str = "news") -> str:
+        (row,) = await self.rows("SELECT status FROM urls WHERE source_id = ? AND path = ?", source_id, path)
+        return row[0]
 
-    async def host_state(self, host: str) -> str:
-        (state,), = await self.rows("SELECT state FROM hosts WHERE host = ?", host)
-        return state
-
-
-class SeedTest(FrontierTestCase):
-    async def test_seed_normalizes_and_counts(self):
-        accepted, rejected = await self.frontier.seed([f"http://{A}", f"HTTP://{B.upper()}/x#frag", "http://example.com/"])
-        self.assertEqual((accepted, rejected), (2, 1))
-        urls = {row[0] for row in await self.rows("SELECT url FROM urls")}
-        self.assertEqual(urls, {f"http://{A}/", f"http://{B}/x"})
-        self.assertEqual(await self.rows("SELECT state FROM hosts WHERE host = ?", A), [("unknown",)])
-
-    async def test_reseeding_is_harmless(self):
-        await self.frontier.seed([f"http://{A}/"])
-        await self.frontier.seed([f"http://{A}/"])
-        self.assertEqual(await self.rows("SELECT COUNT(*) FROM urls"), [(1,)])
+    async def live_run(self, source_id: str = "news", host: str = NEWS, seeds=("/",)) -> int:
+        await make_live(self.table, source_id, host)
+        return await self.frontier.start_run(source_id, seeds)
 
 
-class ClaimTest(FrontierTestCase):
-    async def test_per_host_concurrency_within_one_batch(self):
-        await self.frontier.seed([f"http://{A}/{n}" for n in range(4)] + [f"http://{B}/"])
-        tasks = await self.frontier.claim(5)
-        hosts = sorted(task.host for task in tasks)
-        self.assertEqual(hosts, sorted([A, A, B]))
+class DueSourcesTest(CollectTestCase):
+    async def test_a_live_source_is_due_at_once(self):
+        await make_live(self.table)
+        self.assertEqual(await self.frontier.due_sources(), ["news"])
 
-    async def test_per_host_concurrency_across_claims(self):
-        await self.frontier.seed([f"http://{A}/{n}" for n in range(4)])
-        first = await self.frontier.claim(1)
-        second = await self.frontier.claim(1)
-        third = await self.frontier.claim(1)
-        self.assertEqual((len(first), len(second), third), (1, 1, []))
+    async def test_approval_gate_approved_disabled_and_candidates_are_never_due(self):
+        await self.table.approve(NEWS, "news", "journalism-publishing", "note", "t", frozenset())
+        await self.table.add_candidates({OTHER}, None)
+        self.assertEqual(await self.frontier.due_sources(), [])
+        await self.table.change_state("news", lifecycle.DISABLED, "gone")
+        self.assertEqual(await self.frontier.due_sources(), [])
 
-    async def test_saturated_host_does_not_starve_others(self):
-        await self.frontier.seed([f"http://{A}/{n}" for n in range(200)])
-        self.clock.advance(seconds=1)
-        await self.frontier.seed([f"http://{B}/"])
-        await self.frontier.claim(2)
+    async def test_a_source_with_an_open_run_is_not_due(self):
+        await self.live_run()
+        self.assertEqual(await self.frontier.due_sources(), [])
+
+    async def test_next_run_in_the_future_is_not_due(self):
+        await make_live(self.table)
+        await self.db.conn.execute("UPDATE sources SET next_run = ?", (stamp(self.clock.now + timedelta(hours=1)),))
+        await self.db.conn.commit()
+        self.assertEqual(await self.frontier.due_sources(), [])
+        self.clock.advance(hours=1)
+        self.assertEqual(await self.frontier.due_sources(), ["news"])
+
+
+class StartRunTest(CollectTestCase):
+    async def test_queues_each_seed_as_page_one_of_the_run(self):
+        run_id = await self.live_run(seeds=("/a/", "/b/"))
+        rows = await self.rows("SELECT path, kind, page, run_id, status FROM urls ORDER BY path")
+        self.assertEqual([tuple(row) for row in rows],
+                         [("/a/", LISTING, 1, run_id, "queued"), ("/b/", LISTING, 1, run_id, "queued")])
+        (run,) = await self.rows("SELECT source_id, finished_at FROM runs WHERE id = ?", run_id)
+        self.assertEqual(tuple(run), ("news", None))
+
+    async def test_a_new_run_requeues_a_done_seed(self):
+        run_id = await self.live_run()
         (task,) = await self.frontier.claim(1)
-        self.assertEqual(task.host, B)
+        await self.frontier.complete(task, metric(), [], [])
+        await self.frontier.finish_if_done(run_id, lambda run: self.clock.now)
+        second = await self.frontier.start_run("news", ("/",))
+        (row,) = await self.rows("SELECT status, run_id FROM urls")
+        self.assertEqual(tuple(row), ("queued", second))
 
-    async def test_lease_is_written(self):
-        await self.frontier.seed([f"http://{A}/"])
+
+class ClaimTest(CollectTestCase):
+    async def test_per_source_concurrency_within_one_batch(self):
+        await self.live_run(seeds=("/1", "/2", "/3", "/4"))
+        tasks = await self.frontier.claim(10)
+        self.assertEqual(len(tasks), 2)
+        self.assertEqual(await self.frontier.claim(10), [])
+
+    async def test_saturated_source_does_not_starve_others(self):
+        await self.live_run(seeds=("/1", "/2", "/3"))
+        await self.live_run("other", OTHER, seeds=("/x",))
+        tasks = await self.frontier.claim(10)
+        self.assertEqual(sorted(task.source_id for task in tasks), ["news", "news", "other"])
+
+    async def test_task_fields_and_lease(self):
+        run_id = await self.live_run()
         (task,) = await self.frontier.claim(1)
-        rows = await self.rows("SELECT status, lease_until FROM urls WHERE url = ?", task.url)
-        self.assertEqual(rows, [("leased", stamp(self.clock.now + timedelta(minutes=10)))])
+        self.assertEqual((task.source_id, task.path, task.kind, task.page, task.run_id, task.retries),
+                         ("news", "/", LISTING, 1, run_id, 0))
+        (row,) = await self.rows("SELECT status, lease_until FROM urls")
+        self.assertEqual(row[0], "leased")
+        self.assertEqual(unstamp(row[1]), self.clock.now + timedelta(minutes=10))
+
+    async def test_rows_of_a_source_that_stops_collecting_are_never_claimed(self):
+        await self.live_run()
+        await self.table.change_state("news", lifecycle.DISABLED, "policy")
+        self.assertEqual(await self.frontier.claim(5), [])
+        (row,) = await self.rows("SELECT status FROM urls")
+        self.assertEqual(row[0], "queued")
 
     async def test_not_due_is_not_claimed(self):
-        await self.frontier.seed([f"http://{A}/"])
-        (task,) = await self.frontier.claim(1)
-        await self.frontier.fail(task, 1, self.clock.now + timedelta(minutes=2), host_answered=False)
+        await self.live_run()
+        await self.db.conn.execute("UPDATE urls SET next_due = ?", (stamp(self.clock.now + timedelta(minutes=5)),))
+        await self.db.conn.commit()
         self.assertEqual(await self.frontier.claim(1), [])
-        self.clock.advance(minutes=2)
+        self.clock.advance(minutes=5)
         self.assertEqual(len(await self.frontier.claim(1)), 1)
 
-    async def test_discovery_beats_recrawl_then_depth(self):
-        await self.frontier.seed([f"http://{A}/"])
-        (root,) = await self.frontier.claim(1)
-        await self.frontier.complete(root, page(links=[f"http://{B}/deep"]), self.clock.now, "p")
-        await self.frontier.seed([f"http://{C}/"])
-        order = [(await self.frontier.claim(1))[0].url for _ in range(3)]
-        self.assertEqual(order, [f"http://{C}/", f"http://{B}/deep", f"http://{A}/"])
 
-
-class CompleteTest(FrontierTestCase):
-    async def claimed(self, url: str):
-        await self.frontier.seed([url])
+class CompleteTest(CollectTestCase):
+    async def test_queues_the_next_listing_page_and_details(self):
+        run_id = await self.live_run()
         (task,) = await self.frontier.claim(1)
-        return task
+        await self.frontier.complete(task, metric(), [("/?p=2", 2)], ["/story/1", "/story/2"])
+        rows = await self.rows("SELECT path, kind, page, run_id, status FROM urls ORDER BY path")
+        self.assertEqual([tuple(row) for row in rows], [
+            ("/", LISTING, 1, run_id, "done"), ("/?p=2", LISTING, 2, run_id, "queued"),
+            ("/story/1", DETAIL, 0, run_id, "queued"), ("/story/2", DETAIL, 0, run_id, "queued"),
+        ])
 
-    async def test_complete_writes_all_four_tables(self):
-        task = await self.claimed(f"http://{A}/")
-        due = self.clock.now + timedelta(hours=24)
-        await self.frontier.complete(task, page(links=[f"http://{B}/x"], text_onions=[C]), due, "pages/aa/aa/a.gz")
-        self.assertEqual(
-            await self.rows("SELECT status, priority, last_hash, last_code, next_due FROM urls WHERE url = ?", task.url),
-            [("done", 1, "a" * 64, 200, stamp(due))],
-        )
-        self.assertEqual(await self.rows("SELECT state, title, unchanged_streak FROM hosts WHERE host = ?", A), [("up", "t", 0)])
-        self.assertEqual(await self.rows("SELECT url, bytes, path FROM pages"), [(task.url, 100, "pages/aa/aa/a.gz")])
-        self.assertEqual(await self.rows("SELECT host, up FROM uptime"), [(A, 1)])
-        self.assertEqual(
-            await self.rows("SELECT url, depth FROM urls WHERE depth = 1 ORDER BY url"),
-            sorted([(f"http://{B}/x", 1), (f"http://{C}/", 1)]),
-        )
-
-    async def test_unchanged_streak(self):
-        task = await self.claimed(f"http://{A}/")
-        for _ in range(3):
-            await self.frontier.complete(task, page(), self.clock.now, "p")
-            task.last_hash = "a" * 64
-        self.assertEqual(await self.rows("SELECT unchanged_streak FROM hosts WHERE host = ?", A), [(2,)])
-        await self.frontier.complete(task, page(sha="b" * 64), self.clock.now, "p")
-        self.assertEqual(await self.rows("SELECT unchanged_streak FROM hosts WHERE host = ?", A), [(0,)])
-
-    async def test_claim_carries_streak(self):
-        task = await self.claimed(f"http://{A}/")
-        await self.frontier.complete(task, page(), self.clock.now, "p")
-        task.last_hash = "a" * 64
-        await self.frontier.complete(task, page(), self.clock.now, "p")
-        (again,) = await self.frontier.claim(1)
-        self.assertEqual((again.last_hash, again.unchanged_streak), ("a" * 64, 1))
-
-    async def test_title_only_from_root(self):
-        task = await self.claimed(f"http://{A}/about")
-        await self.frontier.complete(task, page(title="inner"), self.clock.now, "p")
-        self.assertEqual(await self.rows("SELECT title FROM hosts WHERE host = ?", A), [(None,)])
-
-    async def test_max_depth_and_high_simhash(self):
-        await self.frontier.seed([f"http://{A}/"])
+    async def test_a_detail_is_queued_once_ever(self):
+        run_id = await self.live_run()
         (task,) = await self.frontier.claim(1)
-        task.depth = 2
-        await self.frontier.complete(task, page(links=[f"http://{B}/"], simhash=(1 << 64) - 1), self.clock.now, "p")
-        self.assertEqual(await self.rows("SELECT COUNT(*) FROM urls WHERE host = ?", B), [(0,)])
-        self.assertEqual(await self.rows("SELECT simhash FROM pages"), [(signed64((1 << 64) - 1),)])
+        await self.frontier.complete(task, metric(), [], ["/story/1"])
+        (detail,) = await self.frontier.claim(1)
+        await self.frontier.complete(detail, metric(), [], [])
+        await self.frontier.finish_if_done(run_id, lambda run: self.clock.now)
+        await self.frontier.start_run("news", ("/",))
+        (task,) = await self.frontier.claim(1)
+        await self.frontier.complete(task, metric(), [], ["/story/1"])
+        self.assertEqual(await self.status_of("/story/1"), "done")
 
-    async def test_gated_marks_host_and_skips_links(self):
-        task = await self.claimed(f"http://{A}/")
-        await self.frontier.complete(task, page(links=[f"http://{B}/"], gated=True), self.clock.now, None)
-        self.assertEqual(await self.host_state(A), "gated")
-        self.assertEqual(await self.rows("SELECT COUNT(*) FROM pages"), [(0,)])
-        self.assertEqual(await self.rows("SELECT COUNT(*) FROM urls WHERE host = ?", B), [(0,)])
-        await self.frontier.seed([f"http://{A}/other"])
-        self.assertEqual(await self.rows("SELECT COUNT(*) FROM urls WHERE host = ?", A), [(1,)])
+    async def test_a_listing_page_is_not_queued_twice_in_one_run(self):
+        await self.live_run()
+        (task,) = await self.frontier.claim(1)
+        await self.frontier.complete(task, metric(), [("/?p=2", 2)], [])
+        (second,) = await self.frontier.claim(1)
+        # A pager that loops back to the seed.
+        await self.frontier.complete(second, metric(), [("/", 3)], [])
+        self.assertEqual(await self.status_of("/"), "done")
+        self.assertEqual(await self.frontier.claim(1), [])
+
+    async def test_metrics_and_run_aggregates(self):
+        run_id = await self.live_run()
+        (task,) = await self.frontier.claim(1)
+        page = metric(bytes=500, items=4, incomplete=1, fields_resolved=10, fields_declared=12,
+                      below_expectation=True, redactions=2, records_new=3)
+        await self.frontier.complete(task, page, [], [])
+        (row,) = await self.rows("SELECT run_id, source_id, host, kind, status, error, bytes, items, fields_resolved,"
+                                 " fields_declared, redactions FROM page_metrics")
+        self.assertEqual(tuple(row), (run_id, "news", NEWS, LISTING, 200, None, 500, 4, 10, 12, 2))
+        (run,) = await self.rows("SELECT pages, failures, items, incomplete, fields_resolved, fields_declared,"
+                                 " below_expectation, redactions, records_new FROM runs")
+        self.assertEqual(tuple(run), (1, 0, 4, 1, 10, 12, 1, 2, 3))
+        (host,) = await self.rows("SELECT last_up, last_down FROM hosts WHERE host = ?", NEWS)
+        self.assertEqual(tuple(host), (stamp(self.clock.now), None))
+        (uptime,) = await self.rows("SELECT host, up FROM uptime")
+        self.assertEqual(tuple(uptime), (NEWS, 1))
+
+    async def test_field_hits_add_up_across_a_runs_pages(self):
+        await self.live_run()
+        (task,) = await self.frontier.claim(1)
+        await self.frontier.complete(task, metric(field_hits={"title": 4, "url": 0}, field_items=4), [("/?p=2", 2)], [])
+        (second,) = await self.frontier.claim(1)
+        await self.frontier.complete(second, metric(field_hits={"title": 1, "url": 2}, field_items=3), [], [])
+        rows = await self.rows("SELECT kind, field, resolved, declared FROM run_fields ORDER BY field")
+        self.assertEqual([tuple(row) for row in rows], [(LISTING, "title", 5, 7), (LISTING, "url", 2, 7)])
 
 
-class FailTest(FrontierTestCase):
+class ProbeTest(CollectTestCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        await make_live(self.table)
+        await self.table.add_mirror(NEWS_MIRROR, "news", "second address", "t", frozenset())
+
+    async def test_non_active_hosts_of_collecting_sources_are_due_once_a_day(self):
+        self.assertEqual(await self.frontier.due_probes(timedelta(days=1)), [("news", NEWS_MIRROR)])
+        await self.frontier.record_probe(NEWS_MIRROR, False)
+        (host,) = await self.rows("SELECT last_up, last_down FROM hosts WHERE host = ?", NEWS_MIRROR)
+        self.assertEqual(tuple(host), (None, stamp(self.clock.now)))
+        self.assertEqual(await self.frontier.due_probes(timedelta(days=1)), [])
+        self.clock.advance(days=1, seconds=1)
+        self.assertEqual(await self.frontier.due_probes(timedelta(days=1)), [("news", NEWS_MIRROR)])
+        await self.table.change_state("news", lifecycle.DISABLED, "pulled")
+        self.assertEqual(await self.frontier.due_probes(timedelta(days=1)), [])
+
+
+class FailTest(CollectTestCase):
     async def test_retry_then_park(self):
-        await self.frontier.seed([f"http://{A}/"])
+        await self.live_run()
         (task,) = await self.frontier.claim(1)
-        await self.frontier.fail(task, 1, self.clock.now + timedelta(minutes=2), host_answered=False)
-        self.assertEqual(await self.rows("SELECT status, retries FROM urls"), [("queued", 1)])
-        self.assertEqual(await self.rows("SELECT consecutive_failures, last_down FROM hosts WHERE host = ?", A), [(1, stamp(self.clock.now))])
-        await self.frontier.fail(task, 3, None, host_answered=False)
-        self.assertEqual(await self.rows("SELECT status, retries FROM urls"), [("parked", 3)])
-        self.assertEqual(await self.rows("SELECT up FROM uptime"), [(0,), (0,)])
-
-    async def test_host_that_answered_is_up(self):
-        await self.frontier.seed([f"http://{A}/file.pdf"])
-        (task,) = await self.frontier.claim(1)
-        await self.frontier.fail(task, 0, None, host_answered=True)
-        self.assertEqual(await self.host_state(A), "up")
-        self.assertEqual(await self.rows("SELECT consecutive_failures FROM hosts WHERE host = ?", A), [(0,)])
-        self.assertEqual(await self.rows("SELECT up FROM uptime"), [(1,)])
-
-    async def test_recent_failures_since_last_up(self):
-        await self.frontier.seed([f"http://{A}/"])
-        (task,) = await self.frontier.claim(1)
-        await self.frontier.fail(task, 1, self.clock.now, host_answered=False)
-        self.clock.advance(hours=1)
-        await self.frontier.complete(task, page(), self.clock.now, "p")
-        times = []
-        for _ in range(2):
-            self.clock.advance(hours=1)
-            times.append(self.clock.now)
-            await self.frontier.fail(task, 1, self.clock.now, host_answered=False)
-        self.assertEqual(await self.frontier.recent_failures(A), times)
-
-    async def test_mark_dead_parks_and_blocks_discovery(self):
-        await self.frontier.seed([f"http://{A}/", f"http://{A}/2"])
-        await self.frontier.mark_dead(A)
-        self.assertEqual(await self.host_state(A), "dead")
-        self.assertEqual(await self.rows("SELECT DISTINCT status FROM urls"), [("parked",)])
-        await self.frontier.seed([f"http://{A}/3"])
-        self.assertEqual(await self.rows("SELECT COUNT(*) FROM urls"), [(2,)])
-
-
-class ExcludeTest(FrontierTestCase):
-    async def test_exclude_parks_host_and_still_queues_links(self):
-        await self.frontier.seed([f"http://{A}/", f"http://{A}/2", f"http://{A}/3"])
-        task, _ = await self.frontier.claim(2)
-        await self.frontier.exclude(task, page(links=[f"http://{B}/"], text_onions=[C]))
-        self.assertEqual(await self.host_state(A), "excluded")
-        self.assertEqual(await self.rows("SELECT COUNT(*) FROM urls WHERE host = ? AND status = 'queued'", A), [(0,)])
-        self.assertEqual(await self.status_of(task.url), "parked")
-        self.assertEqual(await self.rows("SELECT COUNT(*) FROM pages"), [(0,)])
-        self.assertEqual(await self.rows("SELECT COUNT(*) FROM urls WHERE host IN (?, ?)", B, C), [(2,)])
-        self.assertEqual(await self.frontier.excluded_hosts(), {A, LISTED})
-
-    async def test_excluded_host_never_returns_to_up(self):
-        await self.frontier.seed([f"http://{A}/", f"http://{A}/2"])
-        first, second = await self.frontier.claim(2)
-        await self.frontier.exclude(first, page())
-        await self.frontier.complete(second, page(sha="b" * 64), self.clock.now, None)
-        await self.frontier.fail(second, 0, None, host_answered=True)
-        self.assertEqual(await self.host_state(A), "excluded")
-        await self.frontier.seed([f"http://{A}/new"])
-        self.assertEqual(await self.rows("SELECT COUNT(*) FROM urls WHERE url = ?", f"http://{A}/new"), [(0,)])
-
-
-class ListedHostTest(FrontierTestCase):
-    async def reopen(self, **overrides) -> None:
-        await self.frontier.close()
-        self.frontier = Frontier(throwaway_settings(**overrides), clock=self.clock)
-        await self.frontier.open(self.path)
-
-    async def test_open_excludes_listed_hosts_and_parks_every_row(self):
-        await self.frontier.seed([f"http://{A}/", f"http://{A}/2", f"http://{A}/3"])
-        done, leased = await self.frontier.claim(2)
-        await self.frontier.complete(done, page(title="kept until listed"), self.clock.now, "p")
-        await self.reopen(exclusions=frozenset({LISTED, A}))
-        self.assertEqual(await self.rows("SELECT state, title FROM hosts WHERE host = ?", A), [("excluded", None)])
-        self.assertEqual(await self.rows("SELECT DISTINCT status FROM urls WHERE host = ?", A), [("parked",)])
-        self.assertEqual(await self.frontier.claim(5), [])
-
-    async def test_listed_host_is_never_seeded_or_discovered(self):
-        self.assertEqual(await self.host_state(LISTED), "excluded")
-        await self.frontier.seed([f"http://{LISTED}/", f"http://{A}/"])
-        (task,) = await self.frontier.claim(5)
-        await self.frontier.complete(task, page(links=[f"http://{LISTED}/x"], text_onions=[LISTED]), self.clock.now, "p")
-        self.assertEqual(await self.rows("SELECT COUNT(*) FROM urls WHERE host = ?", LISTED), [(0,)])
-
-    async def test_row_in_flight_when_its_host_was_excluded_is_parked_on_failure(self):
-        await self.frontier.seed([f"http://{A}/", f"http://{A}/2"])
-        first, second = await self.frontier.claim(2)
-        await self.frontier.exclude(first, page())
-        await self.frontier.fail(second, 1, self.clock.now + timedelta(minutes=2), host_answered=False)
-        self.assertEqual(await self.status_of(second.url), "parked")
-
-    async def test_reopen_parks_a_crashed_runs_row_of_an_excluded_host(self):
-        await self.frontier.seed([f"http://{A}/", f"http://{A}/2"])
-        first, second = await self.frontier.claim(2)
-        await self.frontier.exclude(first, page())
-        self.clock.advance(minutes=11)
-        await self.reopen()
-        self.assertEqual(await self.status_of(second.url), "parked")
-
-
-class UnexcludeTest(FrontierTestCase):
-    async def test_unexclude_requeues_parked_urls_at_discovery_priority(self):
-        await self.frontier.seed([f"http://{A}/", f"http://{A}/2"])
-        task, _ = await self.frontier.claim(2)
-        await self.frontier.complete(task, page(), self.clock.now + timedelta(days=1), "p")
-        await self.frontier.exclude(task, page())
-        self.clock.advance(minutes=1)
-        self.assertEqual(await self.frontier.unexclude(A), 1)
-        self.assertEqual(await self.host_state(A), "unknown")
-        self.assertEqual(await self.rows("SELECT status, priority, retries, next_due FROM urls WHERE url = ?", task.url),
-                         [("queued", 0, 0, stamp(self.clock.now))])
-        (again,) = await self.frontier.claim(5)
-        self.assertEqual(again.url, task.url)
-
-    async def test_unexclude_of_a_host_that_is_not_excluded_changes_nothing(self):
-        await self.frontier.seed([f"http://{A}/"])
-        self.assertIsNone(await self.frontier.unexclude(A))
-        self.assertIsNone(await self.frontier.unexclude(B))
-        self.assertEqual(await self.host_state(A), "unknown")
-
-
-class LeaseRecoveryTest(FrontierTestCase):
-    async def test_crash_recovery(self):
-        await self.frontier.seed([f"http://{A}/", f"http://{B}/"])
-        leased = await self.frontier.claim(2)
-        self.assertEqual(len(leased), 2)
-        await self.frontier.close()
-
-        self.clock.advance(minutes=9)
-        self.frontier = Frontier(self.settings, clock=self.clock)
-        await self.frontier.open(self.path)
-        self.assertEqual(await self.frontier.claim(2), [])
-
+        await self.frontier.fail(task, metric(status=None, error="timeout"), 1, self.clock.now + timedelta(minutes=2))
+        (row,) = await self.rows("SELECT status, retries, next_due FROM urls")
+        self.assertEqual(tuple(row), ("queued", 1, stamp(self.clock.now + timedelta(minutes=2))))
         self.clock.advance(minutes=2)
-        self.assertEqual(await self.frontier.release_stale_leases(), 2)
-        self.assertEqual(await self.rows("SELECT DISTINCT status, lease_until FROM urls"), [("queued", None)])
-        self.assertEqual(sorted(task.url for task in await self.frontier.claim(2)), sorted(t.url for t in leased))
+        (task,) = await self.frontier.claim(1)
+        await self.frontier.fail(task, metric(status=None, error="timeout"), 3, None)
+        self.assertEqual(await self.status_of("/"), "failed")
 
-    async def test_open_releases_expired_leases(self):
-        await self.frontier.seed([f"http://{A}/"])
+    async def test_unanswered_failure_marks_the_host_down(self):
+        await self.live_run()
+        (task,) = await self.frontier.claim(1)
+        await self.frontier.fail(task, metric(status=None, error="timeout"), 1, None)
+        (host,) = await self.rows("SELECT last_up, last_down FROM hosts WHERE host = ?", NEWS)
+        self.assertEqual(tuple(host), (None, stamp(self.clock.now)))
+        (run,) = await self.rows("SELECT pages, failures FROM runs")
+        self.assertEqual(tuple(run), (0, 1))
+        (uptime,) = await self.rows("SELECT up FROM uptime")
+        self.assertEqual(uptime[0], 0)
+
+    async def test_a_host_that_answered_is_up(self):
+        await self.live_run()
+        (task,) = await self.frontier.claim(1)
+        await self.frontier.fail(task, metric(status=404, error="not_text"), 2, None)
+        (uptime,) = await self.rows("SELECT up FROM uptime")
+        self.assertEqual(uptime[0], 1)
+
+
+class FinishTest(CollectTestCase):
+    async def test_returns_the_run_once_and_schedules_the_source(self):
+        run_id = await self.live_run()
+        (task,) = await self.frontier.claim(1)
+        await self.frontier.complete(task, metric(), [], [])
+        due = self.clock.now + timedelta(hours=6)
+        run = await self.frontier.finish_if_done(run_id, lambda row: due)
+        self.assertEqual((run["id"], run["pages"], run["failed_runs"]), (run_id, 1, 0))
+        self.assertIsNone(await self.frontier.finish_if_done(run_id, lambda row: due))
+        (source,) = await self.rows("SELECT next_run, failed_runs FROM sources")
+        self.assertEqual(tuple(source), (stamp(due), 0))
+        (finished,) = await self.rows("SELECT finished_at FROM runs")
+        self.assertEqual(finished[0], stamp(self.clock.now))
+
+    async def test_open_work_keeps_the_run_open(self):
+        run_id = await self.live_run()
+        (task,) = await self.frontier.claim(1)
+        await self.frontier.complete(task, metric(), [], ["/story/1"])
+        self.assertIsNone(await self.frontier.finish_if_done(run_id, lambda row: self.clock.now))
+
+    async def test_a_run_that_fetched_nothing_counts_as_failed(self):
+        run_id = await self.live_run()
+        (task,) = await self.frontier.claim(1)
+        await self.frontier.fail(task, metric(status=None, error="timeout"), 3, None)
+        seen = []
+        await self.frontier.finish_if_done(run_id, lambda row: seen.append(row["failed_runs"]) or self.clock.now)
+        self.assertEqual(seen, [0])
+        (source,) = await self.rows("SELECT failed_runs FROM sources")
+        self.assertEqual(source[0], 1)
+        second = await self.frontier.start_run("news", ("/",))
+        (task,) = await self.frontier.claim(1)
+        await self.frontier.complete(task, metric(), [], [])
+        await self.frontier.finish_if_done(second, lambda row: self.clock.now)
+        (source,) = await self.rows("SELECT failed_runs FROM sources")
+        self.assertEqual(source[0], 0)
+
+
+class LeaseRecoveryTest(CollectTestCase):
+    async def test_stale_leases_return_to_the_queue(self):
+        await self.live_run(seeds=("/1", "/2"))
         await self.frontier.claim(1)
-        await self.frontier.close()
+        self.assertEqual(await self.frontier.release_stale_leases(), 0)
         self.clock.advance(minutes=11)
-        self.frontier = Frontier(self.settings, clock=self.clock)
-        await self.frontier.open(self.path)
-        self.assertEqual(await self.status_of(f"http://{A}/"), "queued")
+        self.assertEqual(await self.frontier.release_stale_leases(), 1)
+        self.assertEqual(len(await self.frontier.claim(5)), 2)
 
 
-class StatsTest(FrontierTestCase):
+class StatsTest(CollectTestCase):
     async def test_stats(self):
-        await self.frontier.seed([f"http://{A}/", f"http://{B}/"])
-        task, _ = await self.frontier.claim(2)
-        await self.frontier.complete(task, page(), self.clock.now, "p")
+        await self.live_run(seeds=("/1", "/2"))
+        await self.table.add_candidates({OTHER}, "news")
+        await self.table.decline(EXCLUDED, "on the exclusion list", "t")
+        (task,) = await self.frontier.claim(1)
+        await self.frontier.complete(task, metric(), [], [])
         stats = await self.frontier.stats()
-        self.assertEqual(stats["urls"], {"done": 1, "leased": 1})
-        self.assertEqual(stats["hosts"], {"up": 1, "unknown": 1, "excluded": 1})
-        self.assertEqual((stats["pages"], stats["fetches_last_hour"], stats["up_last_hour"]), (1, 1, 1))
-        self.assertEqual((stats["leased_hosts"], stats["max_leased_per_host"]), (1, 1))
-        self.clock.advance(minutes=6)
-        self.assertEqual(((await self.frontier.stats())["fetches_recent"], stats["fetches_recent"]), (0, 1))
-
-    async def test_leases_per_host(self):
-        await self.frontier.seed([f"http://{A}/", f"http://{A}/2", f"http://{A}/3", f"http://{B}/"])
-        await self.frontier.claim(4)
-        stats = await self.frontier.stats()
-        self.assertEqual((stats["leased_hosts"], stats["max_leased_per_host"]), (2, 2))
-        await self.frontier.release_stale_leases()
+        self.assertEqual(stats["urls"], {"done": 1, "queued": 1})
+        self.assertEqual(stats["sources"], {"live": 1})
+        self.assertEqual(stats["hosts"], {"member": 1, "candidate": 1, "declined": 1})
+        self.assertEqual((stats["open_runs"], stats["fetches_last_hour"], stats["up_last_hour"],
+                          stats["fetches_recent"]), (1, 1, 1, 1))
 
     def test_stamp_round_trip(self):
-        moment = datetime(2026, 11, 7, 12, 0, 0, 123000, tzinfo=UTC)
+        moment = datetime(2026, 11, 7, 12, 0, 1, 250000, tzinfo=UTC)
         self.assertEqual(unstamp(stamp(moment)), moment)
 
 

@@ -1,0 +1,21 @@
+# Debian 13 guest for section 15's self-hosted onion, separate from the crawler VM (node1). `make testonion`
+# creates it and runs setup.sh inside. Plain mode: no shared folders, no port forwarding, no guest agent.
+minimumLimaVersion: 2.0.0
+
+base:
+- template:_images/debian-13
+
+vmType: vz
+cpus: 1
+memory: 1GiB
+disk: 10GiB
+plain: true
+mounts: []
+timezone: UTC
+propagateProxyEnv: false
+upgradePackages: false
+
+ssh:
+  loadDotSSHPubKeys: false
+  forwardAgent: false
+  forwardX11: false

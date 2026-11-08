@@ -1,0 +1,33 @@
+# Section 3's retention clocks. Runs as the crawler, which owns the stores: the analyst reads them and cannot
+# write, until the crawler's write socket lets the analyst ask for deletions.
+[Unit]
+Description=onioncollect retention sweep
+
+[Service]
+Type=oneshot
+User=crawler
+Group=crawler
+WorkingDirectory=/opt/onioncollect/app
+ExecStart=/opt/onioncollect/venv/bin/python -s -E -m onioncollect --settings /home/crawler/settings.toml retention sweep
+TimeoutStartSec=30min
+UMask=0027
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/crawler/data
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX

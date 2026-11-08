@@ -1,0 +1,35 @@
+# make writeup-capture: the write-up's evidence in one bundle under the analyst's home, every file stripped of
+# the testonion address, the section 15 credential values and host IPs first. Never on a timer.
+[Unit]
+Description=onioncollect write-up capture
+
+[Service]
+Type=oneshot
+User=analyst
+Group=analyst
+WorkingDirectory=/opt/onioncollect/app
+LoadCredential=testonion.env:/etc/onioncollect/testonion.env
+SetCredential=testonion.env:
+ExecStart=/opt/onioncollect/venv/bin/python -s -E tools/writeup_capture.py --settings /home/analyst/settings.toml --credentials %d --out /home/analyst/writeup-capture
+TimeoutStartSec=15min
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/analyst
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX

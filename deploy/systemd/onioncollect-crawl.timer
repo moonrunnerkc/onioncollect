@@ -1,0 +1,12 @@
+# Every quarter hour. Cadence decides what a run actually fetches; a tick while a crawl is still running does
+# nothing, and the run lock refuses any second crawl started by hand.
+[Unit]
+Description=onioncollect crawl, every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+RandomizedDelaySec=60
+Persistent=false
+
+[Install]
+WantedBy=timers.target

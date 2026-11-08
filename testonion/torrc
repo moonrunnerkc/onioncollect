@@ -1,0 +1,7 @@
+# testonion-vm only, never the crawler VM. One v3 onion service in front of app.py on 127.0.0.1:8080.
+# No SOCKS port: nothing on this box is a Tor client.
+SocksPort 0
+HiddenServiceDir /var/lib/tor/testonion/
+HiddenServicePort 80 127.0.0.1:8080
+SafeLogging 1
+Log notice syslog

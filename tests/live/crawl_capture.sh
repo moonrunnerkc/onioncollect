@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build steps 8 and 9 under the leak test 3 capture: `onioncrawl run` as crawler for CRAWL_SECONDS
+# The collector under the leak test 3 capture: `onioncollect crawl run` as crawler for CRAWL_SECONDS
 # (default 600) with tcpdump running the whole time, then SIGINT, judged with the test 3 criteria and a
 # crawl log audit. CRAWL_SCOPE=one (step 8) runs one worker on one Tor instance; CRAWL_SCOPE=full
 # (step 9) runs every instance at workers_per_instance and checks each instance's SOCKS stream peak.
@@ -10,8 +10,6 @@ source "$(dirname "$0")/capture.sh"
 RUN_SECONDS=${CRAWL_SECONDS:-600}
 SCOPE=${CRAWL_SCOPE:-one}
 HOME_DIR=/home/crawler
-SEEDS=$HOME_DIR/seeds.txt
-[ -f "$SEEDS" ] || { echo "no $SEEDS: one onion URL or host per line"; exit 1; }
 if [ "$SCOPE" = one ]; then
     STEP=8
     SETTINGS=$HOME_DIR/settings-one-instance.toml
@@ -26,12 +24,15 @@ else
     PER_INSTANCE=$(sed -n 's/^workers_per_instance *= *//p' "$SETTINGS")
     PER_INSTANCE=${PER_INSTANCE:-3}
 fi
-CLI="cd $APP && exec $PY -m onioncrawl --settings $SETTINGS"
+CLI="cd $APP && exec $PY -m onioncollect --settings $SETTINGS"
+# The timer's crawl would hold the run lock; this one runs alone and the timer starts again at the end.
+systemctl stop onioncollect-crawl.timer onioncollect-crawl.service 2>/dev/null
+as_crawler bash -c "$CLI sources list --state live" 2>/dev/null | grep -q . ||
+    { echo "no live sources: triage approve, fill in the config, then golive"; exit 1; }
 
 capture_start "the crawl (${RUN_SECONDS}s)"
-echo "step $STEP: $(as_crawler bash -c "$CLI seed $SEEDS")"
 # SIGINT is the Ctrl-C path: workers finish their current fetch, then the crawler closes cleanly.
-as_crawler timeout --preserve-status -s INT -k 120 "$RUN_SECONDS" bash -c "$CLI run $RUN_ARGS" 2>/dev/null
+as_crawler timeout --preserve-status -s INT -k 120 "$RUN_SECONDS" bash -c "$CLI crawl run $RUN_ARGS" 2>/dev/null
 CODE=$?
 echo "step $STEP: crawler exited with $CODE after SIGINT"
 [ "$CODE" = 0 ] || FAILED=1
@@ -47,9 +48,10 @@ done < <(socks_peaks)
 report "step $STEP no instance carries more streams than its workers" "$STREAMS"
 
 echo "step $STEP: crawl log audit"
-if as_crawler "$PY" "$APP/tests/live/log_audit.py" "$HOME_DIR/data/crawl.log" "$HOME_DIR/data/crawl.db" | sed 's/^/      /'; then
-    report "step $STEP log carries hosts, codes, bytes, timings and error names only" pass
+if as_crawler "$PY" "$APP/tests/live/log_audit.py" --data "$HOME_DIR/data" "$HOME_DIR/data/crawl.log" | sed 's/^/      /'; then
+    report "step $STEP log carries source ids, codes, counts, timings and error names only" pass
 else
-    report "step $STEP log carries hosts, codes, bytes, timings and error names only" fail
+    report "step $STEP log carries source ids, codes, counts, timings and error names only" fail
 fi
+systemctl start onioncollect-crawl.timer 2>/dev/null
 exit $FAILED

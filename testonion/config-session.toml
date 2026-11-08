@@ -1,0 +1,33 @@
+# Stage 2, once testonion is live: the same source, now logging in once a run to reach the members' notes.
+# credential_ref names /etc/onioncollect/testonion.env in the crawler guest, which `make testonion-credentials`
+# writes. No credential ever goes in this file; the loader refuses one.
+id = "testonion"
+hosts = ["HOSTNAME"]
+category = "self-hosted"
+cadence = "6h"
+seeds = ["/", "/members/"]
+
+[listing]
+item = "article.note"
+
+[listing.fields]
+title = "h2 a"
+url = "h2 a@href"
+
+[detail]
+follow = "url"
+
+[detail.fields]
+body = "div.body"
+
+[expect]
+min_items_per_page = 2
+required_fields = ["title", "url"]
+
+[auth]
+type = "form-session"
+login_path = "/login"
+username_field = "username"
+password_field = "password"
+success_selector = "#signed-in"
+credential_ref = "testonion"

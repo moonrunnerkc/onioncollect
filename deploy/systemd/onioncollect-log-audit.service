@@ -1,0 +1,34 @@
+# After every crawl, as the analyst: every log line has a known shape, and no visited path, record text or
+# section 15 credential value is in a log or under the data dir. systemd hands the credential over in memory
+# (%d), so the analyst never reads the crawler's file; the empty SetCredential is the default when it is absent.
+[Unit]
+Description=onioncollect log audit
+
+[Service]
+Type=oneshot
+User=analyst
+Group=analyst
+WorkingDirectory=/opt/onioncollect/app
+LoadCredential=testonion.env:/etc/onioncollect/testonion.env
+SetCredential=testonion.env:
+ExecStart=/opt/onioncollect/venv/bin/python -s -E tests/live/log_audit.py --data /home/crawler/data --credentials %d /home/crawler/data/crawl.log /home/analyst/ui.log
+TimeoutStartSec=15min
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX

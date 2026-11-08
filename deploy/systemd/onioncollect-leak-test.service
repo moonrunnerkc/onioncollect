@@ -1,0 +1,19 @@
+# The four Tor leak tests, daily, as root, so golive check 3 and the crawl gate always have a result under 36 h
+# old. It adds and removes an iptables LOG rule, captures with tcpdump, reads the kernel log and runs parts as the
+# crawler (runuser, so NoNewPrivileges holds), which rules out ProtectSystem=strict and the ProtectKernel* set.
+[Unit]
+Description=onioncollect Tor leak tests
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/bin/bash /opt/onioncollect/app/tests/live/leak_test.sh
+TimeoutStartSec=20min
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+ProtectHostname=yes
+ProtectClock=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native

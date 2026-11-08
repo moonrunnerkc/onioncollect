@@ -1,9 +1,23 @@
 data/
+collect.db
+collect.db-*
+records.db
+records.db-*
+snapshots/
+# Left by earlier versions; delete them, never commit them.
+frontier.db
+frontier.db-*
+findings.db
+findings.db-*
+findings/
+watchlist/
 crawl.db
 crawl.db-*
 pages/
 *.log
 control-password
+redaction-salt
+hibp-api-key
 exclusions.txt
 safety-patterns.txt
 settings.toml
@@ -21,3 +35,10 @@ venv/
 *.raw
 disk
 disk.snapshot
+# Guest-side outputs and credentials: never copied into the checkout, and never committed if they are.
+*.env
+*.pcap
+writeup-capture/
+leak-test.json
+deploy-stamp
+.lima/

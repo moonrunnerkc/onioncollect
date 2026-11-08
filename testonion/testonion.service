@@ -1,0 +1,26 @@
+[Unit]
+Description=Section 15's self-hosted onion app (onioncollect)
+After=network.target
+
+[Service]
+User=testonion
+Group=testonion
+ExecStart=/usr/bin/python3 -I /opt/testonion/app.py
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

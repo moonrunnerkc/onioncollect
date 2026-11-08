@@ -4,8 +4,8 @@ from unittest import mock
 
 from stem import Signal
 
-from onioncrawl import tor_pool
-from onioncrawl.tor_pool import TorInstance, TorPool
+from onioncollect import tor_pool
+from onioncollect.tor_pool import TorInstance, TorPool
 from tests.fixtures import throwaway_settings
 
 
@@ -75,7 +75,7 @@ class TorPoolTest(unittest.IsolatedAsyncioTestCase):
         controllers = [fake_controller("1"), fake_controller("0"), fake_controller("1")]
         with mock.patch.object(tor_pool.Controller, "from_port", side_effect=controllers), \
                 mock.patch.object(tor_pool, "READY_TIMEOUT", 0.05), mock.patch.object(tor_pool, "READY_POLL", 0.01):
-            with self.assertLogs("onioncrawl.tor_pool", "WARNING") as logs:
+            with self.assertLogs("onioncollect.tor_pool", "WARNING") as logs:
                 await pool.start()
         self.assertEqual([instance.socks_port for instance in pool.instances], [10051, 10053])
         controllers[1].close.assert_called_once()
@@ -94,7 +94,7 @@ class TorPoolTest(unittest.IsolatedAsyncioTestCase):
         pool = TorPool(settings(instances=2))
         with mock.patch.object(tor_pool.Controller, "from_port", side_effect=lambda **_: fake_controller("0")), \
                 mock.patch.object(tor_pool, "READY_TIMEOUT", 0.02), mock.patch.object(tor_pool, "READY_POLL", 0.01):
-            with self.assertLogs("onioncrawl.tor_pool", "WARNING"), self.assertRaises(RuntimeError):
+            with self.assertLogs("onioncollect.tor_pool", "WARNING"), self.assertRaises(RuntimeError):
                 await pool.start()
 
     def test_assign_pins_workers_round_robin(self):
@@ -120,7 +120,7 @@ class TorPoolTest(unittest.IsolatedAsyncioTestCase):
         for _ in range(10):
             sick.record(False)
             healthy.record(True)
-        with mock.patch.object(tor_pool, "HEALTH_INTERVAL", 0.01), self.assertLogs("onioncrawl.tor_pool", "INFO"):
+        with mock.patch.object(tor_pool, "HEALTH_INTERVAL", 0.01), self.assertLogs("onioncollect.tor_pool", "INFO"):
             task = asyncio.create_task(pool.health_loop())
             await asyncio.sleep(0.05)
             task.cancel()
