@@ -81,3 +81,20 @@ Roll back to the snapshot: `limactl stop node1 && cp -c ~/.lima/node1/disk.snaps
 Disk encryption comes from the host: FileVault encrypts the guest disk image at rest. FileVault must be
 on before the first real crawl; `make checklist` fails until it is. Moving `data/` onto a LUKS
 volume inside the guest is a possible later change if host encryption alone stops being enough.
+
+## Known residuals
+
+What the guest still allows, on purpose, and why each stays open.
+
+- **The analyst can reach the Tor SOCKS ports.** Like every local user, the analyst has loopback, and loopback
+  includes the six Tor instances' SOCKS ports on 127.0.0.1. Nothing the analyst runs (the UI, the writer, triage)
+  imports a network library, and the writer's unit has no network at all, but a shell as the analyst could open
+  a SOCKS connection. Closing it takes an iptables owner rule, and any firewall change falls under the rule that
+  the leak tests must run again before it is committed, so it is left open and recorded here.
+- **The daily leak-test unit is hardened less than the rest.** `onioncollect-leak-test.service` runs as root with
+  `NoNewPrivileges=yes` and `ProtectSystem=full`, not `strict`, and without the `ProtectKernel*` set. It adds and
+  removes an iptables LOG rule, captures with tcpdump and reads the kernel log, which those settings would
+  block. It drops to the crawler with `runuser`, so `NoNewPrivileges` still holds.
+- **The units' code is built inside provision's update window.** The systemd units run from a root-owned copy of
+  the code and venv under `/opt/onioncollect`. Building that venv needs pip to reach the network, and it reuses
+  the temporary egress hole `provision.sh` already opens for apt and the crawler's venv, then closes with the rest.
