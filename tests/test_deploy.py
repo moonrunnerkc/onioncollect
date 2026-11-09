@@ -63,7 +63,13 @@ class UnitFilesTest(unittest.TestCase):
         for name, (user, command) in EXPECTED.items():
             with self.subTest(unit=name):
                 service = unit(name)["Service"]
-                self.assertEqual(service["User"], user)
+                if user == "root":
+                    # Root by systemd's default. An explicit User=root, with NoNewPrivileges and the syscall
+                    # filters, leaves CAP_SETUID out of the effective set, so the leak test's runuser to the
+                    # crawler failed with EPERM and every scheduled run failed all four tests.
+                    self.assertNotIn("User", service)
+                else:
+                    self.assertEqual(service["User"], user)
                 self.assertEqual(service["ExecStart"], command)
                 if user != "root":
                     self.assertEqual(service["Group"], user)
