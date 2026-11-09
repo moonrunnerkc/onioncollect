@@ -41,10 +41,9 @@ type = "none"
 """
 
 
-async def throwaway_sources(directory: Path) -> tuple:
+async def throwaway_sources(collect) -> tuple:
     # The fetcher only goes where the source table says, so these three public onions are made live in a
     # database that lives as long as the probe.
-    collect = await open_collect(directory / "collect.db")
     table = SourceTable(collect)
     configs = {}
     for source_id, (scheme, host, category) in LIVE_ONIONS.items():
@@ -52,7 +51,7 @@ async def throwaway_sources(directory: Path) -> tuple:
         await table.change_state(source_id, lifecycle.LIVE)
         configs[source_id] = source_config.parse(
             PROBE_CONFIG.format(id=source_id, host=host, category=category, scheme=scheme), source_id)
-    return collect, table, configs
+    return table, configs
 
 
 def check_dead_port_rejected(settings_path: Path) -> None:
@@ -71,41 +70,48 @@ async def main(settings_path: Path) -> None:
     check_dead_port_rejected(settings_path)
     settings = Settings.load(settings_path, crawl=True)
     scratch = tempfile.TemporaryDirectory()
-    collect, table, configs = await throwaway_sources(Path(scratch.name))
+    collect = await open_collect(Path(scratch.name) / "collect.db")
     pool = TorPool(settings)
-    started = time.monotonic()
-    await pool.start()
-    print(f"step 3: {len(pool.instances)} instances ready in {time.monotonic() - started:.1f}s")
+    fetchers = []
+    # Everything is closed on every exit. A failure that skipped collect.close() left aiosqlite's worker thread
+    # running, and the interpreter waited on it forever, so the leak test hung instead of failing.
+    try:
+        table, configs = await throwaway_sources(collect)
+        started = time.monotonic()
+        await pool.start()
+        print(f"step 3: {len(pool.instances)} instances ready in {time.monotonic() - started:.1f}s")
 
-    first = pool.instances[0]
-    started = time.monotonic()
-    await first.rotate()
-    after_first = time.monotonic() - started
-    await first.rotate()
-    after_second = time.monotonic() - started - after_first
-    print(f"step 3: tor {first.socks_port} NEWNYM sent in {after_first:.2f}s, second NEWNYM waited {after_second:.1f}s")
-    if after_second < 9:
-        raise SystemExit("step 3: FAIL, the NEWNYM rate limit was not respected")
+        first = pool.instances[0]
+        started = time.monotonic()
+        await first.rotate()
+        after_first = time.monotonic() - started
+        await first.rotate()
+        after_second = time.monotonic() - started - after_first
+        print(f"step 3: tor {first.socks_port} NEWNYM sent in {after_first:.2f}s, second NEWNYM waited {after_second:.1f}s")
+        if after_second < 9:
+            raise SystemExit("step 3: FAIL, the NEWNYM rate limit was not respected")
 
-    fetchers = [Fetcher(settings, pool.assign(n), table, configs, lifecycle.COLLECTING) for n in range(len(pool.instances))]
-    for n, (source_id, path) in enumerate([(source_id, "/") for source_id in LIVE_ONIONS] + REFUSED):
-        fetcher = fetchers[n % len(fetchers)]
-        result = await fetcher.fetch(source_id, path)
-        size = len(result.body) if result.body is not None else 0
-        print(
-            f"step 4: tor {fetcher.tor.socks_port} {source_id} status={result.status} bytes={size} "
-            f"elapsed={result.elapsed:.2f}s error={result.error}"
-        )
-        if (source_id, path) in REFUSED and result.error not in ("not_approved", "bad_path"):
-            raise SystemExit(f"step 4: FAIL, {source_id} was not refused before sending")
+        fetchers = [Fetcher(settings, pool.assign(n), table, configs, lifecycle.COLLECTING)
+                    for n in range(len(pool.instances))]
+        for n, (source_id, path) in enumerate([(source_id, "/") for source_id in LIVE_ONIONS] + REFUSED):
+            fetcher = fetchers[n % len(fetchers)]
+            result = await fetcher.fetch(source_id, path)
+            size = len(result.body) if result.body is not None else 0
+            print(
+                f"step 4: tor {fetcher.tor.socks_port} {source_id} status={result.status} bytes={size} "
+                f"elapsed={result.elapsed:.2f}s error={result.error}"
+            )
+            if (source_id, path) in REFUSED and result.error not in ("not_approved", "bad_path"):
+                raise SystemExit(f"step 4: FAIL, {source_id} was not refused before sending")
 
-    for instance in pool.instances:
-        print(f"step 3: tor {instance.socks_port} success rate {instance.success_rate():.2f} over {len(instance.outcomes)}")
-    for fetcher in fetchers:
-        await fetcher.close()
-    pool.stop()
-    await collect.close()
-    scratch.cleanup()
+        for instance in pool.instances:
+            print(f"step 3: tor {instance.socks_port} success rate {instance.success_rate():.2f} over {len(instance.outcomes)}")
+    finally:
+        for fetcher in fetchers:
+            await fetcher.close()
+        pool.stop()
+        await collect.close()
+        scratch.cleanup()
 
 
 if __name__ == "__main__":

@@ -5,6 +5,9 @@
 set -uo pipefail
 
 WINDOW=${LEAK_WINDOW_SECONDS:-300}
+# The probe's limit: Tor's 120 s ready wait, two NEWNYMs and six fetches fit well inside it, and the unit's
+# 20 min TimeoutStartSec still covers the whole run when it is used up.
+PROBE_SECONDS=${LEAK_PROBE_SECONDS:-480}
 # Golive's check 3 reads this. Root writes it, mode 644, so the crawler can read it and never forge it.
 RESULT_FILE=/var/lib/onioncollect/leak-test.json
 # Written by make deploy. The result records the one it ran under; golive and the crawl refuse a result that
@@ -85,7 +88,14 @@ else
 fi
 
 echo "test 3: traffic during the window comes from the fetcher probe (steps 2 to 4)"
-as_crawler bash -c "cd $APP && $PY -m tests.live.probe /home/crawler/settings.toml" 2>&1 | sed 's/^/      /'
+# A probe that never fetched leaves a quiet capture, and a quiet capture proves nothing about the fetcher, so a
+# probe that fails or overruns fails test 3. exec makes the probe timeout's own child, so the kill reaches it.
+PROBE=pass
+if ! as_crawler timeout -k 10 "$PROBE_SECONDS" bash -c "cd $APP && exec $PY -m tests.live.probe /home/crawler/settings.toml" \
+        2>&1 | sed 's/^/      /'; then
+    PROBE=fail
+    echo "      the fetcher probe failed or ran past ${PROBE_SECONDS}s"
+fi
 REMAINING=$(( WINDOW - ($(date +%s) - STARTED) ))
 if [ "$REMAINING" -gt 0 ]; then
     echo "      holding the capture open ${REMAINING}s more"
@@ -111,6 +121,14 @@ echo "      example.com: kernel log lines for uid systemd-resolve -> port 53: $T
 [ "$T1_LOOKUP" -gt 0 ] && [ "$T1_LOOKUP_WIRE" = 0 ] || T1=fail
 judged clearnet-block report "test 1 clearnet block" "$T1"
 
-judged packet-capture capture_judge "test 3 packet capture: only tor talks to the network"
+judge_test3() {
+    if [ "$PROBE" = pass ]; then
+        capture_judge "$1"
+    else
+        capture_judge "$1 (traffic only)"
+        report "$1: the fetcher probe did not finish, so the capture shows no fetch" fail
+    fi
+}
+judged packet-capture judge_test3 "test 3 packet capture: only tor talks to the network"
 write_result
 exit $FAILED
