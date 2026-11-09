@@ -45,6 +45,15 @@ systemctl restart onioncollect-writer.service onioncollect-ui.service
 # Triage refuses an excluded host, so the analyst keeps its own copy of the crawler's list.
 install -m 600 -o analyst -g analyst /home/crawler/exclusions.txt /home/analyst/exclusions.txt
 
+# The analyst units load testonion's credential by id from the credstore. The file stays where config.py reads it;
+# the credstore holds a link, present exactly while the file is, since a dangling link fails those units.
+install -d -m 700 -o root -g root /etc/credstore
+if [ -f /etc/onioncollect/testonion.env ]; then
+    ln -sfn /etc/onioncollect/testonion.env /etc/credstore/testonion.env
+else
+    rm -f /etc/credstore/testonion.env
+fi
+
 if [ -d "$STAGE/configs" ]; then
     bash "$STAGE/deploy/sync_configs.sh" "$STAGE/configs" "$CONFIGS"
 fi

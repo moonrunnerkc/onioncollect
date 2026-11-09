@@ -154,10 +154,20 @@ class UnitFilesTest(unittest.TestCase):
         self.assertEqual(writer["Install"]["WantedBy"], "multi-user.target", "enabled at boot")
 
     def test_the_credential_reaches_the_analyst_units_through_systemd_only(self):
+        # The bare id makes systemd search its credstore, where a missing credential falls back to SetCredential.
+        # A missing file named by an absolute path fails the unit instead (status 243, systemd 257), so the audit
+        # never ran on a guest without testonion's credential.
         for name in ("onioncollect-log-audit.service", "onioncollect-capture.service"):
             service = unit(name)["Service"]
-            self.assertEqual(service["LoadCredential"], "testonion.env:/etc/onioncollect/testonion.env")
+            self.assertEqual(service["LoadCredential"], "testonion.env")
             self.assertEqual(service["SetCredential"], "testonion.env:")
+        # The credential itself stays at /etc/onioncollect; the credstore holds only a link to it, which must
+        # exist exactly when the file does (a dangling link fails the unit like a missing path).
+        install = (ROOT / "deploy" / "install.sh").read_text()
+        self.assertIn("ln -sfn /etc/onioncollect/testonion.env /etc/credstore/testonion.env", install)
+        self.assertIn("rm -f /etc/credstore/testonion.env", install)
+        make = (ROOT / "Makefile").read_text()
+        self.assertIn("ln -sfn /etc/onioncollect/testonion.env /etc/credstore/testonion.env", make)
         crawl = unit("onioncollect-crawl.service")["Unit"]
         self.assertEqual((crawl["OnSuccess"], crawl["OnFailure"]), ("onioncollect-log-audit.service",) * 2)
 

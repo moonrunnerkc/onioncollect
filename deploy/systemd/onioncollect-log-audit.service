@@ -1,6 +1,8 @@
 # After every crawl, as the analyst: every log line has a known shape, and no visited path, record text or
 # section 15 credential value is in a log or under the data dir. systemd hands the credential over in memory
 # (%d), so the analyst never reads the crawler's file; the empty SetCredential is the default when it is absent.
+# The bare id is found through /etc/credstore, a link install.sh keeps to /etc/onioncollect/testonion.env only
+# while that file exists: an absolute path to a missing file fails the unit (243/CREDENTIALS) despite the default.
 [Unit]
 Description=onioncollect log audit
 
@@ -9,7 +11,7 @@ Type=oneshot
 User=analyst
 Group=analyst
 WorkingDirectory=/opt/onioncollect/app
-LoadCredential=testonion.env:/etc/onioncollect/testonion.env
+LoadCredential=testonion.env
 SetCredential=testonion.env:
 ExecStart=/opt/onioncollect/venv/bin/python -s -E tests/live/log_audit.py --data /home/analyst/data --credentials %d /var/log/onioncollect/crawl.log /home/analyst/ui.log
 TimeoutStartSec=15min

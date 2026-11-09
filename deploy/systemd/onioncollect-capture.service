@@ -8,7 +8,8 @@ Type=oneshot
 User=analyst
 Group=analyst
 WorkingDirectory=/opt/onioncollect/app
-LoadCredential=testonion.env:/etc/onioncollect/testonion.env
+# Found through /etc/credstore; see onioncollect-log-audit.service.
+LoadCredential=testonion.env
 SetCredential=testonion.env:
 ExecStart=/opt/onioncollect/venv/bin/python -s -E tools/writeup_capture.py --settings /home/analyst/settings.toml --credentials %d --out /home/analyst/writeup-capture
 TimeoutStartSec=15min

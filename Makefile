@@ -94,7 +94,9 @@ testonion: testonion-vm
 testonion-credentials: vm testonion-vm
 	limactl shell $(TESTONION_VM) sudo cat /etc/testonion/credentials | limactl shell $(VM) sudo sh -c \
 		'install -d -m 750 -o root -g crawler /etc/onioncollect && umask 077 && \
-		cat > /etc/onioncollect/testonion.env && chown crawler:crawler /etc/onioncollect/testonion.env'
+		cat > /etc/onioncollect/testonion.env && chown crawler:crawler /etc/onioncollect/testonion.env && \
+		install -d -m 700 -o root -g root /etc/credstore && \
+		ln -sfn /etc/onioncollect/testonion.env /etc/credstore/testonion.env'
 
 # Lists every [PASTE: ...] marker left in the write-up; fails while any remains.
 writeup-check:
