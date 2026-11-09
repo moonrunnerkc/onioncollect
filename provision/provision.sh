@@ -189,8 +189,10 @@ migrate_layout() {
                 log "$name moved to the crawler's state dir"
             fi
         done
+        # Only onioncollect's own log: an older tool's names hosts, which the audited log dir must never hold.
         for file in "$old"/crawl.log*; do
-            if [ -e "$file" ] && [ ! -e "$LOG_DIR/$(basename "$file")" ]; then
+            if [ -e "$file" ] && [ ! -e "$LOG_DIR/$(basename "$file")" ] &&
+                { [ ! -s "$file" ] || head -n 1 "$file" | grep -qE '^[0-9-]+ [0-9:,]+ [A-Z]+ onioncollect\.'; }; then
                 mv "$file" "$LOG_DIR/"
                 log "$(basename "$file") moved to $LOG_DIR"
             fi

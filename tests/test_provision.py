@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 PROVISION = Path(__file__).resolve().parent.parent / "provision" / "provision.sh"
+LOG = "2026-11-08 10:00:00,000 INFO onioncollect.crawler: crawler: stopped\n"
 
 
 class MigrateLayoutTest(unittest.TestCase):
@@ -22,7 +23,7 @@ class MigrateLayoutTest(unittest.TestCase):
         (self.root / "home" / "crawler" / "configs").mkdir()
         (self.root / "home" / "analyst").mkdir()
         for name, text in (("collect.db", "sources"), ("records.db", "records"), ("frontier.db", "urls"),
-                           ("crawl.log", "log"), ("run.lock", ""), ("snapshots/ab/ab12.html", "<p>x</p>")):
+                           ("crawl.log", LOG), ("run.lock", ""), ("snapshots/ab/ab12.html", "<p>x</p>")):
             (old / name).write_text(text)
             (old / name).chmod(0o640)
         (self.root / "home" / "crawler" / "configs" / "news.toml").write_text('id = "news"\n')
@@ -56,7 +57,7 @@ class MigrateLayoutTest(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in data.iterdir()), ["collect.db", "records.db", "snapshots"])
         self.assertEqual((data / "snapshots/ab/ab12.html").read_text(), "<p>x</p>")
         self.assertEqual([path.name for path in state.iterdir()], ["frontier.db"])
-        self.assertEqual((self.root / "var/log/onioncollect/crawl.log").read_text(), "log")
+        self.assertEqual((self.root / "var/log/onioncollect/crawl.log").read_text(), LOG)
         self.assertEqual((self.root / "var/lib/onioncollect/configs/news.toml").read_text(), 'id = "news"\n')
         self.assertFalse((self.root / "home/crawler/data").exists(), "the run lock went with the old data dir")
         self.assertFalse((self.root / "home/crawler/configs").exists())
@@ -72,6 +73,15 @@ class MigrateLayoutTest(unittest.TestCase):
         before = self.tree()
         self.assertEqual(self.migrate(), "")
         self.assertEqual(self.tree(), before)
+
+    def test_another_tools_crawl_log_stays_in_the_crawlers_home(self):
+        old = self.root / "home/crawler/data"
+        older = "2026-11-07 20:54:09,665 INFO onioncrawl.crawler: crawler: 1 worker\n"
+        (old / "crawl.log").write_text(older)
+        (old / "crawl.log.1").write_text(LOG)
+        self.assertIn("kept: it holds files no store uses", self.migrate())
+        self.assertEqual((old / "crawl.log").read_text(), older)
+        self.assertEqual(sorted(path.name for path in (self.root / "var/log/onioncollect").iterdir()), ["crawl.log.1"])
 
     def test_a_store_already_in_place_is_never_overwritten(self):
         data = self.root / "home/analyst/data"
