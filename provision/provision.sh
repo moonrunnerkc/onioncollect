@@ -121,13 +121,17 @@ quiet_the_box() {
     fi
 }
 
+# A test, never a command's last word: `grep && gpasswd` returns 1 for a user outside the group, and as a
+# function's last command that ends the run under set -e.
+in_group() { id -nG "$1" | tr ' ' '\n' | grep -qx "$2"; }
+
 create_crawler() {
     if ! id crawler >/dev/null 2>&1; then
         useradd --create-home --user-group --shell /bin/bash crawler
         log "crawler user created"
     fi
     for group in sudo adm; do
-        id -nG crawler | tr ' ' '\n' | grep -qx "$group" && gpasswd -d crawler "$group"
+        if in_group crawler "$group"; then gpasswd -d crawler "$group"; fi
     done
 }
 
@@ -141,14 +145,14 @@ create_analyst() {
     fi
     chmod 700 "$ANALYST_HOME"
     for group in sudo adm; do
-        id -nG analyst | tr ' ' '\n' | grep -qx "$group" && gpasswd -d analyst "$group"
+        if in_group analyst "$group"; then gpasswd -d analyst "$group"; fi
     done
     if ! getent group "$IPC_GROUP" >/dev/null; then
         groupadd --system "$IPC_GROUP"
         log "$IPC_GROUP group created"
     fi
-    id -nG crawler | tr ' ' '\n' | grep -qx "$IPC_GROUP" || usermod -aG "$IPC_GROUP" crawler
-    id -nG analyst | tr ' ' '\n' | grep -qx "$IPC_GROUP" && gpasswd -d analyst "$IPC_GROUP"
+    in_group crawler "$IPC_GROUP" || usermod -aG "$IPC_GROUP" crawler
+    if in_group analyst "$IPC_GROUP"; then gpasswd -d analyst "$IPC_GROUP"; fi
     migrate_layout
     # Triage refuses an excluded host, so the analyst keeps its own copy of the crawler's list.
     if ! cmp -s "$CRAWLER_HOME/exclusions.txt" "$ANALYST_HOME/exclusions.txt"; then

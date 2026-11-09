@@ -92,5 +92,31 @@ class MigrateLayoutTest(unittest.TestCase):
         self.assertEqual((self.root / "home/crawler/data/collect.db").read_text(), "sources")
 
 
+class CreateCrawlerTest(unittest.TestCase):
+    """create_crawler under the script's own set -e, with id and gpasswd stubbed: it must return 0 for a crawler
+    in no privileged group, the guest's normal case, and take it out of any it is in."""
+
+    def run_with_groups(self, groups: str) -> tuple[subprocess.CompletedProcess, str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            stubs = Path(tmp)
+            (stubs / "id").write_text(f'#!/bin/sh\n[ "$1" = -nG ] && echo "{groups}"\nexit 0\n')
+            (stubs / "gpasswd").write_text(f'#!/bin/sh\necho "$*" >> {tmp}/calls\n')
+            for stub in ("id", "gpasswd"):
+                (stubs / stub).chmod(0o755)
+            done = subprocess.run(["bash", "-c", 'source "$1"; create_crawler; echo returned', "_", str(PROVISION)],
+                                  env={"PATH": f"{tmp}:{os.environ['PATH']}"}, capture_output=True, text=True,
+                                  timeout=60)
+            calls = (stubs / "calls").read_text() if (stubs / "calls").exists() else ""
+        return done, calls
+
+    def test_a_crawler_in_no_privileged_group_returns(self):
+        done, calls = self.run_with_groups("crawler onioncollect-ipc")
+        self.assertEqual((done.returncode, done.stdout, calls), (0, "returned\n", ""), done.stderr)
+
+    def test_a_crawler_in_sudo_and_adm_is_taken_out(self):
+        done, calls = self.run_with_groups("crawler sudo adm")
+        self.assertEqual((done.returncode, done.stdout, calls), (0, "returned\n", "-d crawler sudo\n-d crawler adm\n"))
+
+
 if __name__ == "__main__":
     unittest.main()
