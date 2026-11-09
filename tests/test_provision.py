@@ -118,5 +118,43 @@ class CreateCrawlerTest(unittest.TestCase):
         self.assertEqual((done.returncode, done.stdout, calls), (0, "returned\n", "-d crawler sudo\n-d crawler adm\n"))
 
 
+class KillSwitchRulesTest(unittest.TestCase):
+    """The whole IPv4 kill switch, line for line: any new ACCEPT is a reviewed change to this list."""
+
+    def rules(self, subnet: str, device: str) -> list[str]:
+        done = subprocess.run(["bash", "-c", 'source "$1"; kill_switch_rules "$2" "$3"', "_", str(PROVISION),
+                               subnet, device], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout.splitlines()
+
+    def test_loopback_ssh_replies_the_tor_users_and_dhcp_renewal_only(self):
+        self.assertEqual(self.rules("192.168.5.0/24", "eth0"), [
+            "*filter",
+            ":INPUT ACCEPT [0:0]",
+            ":FORWARD ACCEPT [0:0]",
+            ":OUTPUT ACCEPT [0:0]",
+            "-A OUTPUT -o lo -j ACCEPT",
+            "-A OUTPUT -p tcp -m tcp --sport 22 -m conntrack --ctstate ESTABLISHED -j ACCEPT",
+            *(f"-A OUTPUT -m owner --uid-owner _tor-crawl{n} -j ACCEPT" for n in range(1, 7)),
+            # The lease renewal, unicast to the gateway's subnet. Dropped, it fell back to a raw-socket broadcast
+            # from 0.0.0.0:68 that iptables never sees and leak test 3 rightly flags.
+            "-A OUTPUT -o eth0 -d 192.168.5.0/24 -p udp -m udp --sport 68 --dport 67"
+            " -m owner --uid-owner systemd-network -j ACCEPT",
+            "-A OUTPUT -j DROP",
+            "COMMIT",
+        ])
+
+    def test_the_dhcp_rule_follows_the_guest_network(self):
+        rules = self.rules("10.0.2.0/24", "enp0s1")
+        self.assertIn("-A OUTPUT -o enp0s1 -d 10.0.2.0/24 -p udp -m udp --sport 68 --dport 67"
+                      " -m owner --uid-owner systemd-network -j ACCEPT", rules)
+
+    def test_no_subnet_means_no_dhcp_rule(self):
+        # A guest with no default route gets the spec's original kill switch, never a rule with an empty match.
+        rules = self.rules("", "")
+        self.assertFalse([rule for rule in rules if "systemd-network" in rule])
+        self.assertEqual(rules[-2:], ["-A OUTPUT -j DROP", "COMMIT"])
+
+
 if __name__ == "__main__":
     unittest.main()

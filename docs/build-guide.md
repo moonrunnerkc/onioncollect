@@ -77,7 +77,7 @@ Every anonymity control from the original plan stays. Accessing onion services e
 
 - Dedicated, full-disk-encrypted VM; two users (`crawler` for collection, `analyst` for triage, health, and search); snapshot after setup.
 - Six to ten Tor instances via `tor-instance-create`, each `ClientOnly 1`, `SafeLogging 1`, `IsolateSOCKSAuth`, per-instance system user.
-- The firewall kill-switch: iptables OUTPUT allows loopback, SSH replies, and the Tor UIDs only, then DROP; ip6tables OUTPUT policy DROP. The crawler user can't send a packet off the box.
+- The firewall kill-switch: iptables OUTPUT allows loopback, SSH replies, the Tor UIDs, and the network daemon's DHCP lease renewal (`systemd-network`, UDP 68 to 67, to the guest's own subnet only), then DROP; ip6tables OUTPUT policy DROP. The crawler user can't send a packet off the box. The DHCP rule exists because a dropped renewal makes the client fall back to a raw-socket broadcast that iptables never sees, which leak test 3 flags; letting the unicast renewal through keeps DHCP off the wire except as traffic to the local gateway, which test 3 already accepts.
 - Pinned reproducible dependencies with hashes.
 - Data directory on the encrypted disk, mode 700, owned by `analyst`; the crawler writes through a small local socket service so it never holds the DB file open. Analyst tooling never needs the crawler's circuits.
 
