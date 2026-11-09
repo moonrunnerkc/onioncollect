@@ -32,7 +32,8 @@ def redact(text: str, salt: bytes) -> Redacted:
         cursor = span.end
     out.append(text[cursor:])
     counts = Counter(span.kind for span in spans)
-    hashes = sorted({keyed_hash(salt, key_of(span, text)) for span in spans})[:MAX_HASHES]
+    # A span cut by an overlap has key_end == start: no whole key, so nothing to hash.
+    hashes = sorted({keyed_hash(salt, key_of(span, text)) for span in spans if span.key_end > span.start})[:MAX_HASHES]
     emails = counts.get("email", 0)
     events = len(spans) - (emails if emails < BULK_EMAILS else 0)
     return Redacted("".join(out), dict(counts), tuple(hashes), events)

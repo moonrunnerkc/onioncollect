@@ -14,6 +14,37 @@ class FindTest(unittest.TestCase):
         self.assertEqual(kinds("x bob@acme.com:hunter2 y"), [("email_password", "bob@acme.com:hunter2", "bob@acme.com")])
         self.assertEqual(kinds("bob@acme.com;pw|x")[0][0], "email_password")
 
+    def test_email_password_pair_with_a_spaced_separator_ending_its_line(self):
+        for text in ("bob@acme.com : hunter22\n", "bob@acme.com :hunter22", "bob@acme.com\t|\thunter22<br>",
+                     "bob@acme.com ; hunter22  \r\n"):
+            with self.subTest(text=text):
+                self.assertEqual([k for k, _, key in kinds(text)], ["email_password"])
+                self.assertEqual(kinds(text)[0][2], "bob@acme.com")
+                self.assertIn("hunter22", kinds(text)[0][1])
+
+    def test_a_spaced_separator_mid_sentence_stays_a_bare_email(self):
+        # Contact lines put prose after a spaced separator; only a dump puts the password last on its line.
+        for text in ("Mail bob@acme.com | PGP key below", "write to bob@acme.com; we answer in a day"):
+            with self.subTest(text=text):
+                self.assertEqual([k for k, _, _ in kinds(text)], ["email"])
+
+    def test_a_password_stops_at_a_br_tag(self):
+        self.assertEqual([s for _, s, _ in kinds("a@acme.com:pw1<br>b@acme.com:pw2<BR/>")],
+                         ["a@acme.com:pw1", "b@acme.com:pw2"])
+
+    def test_a_partly_overlapping_span_keeps_its_uncovered_part(self):
+        # Dropping it whole would leave the part past the first span in the text, unredacted.
+        # The first password's 128 characters end at "b@acm", inside the second entry.
+        text = "a@acme.com:" + "P" * 120 + "<p>b@acme.com:" + "Q" * 40
+        spans = find(text)
+        covered = bytearray(len(text))
+        for span in spans:
+            covered[span.start:span.end] = b"\x01" * (span.end - span.start)
+        second = text.index("b@")
+        self.assertEqual(covered[second:], b"\x01" * (len(text) - second))
+        self.assertEqual([(s.kind, s.key_end == s.start) for s in spans],
+                         [("email_password", False), ("email_password", True)])
+
     def test_bare_email(self):
         self.assertEqual(kinds("mail alice.b+tag@mail.acme.co.uk now"),
                          [("email", "alice.b+tag@mail.acme.co.uk", "alice.b+tag@mail.acme.co.uk")])

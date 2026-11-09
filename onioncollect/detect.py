@@ -5,8 +5,13 @@ LOCAL_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ012
 MAX_LOCAL = 64
 DOMAIN = re.compile(r"[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}(?![A-Za-z0-9-])")
 DOMAIN_WINDOW = 300
-PAIR_SEPARATORS = (":", ";", "|")
-PASSWORD = re.compile(r"\S{1,128}")
+# A dump writes "a@b.c:pw", "a@b.c : pw" or "a@b.c\t|\tpw". A spaced pair must end its line (or meet a tag),
+# since contact prose puts more words after a spaced separator ("bob@acme.com | PGP key below").
+SEPARATOR = re.compile(r"([ \t]{0,4})[:;|]([ \t]{0,4})")
+SEPARATOR_WINDOW = 9
+LINE_END = re.compile(r"[ \t]{0,4}(?:\r?\n|<|\Z)")
+# Stops at a <br> tag, so entries a dump joins with <br> on one line stay separate pairs.
+PASSWORD = re.compile(r"(?:(?!<[bB][rR]\b)\S){1,128}")
 USER_PAIR = re.compile(r"^([\w.-]{3,64})[:;|](?!//)\S{4,128}$", re.MULTILINE)
 CARD = re.compile(r"(?<![\d-])\d(?:[ -]?\d){12,18}(?!\d)")
 NATIONAL_IDS = (
@@ -29,15 +34,24 @@ class Span:
 
 
 def find(text: str) -> list[Span]:
-    # Highest priority first. A span overlapping one already taken is dropped; the storage layer reruns
-    # this on what the redaction gate wrote, so anything a drop leaves exposed fails closed there.
+    # Highest priority first. A span overlapping one already taken keeps only its uncovered parts: dropping
+    # it whole would leave whatever runs past the earlier span in the text, and a password tail does not trip
+    # this again when the storage layer reruns it. A cut part has no whole key, so key_end = start (no hash).
     candidates = [*addresses(text), *user_pairs(text), *cards(text), *national_ids(text), *tokens(text)]
     taken = bytearray(len(text))
     spans = []
     for span in candidates:
-        if taken.find(1, span.start, span.end) == -1:
-            taken[span.start:span.end] = b"\x01" * (span.end - span.start)
-            spans.append(span)
+        cursor = span.start
+        while cursor < span.end:
+            free = taken.find(0, cursor, span.end)
+            if free == -1:
+                break
+            stop = taken.find(1, free, span.end)
+            stop = span.end if stop == -1 else stop
+            taken[free:stop] = b"\x01" * (stop - free)
+            whole = free == span.start and stop == span.end
+            spans.append(span if whole else Span(free, stop, span.kind, free))
+            cursor = stop
     return sorted(spans, key=lambda span: span.start)
 
 
@@ -57,7 +71,10 @@ def addresses(text: str) -> list[Span]:
         domain = DOMAIN.match(text, at + 1, at + 1 + DOMAIN_WINDOW) if start < at else None
         if domain:
             end = domain.end()
-            password = PASSWORD.match(text, end + 1, end + 129) if text[end:end + 1] in PAIR_SEPARATORS else None
+            separator = SEPARATOR.match(text, end, end + SEPARATOR_WINDOW)
+            password = separator and PASSWORD.match(text, separator.end(), separator.end() + 128)
+            if password and (separator.group(1) or separator.group(2)) and not LINE_END.match(text, password.end()):
+                password = None
             if password:
                 found.append(Span(start, password.end(), "email_password", end))
             else:
