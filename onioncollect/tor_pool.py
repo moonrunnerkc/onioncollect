@@ -3,6 +3,7 @@ import logging
 import time
 from collections import deque
 
+import stem
 import stem.connection
 from stem import Signal, SocketError
 from stem.control import Controller
@@ -33,6 +34,19 @@ class TorInstance:
     def connect(self) -> None:
         self.controller = Controller.from_port(address="127.0.0.1", port=self.control_port)
         self.controller.authenticate(password=self._password)
+
+    def wake(self) -> None:
+        # An hour idle and Tor drops its circuits and builds none until a client asks; a day idle and it goes
+        # dormant. start() sends nothing until a circuit exists, so without this a crawl after a long outage waits
+        # forever. ACTIVE lifts dormancy; EXTENDCIRCUIT 0 builds a general circuit and opens no stream.
+        self.controller.signal(Signal.ACTIVE)
+        if self.is_ready():
+            return
+        try:
+            self.controller.new_circuit(await_build=False)
+        except stem.ControllerError as exc:
+            log.warning("tor %d: circuit request refused (%s), left to the ready wait", self.socks_port,
+                        type(exc).__name__)
 
     def is_ready(self) -> bool:
         return self.controller.get_info("status/circuit-established", "0") == "1"
@@ -74,6 +88,7 @@ class TorPool:
     async def start(self) -> None:
         for instance in self.instances:
             instance.connect()
+            instance.wake()
         deadline = time.monotonic() + READY_TIMEOUT
         waiting = list(self.instances)
         while waiting:
