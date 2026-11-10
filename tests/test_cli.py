@@ -13,7 +13,7 @@ from unittest import mock
 
 import stem
 
-from onioncollect import cli, crawl_cli, health, lifecycle
+from onioncollect import cli, crawl_cli, health, lifecycle, writer_ops
 from onioncollect.health_queue import HealthQueue
 from onioncollect.config import Settings
 from onioncollect.db import open_collect
@@ -226,6 +226,24 @@ class SourcesTest(CliTestCase):
         self.cli("sources", "disable", "news", "--reason", "re-run golive for a baseline")
         self.assertIn("approved again; run golive news", self.cli("sources", "reapprove", "news", "--note", "baseline"))
         self.assertEqual(self.table_do(lambda table: table.get("news"))["state"], lifecycle.APPROVED)
+
+
+    def test_note_appends_a_correction_and_only_the_analyst_command_can(self):
+        self.live_news()
+        original = self.table_do(lambda table: table.get("news"))["note"]
+        out = self.cli("sources", "note", "news", "--append", "the onion is the archive")
+        self.assertRegex(out, r"^news: correction \d{4}-\d\d-\d\d by \S+: the onion is the archive\n$")
+        note = self.table_do(lambda table: table.get("news"))["note"]
+        self.assertEqual(note, f"{original}\n{out.removeprefix('news: ').rstrip()}")
+        self.assertIn(note, json.loads(self.cli("sources", "export").splitlines()[0])["note"])
+        self.assertIn("no source nope", self.refused("sources", "note", "nope", "--append", "x"))
+        self.assertIn("needs its text", self.refused("sources", "note", "news", "--append", " "))
+        # Not a reader command and not a crawler one: it runs only for the user who owns the data dir.
+        args = cli.build_parser().parse_args(["--settings", "s", "sources", "note", "news", "--append", "x"])
+        self.assertEqual((args.crawl, args.reader), (False, False))
+        with self.assertRaises(SystemExit):
+            self.cli("sources", "note", "news")
+        self.assertFalse(any("note" in name for name in writer_ops.OPS))
 
 
 class SearchAndRetentionTest(CliTestCase):

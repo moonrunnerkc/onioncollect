@@ -165,6 +165,18 @@ class SourceTable:
         async with self.db.write() as db:
             await db.execute("UPDATE sources SET reviewer = ? WHERE id = ?", (reviewer, source_id))
 
+    async def append_note(self, source_id: str, text: str, reviewer: str) -> str:
+        """Adds a dated correction under a source's note and returns it. The note is extended inside the UPDATE
+        and never passes through this process, so what the reviewer wrote at approval cannot be rewritten."""
+        if not text.strip():
+            raise RefusedChange("a correction needs its text")
+        line = f"correction {self.clock():%Y-%m-%d} by {reviewer}: {' '.join(text.split())}"
+        async with self.db.write() as db:
+            if not await db.execute_fetchall(
+                    "UPDATE sources SET note = note || char(10) || ? WHERE id = ? RETURNING id", (line, source_id)):
+                raise RefusedChange(f"no source {source_id}")
+        return line
+
     async def members(self) -> dict[str, str]:
         rows = await self.db.rows("SELECT host, source_id FROM hosts WHERE state = ?", (MEMBER,))
         return {row["host"]: row["source_id"] for row in rows}

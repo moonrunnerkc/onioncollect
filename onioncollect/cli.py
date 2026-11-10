@@ -73,6 +73,10 @@ def build_parser() -> argparse.ArgumentParser:
     reapprove.add_argument("id")
     reapprove.add_argument("--note", required=True)
     reapprove.set_defaults(command=reapprove_command)
+    note = sources.add_parser("note", help="append a dated correction to a source's note, which is never rewritten")
+    note.add_argument("id")
+    note.add_argument("--append", required=True, metavar="TEXT")
+    note.set_defaults(command=note_command)
     merge = sources.add_parser("merge", help="fold a live source into its live twin: hosts, config entries, records")
     merge.add_argument("id")
     merge.add_argument("--into", required=True, metavar="ID")
@@ -193,6 +197,11 @@ def disable_command(settings: Settings, args: argparse.Namespace) -> None:
 def reapprove_command(settings: Settings, args: argparse.Namespace) -> None:
     with_stores(settings, lambda table, store: table.reapprove(args.id, args.note, operator()))
     print(f"{args.id} approved again; run golive {args.id}")
+
+
+def note_command(settings: Settings, args: argparse.Namespace) -> None:
+    line = with_stores(settings, lambda table, store: table.append_note(args.id, args.append, operator()))
+    print(f"{args.id}: {line}")
 
 
 def merge_command(settings: Settings, args: argparse.Namespace) -> None:

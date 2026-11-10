@@ -71,7 +71,7 @@ onioncollect/
   schema.py         CREATE TABLE and CREATE INDEX statements
   db.py             Database helper; the crawler's Frontier (its own state dir), Task and PageMetric
   sources.py        SourceTable: candidates, approve, mirror approve, fold and merge, decline, state changes,
-                    cluster ids, redirect evidence, active host, reapprove; PinnedHost
+                    cluster ids, redirect evidence, active host, reapprove, note corrections (append only); PinnedHost
   runs.py           RunLog: run totals, page metrics, per-field hits, uptime and probes, visited paths (writer side)
   health_queue.py   HealthQueue: items, dispositions, snoozes, run summaries and per-run metrics
   records.py        RecordStore: records, host sightings, cluster dedup and merge, FTS, snapshots and baselines,
