@@ -1,13 +1,17 @@
 """Leak test 3 analysis: every packet that left the guest must belong to a tor-owned connection.
 
 Usage (guest, as crawler): leak_analyze.py CAPTURE_TXT SS_SAMPLES FLOW_LOG LOCAL_IP PASSWORD_FILE ORCONN_SAMPLES
+       CONNTRACK_SAMPLES
 CAPTURE_TXT is `tcpdump -r cap.pcap -nn -q -tt` output. FLOW_LOG is the kernel's LOG --log-uid line for
 every new outbound flow from the pre-roll on. SS_SAMPLES is `ss -tanpeH` every second from the pre-roll on:
 every TCP socket in every state. A packet is credited by its exact connection (local address, local port,
 remote address, remote port) and by nothing less: the connection must have been owned by a Tor uid, and by
 no other uid, in the flow log or in any ss sample. ss names no owner for a socket its process has closed
 (FIN-WAIT-1 to TIME-WAIT, measured in the guest), so the owner a connection had while it was open is
-remembered for the packets that follow its close. A connection never seen with an owner fails.
+remembered for the packets that follow its close. CONNTRACK_SAMPLES is /proc/net/nf_conntrack every second:
+the kill switch marks a connection only on the SYN a Tor instance opens it with, and the entry outlives the
+socket, so a packet on a connection with that mark is credited even when its close was before the pre-roll.
+A connection with neither an owner nor the mark fails, and so does one any other uid ever owned, marked or not.
 ORCONN_SAMPLES (orconn_sample.py) is each Tor instance's own list of its relay connections. It names a relay,
 not a connection, so it credits nothing and only describes a failure. A window in which no packet left from
 a Tor UID fails: it saw no fetch, so it proves nothing about the fetcher.
@@ -25,6 +29,10 @@ SS_LINE = re.compile(r"(\S+)\s+\d+\s+\d+\s+(\S+):(\d+)\s+(\S+):(\d+)(?:\s|$)")
 # ss -e prints a socket's uid only when it is not root's, and no users at all once its process has closed it.
 SS_UID = re.compile(r"\buid:(\d+)")
 FLOW_LINE = re.compile(r"SRC=(\S+) DST=(\S+) .*?PROTO=\w+(?: SPT=(\d+) DPT=(\d+))?.*?UID=(\d+)")
+# The original direction of a TCP entry, which is the side that sent the SYN, and the entry's mark.
+CONNTRACK_LINE = re.compile(r"\btcp\b.*?\bsrc=(\S+) dst=(\S+) sport=(\d+) dport=(\d+) .*\bmark=(\d+)")
+# provision.sh's TOR_MARK: set only by a Tor instance's SYN on a new connection.
+TOR_MARK = 0x746f72
 DHCP_PORTS = {67, 68}
 # A connection: local address, local port, remote address, remote port.
 Connection = tuple[str, int | None, str, int | None]
@@ -90,6 +98,16 @@ def parse_flows(path: Path) -> dict[Connection, set[int]]:
     return flows
 
 
+def parse_marked(path: Path, local_ip: str) -> set[Connection]:
+    """The connections the guest opened whose conntrack entry carried the Tor mark in any sample."""
+    marked = set()
+    for line in path.read_text().splitlines():
+        match = CONNTRACK_LINE.search(line)
+        if match and match[1] == local_ip and int(match[5]) == TOR_MARK:
+            marked.add((match[1], int(match[3]), match[2], int(match[4])))
+    return marked
+
+
 def parse_orconns(path: Path) -> dict[tuple[str, int], set[int]]:
     owners: dict[tuple[str, int], set[int]] = {}
     for line in path.read_text().splitlines():
@@ -112,12 +130,13 @@ def consensus_relays(password_file: Path) -> set[tuple[str, int]]:
 
 
 def main(capture: Path, samples: Path, flow_log: Path, local_ip: str, password_file: Path,
-         orconn_samples: Path) -> int:
+         orconn_samples: Path, conntrack_samples: Path) -> int:
     tor = tor_uids()
     packets = parse_capture(capture, local_ip)
     owned, connected, unowned = parse_sockets(samples, local_ip)
     flows = parse_flows(flow_log)
     orconns = parse_orconns(orconn_samples)
+    marked = parse_marked(conntrack_samples, local_ip)
     relays = consensus_relays(password_file)
     subnet = ipaddress.ip_network(f"{local_ip}/24", strict=False)
 
@@ -126,8 +145,16 @@ def main(capture: Path, samples: Path, flow_log: Path, local_ip: str, password_f
     for (_, _, host, port), uids in non_tor.items():
         failures.append(f"socket to {host}:{port} owned by uid {sorted(uids - tor)}")
 
+    # Only a Tor instance's SYN may set the mark. A marked connection another uid was seen on means the rule
+    # marked a packet it must not, whether or not a packet of it reached the wire.
+    for connection in sorted(marked, key=str):
+        strangers = owner_uids(connection, flows, owned) - tor
+        if strangers:
+            failures.append(f"connection to {connection[2]}:{connection[3]} carries the Tor mark and uid"
+                            f" {sorted(strangers)} was on it")
+
     dhcp, ipv6, from_tor, attributed = 0, 0, 0, Counter()
-    after_close, never_owned, tor_names_relay = set(), 0, 0
+    after_close, by_mark, never_owned, tor_names_relay = set(), set(), 0, 0
     for packet in packets:
         host, port = packet["remote"]
         connection = packet["connection"]
@@ -139,10 +166,12 @@ def main(capture: Path, samples: Path, flow_log: Path, local_ip: str, password_f
             dhcp += 1
             continue
         uids = owner_uids(connection, flows, owned)
-        if uids and uids <= tor:
+        if uids <= tor and (uids or connection in marked):
             attributed[(host, port)] += 1
-            from_tor += packet["outbound"]
-            if connection in unowned:
+            from_tor += packet["outbound"] and bool(uids)
+            if not uids:
+                by_mark.add(connection)
+            elif connection in unowned:
                 after_close.add(connection)
         else:
             never_owned += not uids
@@ -165,7 +194,9 @@ def main(capture: Path, samples: Path, flow_log: Path, local_ip: str, password_f
     print(f"non-tor sockets seen by ss: {len(non_tor)}")
     print(f"connections ss saw: {len(owned)} with an owner, {len(set(unowned) - set(owned))} only without one")
     print(f"connections credited to the Tor uid that owned them before ss showed them closed: {len(after_close)}")
-    print(f"packets on a connection never seen with an owner: {never_owned}, "
+    print(f"connections carrying the kill switch's Tor mark: {len(marked)}, credited by the mark alone (no owner"
+          f" seen from the pre-roll on): {len(by_mark)}")
+    print(f"packets on a connection with no owner and no mark: {never_owned}, "
           f"of them to or from a relay Tor's own list names, which credits nothing: {tor_names_relay}")
     print(f"new flows logged by the kernel: {sum(len(u) for u in flows.values())}, "
           f"from tor UIDs: {sum(len(u & tor) for u in flows.values())}")
@@ -180,4 +211,4 @@ def main(capture: Path, samples: Path, flow_log: Path, local_ip: str, password_f
 
 if __name__ == "__main__":
     sys.exit(main(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], Path(sys.argv[5]),
-                  Path(sys.argv[6])))
+                  Path(sys.argv[6]), Path(sys.argv[7])))

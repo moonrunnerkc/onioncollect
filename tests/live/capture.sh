@@ -42,7 +42,11 @@ capture_start() {
     iptables -I "${LOG_RULE[@]:0:1}" 1 "${LOG_RULE[@]:1}"
     # Every TCP socket in every state. ss names an owner only while a process holds the socket, so a closing one
     # is credited by the owner an earlier sample saw on the same four-part address.
-    ( while :; do echo "sample $(date +%s)"; ss -tanpeH; sleep 1; done ) > "$WORK/ss.txt" &
+    # The same second's conntrack table goes beside it: an entry carries the kill switch's Tor mark only if a
+    # Tor instance's SYN opened it, and it outlives the socket, so it names the opener of a connection whose
+    # close was before the pre-roll.
+    ( while :; do cat /proc/net/nf_conntrack >> "$WORK/conntrack.txt"
+                  echo "sample $(date +%s)"; ss -tanpeH; sleep 1; done ) > "$WORK/ss.txt" &
     SAMPLER=$!
     # Each Tor instance's own list of its relay connections, to describe a packet nothing else owns. runuser is
     # started directly, not through as_crawler: a backgrounded function is a subshell, $! would name it, and
@@ -72,7 +76,8 @@ capture_stop() {
     kill -INT "$TCPDUMP" && wait "$TCPDUMP" 2>/dev/null
     TCPDUMP= SAMPLER= ORCONN=
     tcpdump -r "$WORK/cap.pcap" -nn -q -tt 2>/dev/null > "$WORK/cap.txt"
-    chmod 755 "$WORK" && chmod 644 "$WORK/cap.txt" "$WORK/ss.txt" "$WORK/flows.txt" "$WORK/orconn.txt"
+    chmod 755 "$WORK" && chmod 644 "$WORK/cap.txt" "$WORK/ss.txt" "$WORK/flows.txt" "$WORK/orconn.txt" \
+        "$WORK/conntrack.txt"
     echo "      capture closed after $(( $(date +%s) - STARTED ))s"
     echo "      Tor's own connection list: $(grep -c '^sample ' "$WORK/orconn.txt") samples, $ORCONN_RUN"
     echo "      kill switch DROP counter: $DROPS_BEFORE -> $DROPS_AFTER (blocked attempts never reach the wire)"
@@ -91,7 +96,7 @@ socks_peaks() {
 
 capture_judge() {
     if as_crawler "$PY" "$APP/tests/live/leak_analyze.py" "$WORK/cap.txt" "$WORK/ss.txt" "$WORK/flows.txt" \
-            "$LOCAL_IP" /home/crawler/control-password "$WORK/orconn.txt" | sed 's/^/      /'; then
+            "$LOCAL_IP" /home/crawler/control-password "$WORK/orconn.txt" "$WORK/conntrack.txt" | sed 's/^/      /'; then
         report "$1" pass
     else
         report "$1" fail

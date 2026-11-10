@@ -135,14 +135,59 @@ class KillSwitchRulesTest(unittest.TestCase):
             ":OUTPUT ACCEPT [0:0]",
             "-A OUTPUT -o lo -j ACCEPT",
             "-A OUTPUT -p tcp -m tcp --sport 22 -m conntrack --ctstate ESTABLISHED -j ACCEPT",
+            # Non-terminating: the SYN that opens a Tor instance's connection marks it, and falls through to the
+            # owner rule that accepts it.
+            *(f"-A OUTPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m conntrack --ctstate NEW"
+              f" -m owner --uid-owner _tor-crawl{n} -j CONNMARK --set-xmark 0x746f72/0xffffffff" for n in range(1, 7)),
             *(f"-A OUTPUT -m owner --uid-owner _tor-crawl{n} -j ACCEPT" for n in range(1, 7)),
             # The lease renewal, unicast to the gateway's subnet. Dropped, it fell back to a raw-socket broadcast
             # from 0.0.0.0:68 that iptables never sees and leak test 3 rightly flags.
             "-A OUTPUT -o eth0 -d 192.168.5.0/24 -p udp -m udp --sport 68 --dport 67"
             " -m owner --uid-owner systemd-network -j ACCEPT",
+            # The kernel's own packets for a connection Tor has closed: they have no owner, only the mark.
+            "-A OUTPUT -p tcp -m connmark --mark 0x746f72 -j ACCEPT",
             "-A OUTPUT -j DROP",
             "COMMIT",
         ])
+
+    def test_only_a_tor_instances_syn_on_a_new_connection_sets_the_mark(self):
+        rules = self.rules("192.168.5.0/24", "eth0")
+        setting = [rule for rule in rules if "CONNMARK" in rule or "--set-" in rule or "-j MARK" in rule]
+        self.assertEqual(len(setting), 6)
+        for n, rule in enumerate(setting, 1):
+            words = rule.split()
+            self.assertEqual(words[words.index("--uid-owner") + 1], f"_tor-crawl{n}")
+            for needed in ("-p tcp", "--tcp-flags FIN,SYN,RST,ACK SYN", "--ctstate NEW", "-m owner",
+                           "-j CONNMARK --set-xmark 0x746f72/0xffffffff"):
+                self.assertIn(needed, rule)
+            self.assertNotIn("ESTABLISHED", rule)
+            self.assertNotIn("RELATED", rule)
+        self.assertFalse([rule for rule in rules if "--restore-mark" in rule or "--save-mark" in rule])
+
+    def test_one_accept_reads_the_mark_after_the_owner_rules_and_right_before_the_drop(self):
+        rules = self.rules("192.168.5.0/24", "eth0")
+        reading = [rule for rule in rules if "-m connmark" in rule or "-m mark" in rule]
+        self.assertEqual(reading, ["-A OUTPUT -p tcp -m connmark --mark 0x746f72 -j ACCEPT"])
+        self.assertEqual(rules.index(reading[0]) + 1, rules.index("-A OUTPUT -j DROP"))
+        owners = [n for n, rule in enumerate(rules) if rule.endswith("-j ACCEPT") and "--uid-owner _tor-crawl" in rule]
+        marks = [n for n, rule in enumerate(rules) if "-j CONNMARK" in rule]
+        self.assertLess(max(marks), min(owners), "a mark rule after its owner ACCEPT would never run")
+        self.assertLess(max(owners), rules.index(reading[0]))
+        # No rule accepts by connection state but the SSH reply rule, and no UDP but the lease renewal.
+        self.assertEqual([rule for rule in rules if "ESTABLISHED" in rule or "RELATED" in rule],
+                         ["-A OUTPUT -p tcp -m tcp --sport 22 -m conntrack --ctstate ESTABLISHED -j ACCEPT"])
+        self.assertEqual(len([rule for rule in rules if "-p udp" in rule]), 1)
+        self.assertEqual(len([rule for rule in rules if rule.endswith("-j ACCEPT")]), 10)
+
+    def test_the_mark_is_the_one_the_leak_test_reads_and_ipv6_stays_closed(self):
+        from tests.live import leak_analyze
+        script = PROVISION.read_text()
+        self.assertEqual(script.count("\nTOR_MARK=0x746f72\n"), 1)
+        self.assertEqual(leak_analyze.TOR_MARK, 0x746f72)
+        self.assertIn("printf '*filter\\n:INPUT ACCEPT [0:0]\\n:FORWARD ACCEPT [0:0]\\n:OUTPUT DROP [0:0]\\nCOMMIT\\n'"
+                      " > /etc/iptables/rules.v6", script)
+        self.assertNotIn("ip6tables -A", script)
+        self.assertNotIn("ip6tables -I", script)
 
     def test_the_dhcp_rule_follows_the_guest_network(self):
         rules = self.rules("10.0.2.0/24", "enp0s1")
@@ -153,7 +198,7 @@ class KillSwitchRulesTest(unittest.TestCase):
         # A guest with no default route gets the spec's original kill switch, never a rule with an empty match.
         rules = self.rules("", "")
         self.assertFalse([rule for rule in rules if "systemd-network" in rule])
-        self.assertEqual(rules[-2:], ["-A OUTPUT -j DROP", "COMMIT"])
+        self.assertEqual(rules[-3:], ["-A OUTPUT -p tcp -m connmark --mark 0x746f72 -j ACCEPT", "-A OUTPUT -j DROP", "COMMIT"])
 
 
 if __name__ == "__main__":
