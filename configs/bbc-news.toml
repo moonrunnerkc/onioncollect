@@ -1,0 +1,21 @@
+id = "bbc-news"
+hosts = ["bbcnewsd73hkzno2ini43t4gblxvycyac5aw4gnv7t2rccijh7745uqd.onion"]
+category = "journalism-publishing"
+cadence = "6h"
+scheme = "https"
+seeds = ["/"]
+
+[listing]
+item = '[data-testid="anchor-inner-wrapper"]:has([data-testid="card-headline"])'
+
+[listing.fields]
+headline = '[data-testid="card-headline"]'
+summary = '[data-testid="card-description"]'
+link = "a@href"
+
+[expect]
+min_items_per_page = 10
+required_fields = ["headline", "link"]
+
+[auth]
+type = "none"

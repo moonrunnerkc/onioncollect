@@ -1,0 +1,20 @@
+id = "nytimes"
+hosts = ["nytimesn7cgmftshazwhfgzm37qxb44r64ytbb2dj3x62d2lljsciiyd.onion"]
+category = "journalism-publishing"
+cadence = "6h"
+scheme = "https"
+seeds = ["/"]
+
+[listing]
+item = "section.story-wrapper"
+
+[listing.fields]
+headline = "p.indicate-hover"
+link = "a@href"
+
+[expect]
+min_items_per_page = 10
+required_fields = ["headline", "link"]
+
+[auth]
+type = "none"

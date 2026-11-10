@@ -1,0 +1,22 @@
+# deb.debian.org's onion, the package archive: its release directories and when each last changed. No link field:
+# paths such as /debian/dists/Debian13.7/ put a capital letter beside the 56-character onion host, which the
+# detector reads as a token, and golive refuses a seed page with a redaction event.
+id = "debian"
+hosts = ["2s4yqjx5ul6okpp3f2gaunr2syex5jgbfpfvhxxbbjwnrsvbk5v3qbid.onion"]
+category = "software-infrastructure"
+cadence = "12h"
+seeds = ["/debian/dists/"]
+
+[listing]
+item = 'tr:has(img[alt="[DIR]"])'
+
+[listing.fields]
+release = "td a"
+last_modified = 'td[align="right"]'
+
+[expect]
+min_items_per_page = 10
+required_fields = ["release", "last_modified"]
+
+[auth]
+type = "none"
