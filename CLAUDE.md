@@ -42,6 +42,10 @@ Violating any of these is a bug, not a judgment call:
 
 If you touch fetcher.py, the torrc files, or the firewall, rerun the four Tor leak tests (`make leak-test`) before committing and before the next golive. testonion/torrc is the second VM's, not the crawler's, and is not covered by this rule.
 
+## Known limits
+
+- A hex-only token inside a URL path is not detected: `detect.tokens` judges a whole run of token characters, and with the slashes of the path in it the run is not all hex. A mixed-case token in a path or query is detected. Recorded 2026-11-10, not fixed.
+
 ## Stack
 
 Python 3.13 (Debian 13's system Python), asyncio, single process, single event loop. Five dependencies, no more without discussion: `httpx`, `httpx-socks`, `stem`, `selectolax`, `aiosqlite`. Collection configs are TOML read with the standard library's `tomllib`. SQLite in WAL mode with hand-written SQL and FTS5. No ORM, no web framework, no task queue.

@@ -71,6 +71,29 @@ class FindTest(unittest.TestCase):
         self.assertEqual(kinds("lowercase_words_joined_together_for_a_while"), [])
         self.assertEqual(kinds(AHMIA), [])
 
+    def test_an_onion_link_is_judged_without_its_host(self):
+        token = "sk_live_AbCdEf0123456789XyZaBcD"
+        bad_checksum = AHMIA[:10] + ("b" if AHMIA[10] != "b" else "c") + AHMIA[11:]
+        rows = [("short path with a capital", f"see http://{AHMIA}/Press/ now", False),
+                ("lowercase path", f"http://{AHMIA}/press/2026/", False),
+                ("www form with a capital", f"http://www.{AHMIA}/News", False),
+                ("upper case host", f"http://{AHMIA.upper()}/Press/1", False),
+                ("token in the path", f"http://{AHMIA}/{token}", True),
+                ("token in the query", f"http://{AHMIA}/q?key={token}", True),
+                ("token split around the host", f"sk_live_AbCdEf-{AHMIA}/0123456789XyZaBcD", True),
+                ("long mixed path", f"http://{AHMIA}/Archive/2026/Reports/Q3summary", True),
+                ("the same path, relative", "/Archive/2026/Reports/Q3summary", True),
+                ("bad checksum host with a capital", f"http://{bad_checksum}/Press/", True),
+                ("host inside a longer base32 run", f"Ab2{AHMIA}/Press/", True),
+                ("host run on into more letters", f"http://{AHMIA}X/Press/1", True),
+                ("bare token", token, True),
+                ("bare md5", "5f4dcc3b5aa765d61d8327deb882cf99", True)]
+        for name, text, trips in rows:
+            with self.subTest(name):
+                self.assertEqual([kind for kind, _, _ in kinds(text)], ["token"] if trips else [])
+        text = f"x //{AHMIA}/{token} y"
+        self.assertEqual(kinds(text)[0][1], f"//{AHMIA}/{token}", "the span is still the whole run")
+
     def test_overlaps_go_to_the_higher_priority_kind(self):
         self.assertEqual([k for k, _, _ in kinds("AbCdEf0123456789XyZaBcDbob@acme.com:pw")], ["email_password"])
 
@@ -85,7 +108,9 @@ class FindTest(unittest.TestCase):
 
     def test_hostile_bodies_stay_linear(self):
         bodies = ["a" * 2_000_000, "a@" * 1_000_000, ("a" * 63 + "@") * 31_000, "4" * 2_000_000,
-                  "ab@cd.ef:pw\n" * 160_000, "Ab1" * 700_000, "1-" * 1_000_000, ":" * 2_000_000]
+                  "ab@cd.ef:pw\n" * 160_000, "Ab1" * 700_000, "1-" * 1_000_000, ":" * 2_000_000,
+                  ".onion" * 333_000, ("A1" + AHMIA + "/") * 30_000, (AHMIA[:-6] + "a.onion/") * 30_000,
+                  "a" * 56 + ".onion" * 300_000]
         for body in bodies:
             started = time.perf_counter()
             find(body)

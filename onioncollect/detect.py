@@ -1,6 +1,8 @@
 import re
 from dataclasses import dataclass
 
+from onioncollect.onion import is_v3_onion
+
 LOCAL_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._%+-")
 MAX_LOCAL = 64
 DOMAIN = re.compile(r"[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}(?![A-Za-z0-9-])")
@@ -21,6 +23,11 @@ NATIONAL_IDS = (
 TOKEN_RUN = re.compile(r"[A-Za-z0-9_\-+/=.$]{24,}")
 HEX = re.compile(r"[0-9a-fA-F]{32,}")
 UPPER, LOWER, DIGIT = re.compile("[A-Z]"), re.compile("[a-z]"), re.compile("[0-9]")
+MIN_TOKEN = 24
+ONION_SUFFIX = ".onion"
+ONION_LABEL = 56
+BASE32 = frozenset("abcdefghijklmnopqrstuvwxyz234567")
+HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 
 
 @dataclass(frozen=True)
@@ -98,10 +105,28 @@ def national_ids(text: str) -> list[Span]:
 def tokens(text: str) -> list[Span]:
     found = []
     for m in TOKEN_RUN.finditer(text):
-        run = m.group()
-        if HEX.fullmatch(run) or (UPPER.search(run) and LOWER.search(run) and DIGIT.search(run)):
+        rest = without_onion_hosts(m.group())
+        if len(rest) >= MIN_TOKEN and (HEX.fullmatch(rest) or (UPPER.search(rest) and LOWER.search(rest)
+                                                              and DIGIT.search(rest))):
             found.append(Span(m.start(), m.end(), "token", m.end()))
     return found
+
+
+def without_onion_hosts(run: str) -> str:
+    # A link's onion host is 56 lowercase letters and digits, so one capital in its path made the whole link a
+    # token. Only a host that passes the v3 checksum and stands alone is taken out, and what is left is still
+    # judged. Anchored on each ".onion" and bounded to the label before it, as addresses() is on "@".
+    kept, cursor = [], 0
+    lowered = run.lower()
+    dot = lowered.find(ONION_SUFFIX)
+    while dot != -1:
+        start, end = dot - ONION_LABEL, dot + len(ONION_SUFFIX)
+        if (start >= cursor and (start == 0 or lowered[start - 1] not in BASE32)
+                and (end == len(run) or run[end] not in HOST_CHARS) and is_v3_onion(run[start:end])):
+            kept.append(run[cursor:start])
+            cursor = end
+        dot = lowered.find(ONION_SUFFIX, dot + 1)
+    return "".join(kept) + run[cursor:] if cursor else run
 
 
 def luhn_valid(candidate: str) -> bool:
