@@ -2,10 +2,15 @@
 
 Usage (guest, as crawler): leak_analyze.py CAPTURE_TXT SS_SAMPLES FLOW_LOG LOCAL_IP PASSWORD_FILE ORCONN_SAMPLES
 CAPTURE_TXT is `tcpdump -r cap.pcap -nn -q -tt` output. FLOW_LOG is the kernel's LOG --log-uid line for
-every new outbound flow during the window. SS_SAMPLES (repeated `ss -tnpeH state established`) covers
-connections Tor opened before the window started. ORCONN_SAMPLES (orconn_sample.py) is each Tor instance's own
-list of its relay connections, consulted only for an endpoint neither of the others saw. A window in which no
-packet left from a Tor UID fails: it saw no fetch, so it proves nothing about the fetcher.
+every new outbound flow from the pre-roll on. SS_SAMPLES is `ss -tanpeH` every second from the pre-roll on:
+every TCP socket in every state. A packet is credited by its exact connection (local address, local port,
+remote address, remote port) and by nothing less: the connection must have been owned by a Tor uid, and by
+no other uid, in the flow log or in any ss sample. ss names no owner for a socket its process has closed
+(FIN-WAIT-1 to TIME-WAIT, measured in the guest), so the owner a connection had while it was open is
+remembered for the packets that follow its close. A connection never seen with an owner fails.
+ORCONN_SAMPLES (orconn_sample.py) is each Tor instance's own list of its relay connections. It names a relay,
+not a connection, so it credits nothing and only describes a failure. A window in which no packet left from
+a Tor UID fails: it saw no fetch, so it proves nothing about the fetcher.
 """
 import ipaddress
 import pwd
@@ -16,11 +21,13 @@ from pathlib import Path
 
 from stem.control import Controller
 
-SS_LINE = re.compile(r"\S+\s+\S+\s+(\S+):(\d+)\s+(\S+):(\d+)\s+users:\(\(")
-# ss -e prints a socket's uid only when it is not root's.
+SS_LINE = re.compile(r"(\S+)\s+\d+\s+\d+\s+(\S+):(\d+)\s+(\S+):(\d+)(?:\s|$)")
+# ss -e prints a socket's uid only when it is not root's, and no users at all once its process has closed it.
 SS_UID = re.compile(r"\buid:(\d+)")
-FLOW_LINE = re.compile(r"DST=(\S+) .*?PROTO=(\w+)(?: SPT=\d+ DPT=(\d+))?.*?UID=(\d+)")
+FLOW_LINE = re.compile(r"SRC=(\S+) DST=(\S+) .*?PROTO=\w+(?: SPT=(\d+) DPT=(\d+))?.*?UID=(\d+)")
 DHCP_PORTS = {67, 68}
+# A connection: local address, local port, remote address, remote port.
+Connection = tuple[str, int | None, str, int | None]
 
 
 def tor_uids() -> set[int]:
@@ -43,30 +50,43 @@ def parse_capture(path: Path, local_ip: str):
             continue
         src, dst = split_endpoint(parts[2]), split_endpoint(parts[4])
         outbound = src[0] == local_ip
-        remote = dst if outbound else src
+        local, remote = (src, dst) if outbound else (dst, src)
         protocol = parts[5].rstrip(",").lower() if len(parts) > 5 else "?"
-        packets.append({"family": parts[1], "outbound": outbound, "remote": remote, "protocol": protocol})
+        packets.append({"family": parts[1], "outbound": outbound, "remote": remote, "protocol": protocol,
+                        "connection": (*local, *remote)})
     return packets
 
 
-def parse_sockets(path: Path, local_ip: str) -> dict[tuple[str, int], set[int]]:
-    owners: dict[tuple[str, int], set[int]] = {}
+def parse_sockets(path: Path, local_ip: str):
+    """What ss saw of each connection from the guest's address: the uids that ever owned it, whether an owner
+    held it past SYN-SENT, and the states it showed with no owner."""
+    owned: dict[Connection, set[int]] = {}
+    connected: set[Connection] = set()
+    unowned: dict[Connection, set[str]] = {}
     for line in path.read_text().splitlines():
         match = SS_LINE.match(line.strip())
-        if not match or match[1] != local_ip:
+        if not match or match[2] != local_ip:
             continue
+        connection = (match[2], int(match[3]), match[4], int(match[5]))
         uid = SS_UID.search(line)
-        owners.setdefault((match[3], int(match[4])), set()).add(int(uid[1]) if uid else 0)
-    return owners
+        if not uid and "users:((" not in line:
+            unowned.setdefault(connection, set()).add(match[1])
+            continue
+        owned.setdefault(connection, set()).add(int(uid[1]) if uid else 0)
+        # A SYN the kill switch dropped is an attempt, not a connection: test 1 makes two on purpose.
+        if match[1] != "SYN-SENT":
+            connected.add(connection)
+    return owned, connected, unowned
 
 
-def parse_flows(path: Path) -> dict[tuple[str, int | None], set[int]]:
-    flows: dict[tuple[str, int | None], set[int]] = {}
+def parse_flows(path: Path) -> dict[Connection, set[int]]:
+    flows: dict[Connection, set[int]] = {}
     for line in path.read_text().splitlines():
         match = FLOW_LINE.search(line)
         if match:
-            dst, _, port, uid = match.groups()
-            flows.setdefault((dst, int(port) if port else None), set()).add(int(uid))
+            src, dst, sport, dport, uid = match.groups()
+            connection = (src, int(sport) if sport else None, dst, int(dport) if dport else None)
+            flows.setdefault(connection, set()).add(int(uid))
     return flows
 
 
@@ -79,10 +99,10 @@ def parse_orconns(path: Path) -> dict[tuple[str, int], set[int]]:
     return owners
 
 
-def owner_uids(endpoint, flows: dict, owners: dict, orconns: dict) -> set[int] | None:
-    # The kernel's log decides a flow opened in the window, ss one open across a sample, and Tor's own list only
-    # one neither saw, such as a connection to a guard opened before the window that never sampled as established.
-    return flows.get(endpoint) or owners.get(endpoint) or orconns.get(endpoint)
+def owner_uids(connection: Connection, flows: dict, owned: dict) -> set[int]:
+    # Every uid either witness ever saw on this exact connection. One that is not Tor's spoils it, whenever it
+    # was seen, so a port a Tor instance used and another user then reused is never credited.
+    return flows.get(connection, set()) | owned.get(connection, set())
 
 
 def consensus_relays(password_file: Path) -> set[tuple[str, int]]:
@@ -95,20 +115,22 @@ def main(capture: Path, samples: Path, flow_log: Path, local_ip: str, password_f
          orconn_samples: Path) -> int:
     tor = tor_uids()
     packets = parse_capture(capture, local_ip)
-    owners = parse_sockets(samples, local_ip)
+    owned, connected, unowned = parse_sockets(samples, local_ip)
     flows = parse_flows(flow_log)
     orconns = parse_orconns(orconn_samples)
     relays = consensus_relays(password_file)
     subnet = ipaddress.ip_network(f"{local_ip}/24", strict=False)
 
     failures = []
-    non_tor = {endpoint: uids for endpoint, uids in owners.items() if not uids <= tor}
-    for endpoint, uids in non_tor.items():
-        failures.append(f"socket to {endpoint[0]}:{endpoint[1]} owned by uid {sorted(uids - tor)}")
+    non_tor = {connection: owned[connection] for connection in connected if not owned[connection] <= tor}
+    for (_, _, host, port), uids in non_tor.items():
+        failures.append(f"socket to {host}:{port} owned by uid {sorted(uids - tor)}")
 
-    dhcp, ipv6, from_tor, attributed, by_tor_list = 0, 0, 0, Counter(), set()
+    dhcp, ipv6, from_tor, attributed = 0, 0, 0, Counter()
+    after_close, never_owned, tor_names_relay = set(), 0, 0
     for packet in packets:
         host, port = packet["remote"]
+        connection = packet["connection"]
         if packet["family"] == "IP6":
             ipv6 += 1
             failures.append(f"IPv6 packet to/from {host}")
@@ -116,17 +138,20 @@ def main(capture: Path, samples: Path, flow_log: Path, local_ip: str, password_f
         if port in DHCP_PORTS and ipaddress.ip_address(host) in subnet:
             dhcp += 1
             continue
-        uids = owner_uids((host, port), flows, owners, orconns)
+        uids = owner_uids(connection, flows, owned)
         if uids and uids <= tor:
             attributed[(host, port)] += 1
             from_tor += packet["outbound"]
-            if (host, port) not in flows and (host, port) not in owners:
-                by_tor_list.add((host, port))
+            if connection in unowned:
+                after_close.add(connection)
         else:
+            never_owned += not uids
+            tor_names_relay += bool(orconns.get((host, port), set()) & tor)
             failures.append(f"{packet['protocol']} packet {'to' if packet['outbound'] else 'from'} {host}:{port} not on a tor socket")
 
-    on_wire = {packet["remote"] for packet in packets}
-    blocked = {(dst, uid) for dst, uids in flows.items() for uid in uids - tor if dst not in on_wire}
+    on_wire = {packet["connection"] for packet in packets}
+    blocked = {(connection[2:], uid) for connection, uids in flows.items() for uid in uids - tor
+               if connection not in on_wire}
     endpoints = set(attributed)
     in_consensus = endpoints & relays
     outbound = sum(1 for p in packets if p["outbound"])
@@ -138,7 +163,10 @@ def main(capture: Path, samples: Path, flow_log: Path, local_ip: str, password_f
     print(f"protocols: {dict(Counter(p['protocol'] for p in packets))}")
     print(f"DHCP to local gateway: {dhcp}, IPv6: {ipv6}")
     print(f"non-tor sockets seen by ss: {len(non_tor)}")
-    print(f"endpoints only Tor's own connection list names: {len(by_tor_list)}")
+    print(f"connections ss saw: {len(owned)} with an owner, {len(set(unowned) - set(owned))} only without one")
+    print(f"connections credited to the Tor uid that owned them before ss showed them closed: {len(after_close)}")
+    print(f"packets on a connection never seen with an owner: {never_owned}, "
+          f"of them to or from a relay Tor's own list names, which credits nothing: {tor_names_relay}")
     print(f"new flows logged by the kernel: {sum(len(u) for u in flows.values())}, "
           f"from tor UIDs: {sum(len(u & tor) for u in flows.values())}")
     for (dst, port), uid in sorted(blocked, key=str):

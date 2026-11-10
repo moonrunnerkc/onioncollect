@@ -4,9 +4,12 @@ APP=/home/crawler/app
 PY=/home/crawler/venv/bin/python
 WORK=$(mktemp -d)
 FAILED=0
-# Non-terminating rule, present only for the capture window: the kernel logs the owning UID of every
-# new outbound flow, so attribution never depends on catching a short-lived socket with ss.
+# Non-terminating rule, present only from the pre-roll to the end of the window: the kernel logs the owning UID
+# of every new outbound flow, so attribution never depends on catching a short-lived socket with ss.
 LOG_RULE=(OUTPUT ! -o lo -m conntrack --ctstate NEW -j LOG --log-prefix "onioncrawl-lt3: " --log-uid)
+# The witnesses run this long before the capture opens, so a connection Tor closes in the window's first
+# moments was seen with its owner first.
+PREROLL=5
 capture_cleanup() {
     # A run that stops before capture_stop leaves no capture or sampler behind; capture_stop clears these pids.
     [ -z "${TCPDUMP:-}${SAMPLER:-}${ORCONN:-}" ] || kill ${TCPDUMP:-} ${SAMPLER:-} ${ORCONN:-} 2>/dev/null
@@ -34,18 +37,22 @@ captured() { tcpdump -r "$WORK/cap.pcap" -nn "$1" 2>/dev/null | wc -l; }
 capture_start() {
     DEV=$(ip route show default | awk '{print $5; exit}')
     LOCAL_IP=$(ip -4 -o addr show dev "$DEV" | awk '{split($4, a, "/"); print a[1]; exit}')
-    echo "capture: tcpdump -i $DEV 'not port 22' for $1, guest address $LOCAL_IP"
-    tcpdump -i "$DEV" -nn -Z root -w "$WORK/cap.pcap" 'not port 22' 2>"$WORK/tcpdump.err" &
-    TCPDUMP=$!
-    ( while :; do echo "sample $(date +%s)"; ss -tnpeH state established; sleep 1; done ) > "$WORK/ss.txt" &
+    echo "capture: tcpdump -i $DEV 'not port 22' for $1, guest address $LOCAL_IP, witnesses ${PREROLL}s ahead"
+    WITNESSES_FROM=$(date +%s)
+    iptables -I "${LOG_RULE[@]:0:1}" 1 "${LOG_RULE[@]:1}"
+    # Every TCP socket in every state. ss names an owner only while a process holds the socket, so a closing one
+    # is credited by the owner an earlier sample saw on the same four-part address.
+    ( while :; do echo "sample $(date +%s)"; ss -tanpeH; sleep 1; done ) > "$WORK/ss.txt" &
     SAMPLER=$!
-    # Each Tor instance's own list of its relay connections, for one the flow log and ss both miss. runuser is
+    # Each Tor instance's own list of its relay connections, to describe a packet nothing else owns. runuser is
     # started directly, not through as_crawler: a backgrounded function is a subshell, $! would name it, and
     # killing it would leave runuser and the sampler running. A kill of runuser reaches the sampler.
     runuser -u crawler -- env HOME=/home/crawler "$PY" -I "$APP/tests/live/orconn_sample.py" \
         /home/crawler/control-password > "$WORK/orconn.txt" 2>"$WORK/orconn.err" &
     ORCONN=$!
-    iptables -I "${LOG_RULE[@]:0:1}" 1 "${LOG_RULE[@]:1}"
+    sleep "$PREROLL"
+    tcpdump -i "$DEV" -nn -Z root -w "$WORK/cap.pcap" 'not port 22' 2>"$WORK/tcpdump.err" &
+    TCPDUMP=$!
     sleep 2
     STARTED=$(date +%s)
     DROPS_BEFORE=$(drop_count)
@@ -54,7 +61,7 @@ capture_start() {
 capture_stop() {
     DROPS_AFTER=$(drop_count)
     iptables -D "${LOG_RULE[@]}"
-    journalctl -k --since "@$((STARTED - 2))" -o cat --no-pager | grep "onioncrawl-lt3: " > "$WORK/flows.txt"
+    journalctl -k --since "@$WITNESSES_FROM" -o cat --no-pager | grep "onioncrawl-lt3: " > "$WORK/flows.txt"
     if kill -0 "$ORCONN" 2>/dev/null; then
         ORCONN_RUN="sampled the whole window"
     else
@@ -77,7 +84,7 @@ capture_stop() {
 # connection is one Tor stream, so the peak per port is the most streams that instance carried for us.
 socks_peaks() {
     awk '/^sample / { for (port in now) { if (now[port] > peak[port]) peak[port] = now[port] }; delete now; next }
-         $4 ~ /^127\.0\.0\.1:100[0-9][0-9]$/ && $5 ~ /python/ { split($4, a, ":"); now[a[2]]++ }
+         $1 == "ESTAB" && $5 ~ /^127\.0\.0\.1:100[0-9][0-9]$/ && $6 ~ /python/ { split($5, a, ":"); now[a[2]]++ }
          END { for (port in now) { if (now[port] > peak[port]) peak[port] = now[port] }
                for (port in peak) print port, peak[port] }' "$WORK/ss.txt" | sort
 }

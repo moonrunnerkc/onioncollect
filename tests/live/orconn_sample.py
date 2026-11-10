@@ -1,10 +1,10 @@
-"""Leak test 3's third witness: each Tor instance's own list of its relay connections, sampled every second.
+"""Leak test 3's describing witness: each Tor instance's own list of its relay connections, sampled every second.
 
 Usage (guest, as crawler): orconn_sample.py PASSWORD_FILE > ORCONN_SAMPLES
-A connection Tor opened before the capture window has no line in the kernel's flow log, and ss samples only
-established sockets, so one that never shows as established while the window is open has no owner on either.
-Tor still lists it. Each line is `UID ADDRESS PORT`: the instance's uid and the relay's address and ORPort,
-from the consensus. A relay the consensus does not name is left out, so its packets stay unattributed.
+Tor names a relay here, not a connection, so leak_analyze.py credits no packet by it. When a packet has no
+owner, the list says whether a Tor instance held a connection to that relay during the window, which tells a
+late packet on a connection closed before the pre-roll from traffic Tor knows nothing about. Each line is
+`UID ADDRESS PORT`: the instance's uid and the relay's address and ORPort, from the consensus.
 """
 import os
 import pwd
