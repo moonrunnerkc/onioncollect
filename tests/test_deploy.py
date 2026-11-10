@@ -136,6 +136,12 @@ class UnitFilesTest(unittest.TestCase):
         self.assertEqual((service["SocketBindAllow"], service["SocketBindDeny"]), (f"tcp:{ui.PORT}", "any"))
         self.assertEqual(service["RestrictAddressFamilies"], "AF_INET AF_UNIX")
 
+    def test_the_crawl_may_bind_no_port(self):
+        service = unit("onioncollect-crawl.service")["Service"]
+        self.assertEqual(service["SocketBindDeny"], "any")
+        self.assertNotIn("SocketBindAllow", service)
+        self.assertEqual(service["RestrictAddressFamilies"], "AF_INET AF_UNIX")
+
     def test_the_ui_starts_from_its_own_entry_point_and_never_through_the_cli(self):
         for path in sorted(UNITS.glob("*.service")):
             command = unit(path.name)["Service"]["ExecStart"].split()

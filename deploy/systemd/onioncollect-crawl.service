@@ -38,6 +38,8 @@ LockPersonality=yes
 SystemCallArchitectures=native
 CapabilityBoundingSet=
 # Tor's SOCKS and control ports are on 127.0.0.1 and the writer is a unix socket; nothing else is reachable.
+# The crawl only connects: Tor and the writer run in their own units, so it may bind no port.
 RestrictAddressFamilies=AF_INET AF_UNIX
 IPAddressDeny=any
 IPAddressAllow=localhost
+SocketBindDeny=any
