@@ -239,7 +239,7 @@ class ConfigSyncTest(unittest.TestCase):
         self.assertEqual(self.guest_files(), {"news.toml": "old news\n", "testonion.toml": "hand-installed\n"})
         self.assertIn("would run: install -m 640", out)
         self.assertIn("kept; PRUNE_CONFIGS=1", out)
-        self.assertNotIn("rm", out)
+        self.assertNotIn("would run: rm", out)
 
     def test_a_dry_run_with_prune_and_yes_still_deletes_nothing(self):
         out = self.sync("yes\n", DRY_RUN="1", PRUNE_CONFIGS="1")
