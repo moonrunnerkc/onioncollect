@@ -69,6 +69,30 @@ class AddTest(RecordStoreTestCase):
         self.assertEqual(json.loads(row["hashes"]), list(summary.hashes))
 
 
+class OnionLinkTest(RecordStoreTestCase):
+    """The redaction gate and the store's own detector are one detect.find, so they agree on a link."""
+
+    async def test_a_link_with_a_capital_in_its_path_passes_both(self):
+        link = f"http://{NEWS}/Press/"
+        done = redact.redact(f"read {link} today", SALT)
+        self.assertEqual((done.text, done.events), (f"read {link} today", 0))
+        self.assertTrue(await self.add(fields=record(url=link)))
+        await self.store.save_snapshot("news", "/", "listing", f'<a href="{link}">Press</a>')
+        self.assertEqual(len(await self.rows("SELECT * FROM records")), 1)
+        self.assertEqual(len(await self.rows("SELECT * FROM snapshots")), 1)
+
+    async def test_a_token_in_a_link_trips_both(self):
+        link = f"http://{NEWS}/reset/sk_live_AbCdEf0123456789XyZaBcD"
+        done = redact.redact(link, SALT)
+        self.assertEqual((done.text, done.counts, done.events), ("http:[token]", {"token": 1}, 1))
+        with self.assertRaises(RefusedWrite):
+            await self.add(fields=record(url=link))
+        with self.assertRaises(RefusedWrite):
+            await self.store.save_snapshot("news", "/", "listing", f'<a href="{link}">reset</a>')
+        self.assertEqual(await self.rows("SELECT * FROM records"), [])
+        self.assertEqual(await self.rows("SELECT * FROM snapshots"), [])
+
+
 class DetailAndSearchTest(RecordStoreTestCase):
     async def test_detail_merges_by_follow_path_and_reaches_the_index(self):
         await self.add()

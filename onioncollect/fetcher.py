@@ -151,13 +151,17 @@ class Fetcher:
 
     async def _get(self, result: FetchResult, url: str) -> None:
         client = await self._client_for(result.host)
+        config = self.configs[result.source_id]
         try:
-            async with client.stream("GET", url, headers=self._session_for(result)) as response:
+            # result.host and result.url stay the bare address: only the request line carries a reviewed prefix.
+            asked = onion.with_label(url, config.host_prefix)
+            async with client.stream("GET", asked, headers=self._session_for(result)) as response:
                 result.status = response.status_code
                 result.headers = dict(response.headers)
                 if response.status_code in REDIRECT_CODES:
                     # Recorded, never followed. The crawler decides where the target belongs.
-                    result.redirect_to = onion.normalize(urljoin(url, response.headers.get("location", "")))
+                    target = urljoin(url, response.headers.get("location", ""))
+                    result.redirect_to = onion.normalize(onion.without_label(target, config.host_prefix, config.hosts))
                     result.error = "redirect"
                     return
                 if not response.headers.get("content-type", "").lower().startswith(TEXT_TYPES):

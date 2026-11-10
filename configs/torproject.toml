@@ -1,0 +1,21 @@
+id = "torproject"
+hosts = ["2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion"]
+category = "software-infrastructure"
+cadence = "1d"
+seeds = ["/press/page/2/"]
+
+[listing]
+item = "tbody tr"
+
+[listing.fields]
+date = "th"
+publication = "td"
+headline = "td a"
+link = "td a@href"
+
+[expect]
+min_items_per_page = 5
+required_fields = ["date", "headline"]
+
+[auth]
+type = "none"

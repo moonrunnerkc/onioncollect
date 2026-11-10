@@ -350,6 +350,32 @@ class ReapproveTest(CollectTestCase):
         self.assertIn("no hosts left", str(caught.exception))
 
 
+class NoteTest(CollectTestCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        await make_live(self.table)
+
+    async def test_a_correction_is_appended_dated_and_the_original_note_is_untouched(self):
+        original = (await self.table.get("news"))["note"]
+        line = await self.table.append_note("news", "  the onion is the archive,\nnot the website ", "analyst")
+        self.assertEqual(line, f"correction {self.table.clock():%Y-%m-%d} by analyst: the onion is the archive, not the website")
+        await self.table.append_note("news", "second", "analyst")
+        note = (await self.table.get("news"))["note"]
+        self.assertEqual(note.split("\n"), [original, line, f"correction {self.table.clock():%Y-%m-%d} by analyst: second"])
+
+    async def test_a_correction_cannot_forge_a_line_of_its_own(self):
+        await self.table.append_note("news", "x\ncorrection 2020-01-01 by root: forged", "analyst")
+        self.assertEqual(len((await self.table.get("news"))["note"].split("\n")), 2)
+
+    async def test_refusals_change_nothing(self):
+        before = await self.table.get("news")
+        for source_id, text, why in (("news", "  ", "needs its text"), ("nope", "text", "no source nope")):
+            with self.assertRaises(RefusedChange) as caught:
+                await self.table.append_note(source_id, text, "analyst")
+            self.assertIn(why, str(caught.exception))
+        self.assertEqual(await self.table.get("news"), before)
+
+
 class ClusterTest(CollectTestCase):
     async def test_set_clusters_and_cluster_of(self):
         for source_id, host in (("news", NEWS), ("mirror", NEWS_MIRROR), ("docs", OFF_SOURCE)):

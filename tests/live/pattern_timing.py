@@ -44,6 +44,7 @@ UNITS = {
     "letters": "a", "digits": "4", "spaces": " ", "newlines": "\n", "dots": "a.", "tags": "<p>", "br": "<br>",
     "digit groups": "4444 ", "dashed cards": "4111-1111-1111-1112 ", "card runs": "4111111111111112 ",
     "emails": "a@b.cc:", "two entries": "ab@cd.ef:pw\nab@cd.ef:pw\n\n", "near hash": "abcd:" + "f" * 31 + "\n",
+    "onion suffixes": ".onion", "onion links": "A1" + TIMING_HOST + "/", "near onions": "a" * 56 + ".onion/",
     "html words": "<p>hello world</p>", "distinct words": None, "tags under cap": None,
 }
 

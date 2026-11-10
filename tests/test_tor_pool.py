@@ -7,6 +7,7 @@ from stem import Signal
 from onioncollect import tor_pool
 from onioncollect.tor_pool import TorInstance, TorPool
 from tests.fixtures import throwaway_settings
+from tests.live import log_audit
 
 
 def fake_controller(ready="1", newnym_available=True, newnym_wait=0.0):
@@ -29,6 +30,41 @@ class TorInstanceTest(unittest.IsolatedAsyncioTestCase):
             TorInstance(10051, 11051, "secret").connect()
         from_port.assert_called_once_with(address="127.0.0.1", port=11051)
         controller.authenticate.assert_called_once_with(password="secret")
+
+    def test_connect_changes_nothing_in_tor(self):
+        # `crawl status` connects only to read; waking or building belongs to start().
+        controller = fake_controller()
+        with mock.patch.object(tor_pool.Controller, "from_port", return_value=controller):
+            TorInstance(10051, 11051, "secret").connect()
+        controller.signal.assert_not_called()
+        controller.new_circuit.assert_not_called()
+
+    def test_wake_asks_an_idle_instance_for_a_circuit(self):
+        # An hour idle and Tor drops its circuits and builds none until asked; start() sends nothing until one
+        # exists. ACTIVE lifts the 24 h dormancy, and an EXTENDCIRCUIT 0 (a circuit, no stream) breaks the wait.
+        instance = TorInstance(10051, 11051, "pw")
+        instance.controller = fake_controller(ready="0")
+        instance.wake()
+        self.assertEqual(instance.controller.method_calls[0], mock.call.signal(Signal.ACTIVE))
+        instance.controller.new_circuit.assert_called_once_with(await_build=False)
+
+    def test_wake_builds_nothing_when_a_circuit_is_up(self):
+        instance = TorInstance(10051, 11051, "pw")
+        instance.controller = fake_controller(ready="1")
+        instance.wake()
+        instance.controller.signal.assert_called_once_with(Signal.ACTIVE)
+        instance.controller.new_circuit.assert_not_called()
+
+    def test_a_refused_wake_is_left_to_the_ready_wait(self):
+        instance = TorInstance(10051, 11051, "pw")
+        instance.controller = fake_controller(ready="0")
+        instance.controller.new_circuit.side_effect = tor_pool.stem.ControllerError("no path")
+        with self.assertLogs("onioncollect.tor_pool", "WARNING") as logs:
+            instance.wake()
+        self.assertIn("10051", logs.output[0])
+        # The log audit fails a crawl log with a line of unknown shape.
+        message = logs.output[0].split(":", 2)[2]
+        self.assertTrue(any(shape.fullmatch(message) for shape in log_audit.SHAPES.values()), message)
 
     def test_is_ready_reads_circuit_established(self):
         instance = TorInstance(10051, 11051, "pw")
@@ -80,6 +116,14 @@ class TorPoolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([instance.socks_port for instance in pool.instances], [10051, 10053])
         controllers[1].close.assert_called_once()
         self.assertIn("10052", logs.output[0])
+
+    async def test_start_wakes_every_instance(self):
+        pool = TorPool(settings(instances=2))
+        controllers = [fake_controller("1"), fake_controller("1")]
+        with mock.patch.object(tor_pool.Controller, "from_port", side_effect=controllers):
+            await pool.start()
+        for controller in controllers:
+            controller.signal.assert_called_once_with(Signal.ACTIVE)
 
     async def test_start_waits_for_slow_instance(self):
         pool = TorPool(settings(instances=1))

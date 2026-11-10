@@ -37,12 +37,30 @@ def normalize(url: str) -> str | None:
     return urlunsplit((scheme, netloc, parts.path or "/", parts.query, ""))
 
 
+def with_label(url: str, label: str | None) -> str:
+    """A normalized URL with label put before its host: how a site that answers only under that name is asked."""
+    return url.replace("://", f"://{label}.", 1) if label else url
+
+
+def without_label(url: str, label: str | None, hosts: tuple[str, ...]) -> str:
+    """The URL with label taken off its host, only when what is left is one of hosts. Anything else comes back
+    as it was, for normalize to refuse: a label never makes another address, or a deeper name, the source's."""
+    try:
+        parts = urlsplit(url.strip())
+        port = parts.port
+    except ValueError:
+        return url
+    first, _, rest = (parts.hostname or "").lower().partition(".")
+    if not label or first != label or rest not in hosts:
+        return url
+    return urlunsplit(parts._replace(netloc=rest if port is None else f"{rest}:{port}"))
+
+
 def host_of(url: str) -> str:
     try:
         return (urlsplit(url).hostname or "").lower()
     except ValueError:
         return ""
-
 
 
 def find_onions_in_text(text: str) -> set[str]:

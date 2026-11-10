@@ -15,8 +15,12 @@ MAX_PAGES = 50
 ATTRIBUTE = re.compile(r"[A-Za-z_:][-A-Za-z0-9_:.]*")
 FIELD_NAME = re.compile(r"[a-z_][a-z0-9_]{0,31}")
 LINK_ATTRIBUTES = ("href", "src")
-TOP_KEYS = {"id", "hosts", "category", "cadence", "scheme", "seeds", "pagination", "listing", "detail", "expect", "auth"}
+TOP_KEYS = {"id", "hosts", "category", "cadence", "scheme", "seeds", "pagination", "listing", "detail", "expect", "auth",
+            "host_prefix"}
 REQUIRED = ("id", "hosts", "category", "cadence", "seeds", "listing", "expect", "auth")
+# The one name a source's site may be asked under instead of its bare address. The host set, approval, exclusions
+# and circuit isolation never see it.
+HOST_PREFIX = "www"
 PROBE = LexborHTMLParser("<html><body></body></html>")
 HOSTS_ARRAY = re.compile(r"^hosts\s*=\s*\[[^\]]*\]", re.MULTILINE)
 # Section 15. The one source that may log in: the self-hosted onion the operator owns. A constant in code, so
@@ -68,10 +72,11 @@ class SourceConfig:
     min_items_per_page: int
     required_fields: tuple[str, ...]
     auth: FormSession | None = None
+    host_prefix: str | None = None
 
     def path_for(self, url: str) -> str | None:
         """The path of a URL on one of this source's hosts, or None for anything else."""
-        normalized = onion.normalize(url)
+        normalized = onion.normalize(onion.without_label(url, self.host_prefix, self.hosts))
         if normalized is None or onion.host_of(normalized) not in self.hosts:
             return None
         return onion.path_of(normalized)
@@ -97,6 +102,9 @@ def parse(text: str, expected_id: str) -> SourceConfig:
     if scheme not in SCHEMES:
         raise ConfigError(f"scheme must be one of {', '.join(SCHEMES)}")
     auth = parse_auth(raw["auth"], raw["id"], scheme, hosts)
+    prefix = raw.get("host_prefix")
+    if "host_prefix" in raw and (prefix != HOST_PREFIX or auth is not None):
+        raise ConfigError(f'host_prefix can only be "{HOST_PREFIX}", and never on a form-session source')
 
     listing = table(raw, "listing", {"item", "fields"})
     if "item" not in listing or "fields" not in listing:
@@ -124,7 +132,7 @@ def parse(text: str, expected_id: str) -> SourceConfig:
         seeds=parse_seeds(raw["seeds"], scheme, hosts), next_page=link_selector(pagination, "next"),
         max_pages=parse_max_pages(pagination), item=item, fields=fields, follow=follow,
         detail_fields=parse_fields(detail["fields"], "detail.fields") if detail else {},
-        min_items_per_page=minimum, required_fields=tuple(required), auth=auth,
+        min_items_per_page=minimum, required_fields=tuple(required), auth=auth, host_prefix=prefix,
     )
 
 

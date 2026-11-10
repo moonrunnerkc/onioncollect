@@ -4,12 +4,12 @@ import os
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-from onioncollect import config_cli, crawl_cli, health, health_cli, lifecycle, matching, mirrors, source_config
+from onioncollect import config_cli, crawl_cli, health, health_cli, lifecycle, matching, mirrors, source_config, triage_cli
 from onioncollect.config import Settings, config_path, write_config
 from onioncollect.health_queue import HealthQueue
 from onioncollect.records import RecordStore
 from onioncollect.source_config import ConfigError
-from onioncollect.sources import RefusedChange, SourceTable, approvable
+from onioncollect.sources import RefusedChange, SourceTable
 from onioncollect.stores import operator, reading, with_records, with_stores
 
 def main(argv: list[str] | None = None) -> None:
@@ -42,23 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--settings", type=Path, required=True, help="path to settings.toml")
     commands = parser.add_subparsers(required=True)
 
-    triage = commands.add_parser("triage", help="work the candidate queue").add_subparsers(required=True)
-    triage.add_parser("list", help="candidates by age, with where each was found").set_defaults(
-        command=candidates_command, reader=True)
-    approve = triage.add_parser("approve", help="approve a host as a new source and scaffold its config, or as a"
-                                                " mirror of an existing source")
-    approve.add_argument("host")
-    target = approve.add_mutually_exclusive_group(required=True)
-    target.add_argument("--as", dest="id", help="the new source id")
-    target.add_argument("--as-mirror-of", dest="mirror_of", metavar="ID",
-                        help="add the host to this source's host set and config; the source keeps its state")
-    approve.add_argument("--category", choices=lifecycle.CATEGORIES, help="required for a new source")
-    approve.add_argument("--note", required=True)
-    approve.set_defaults(command=approve_command)
-    decline = triage.add_parser("decline", help="decline a host, with the policy reason")
-    decline.add_argument("host")
-    decline.add_argument("--reason", required=True)
-    decline.set_defaults(command=decline_command)
+    triage_cli.add_commands(commands)
 
     sources = commands.add_parser("sources", help="the source table").add_subparsers(required=True)
     listing = sources.add_parser("list")
@@ -73,6 +57,10 @@ def build_parser() -> argparse.ArgumentParser:
     reapprove.add_argument("id")
     reapprove.add_argument("--note", required=True)
     reapprove.set_defaults(command=reapprove_command)
+    note = sources.add_parser("note", help="append a dated correction to a source's note, which is never rewritten")
+    note.add_argument("id")
+    note.add_argument("--append", required=True, metavar="TEXT")
+    note.set_defaults(command=note_command)
     merge = sources.add_parser("merge", help="fold a live source into its live twin: hosts, config entries, records")
     merge.add_argument("id")
     merge.add_argument("--into", required=True, metavar="ID")
@@ -110,62 +98,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def candidates_command(settings: Settings, args: argparse.Namespace) -> None:
-    async def read(table: SourceTable, store: RecordStore):
-        rows = await table.hosts(lifecycle.CANDIDATE)
-        hosts = [row["host"] for row in rows]
-        return rows, await mirrors.host_matches(hosts, table, store), await table.redirected_from(hosts)
-
-    rows, matched, redirected = reading(settings, read)
-    for row in rows:
-        print(f"{row['first_seen'][:16]}  {row['host']}  found on {row['found_on'] or 'request'}")
-        for source_id, near in matched.get(row["host"], []):
-            print(f"    candidate matches source {source_id} ({matching.describe(near)})")
-        for source_id in redirected.get(row["host"], []):
-            print(f"    candidate was the redirect target of source {source_id}")
-    print(f"{len(rows)} candidates")
-
-
-def approve_command(settings: Settings, args: argparse.Namespace) -> None:
-    if args.mirror_of:
-        return approve_mirror(settings, args)
-    if args.category is None:
-        raise SystemExit("onioncollect: not changed, a new source needs --category")
-    path = config_path(settings.configs_dir, args.id)
-    if path.exists():
-        raise SystemExit(f"onioncollect: not changed, {path} already exists")
-    with_stores(settings, lambda table, store: table.approve(
-        args.host, args.id, args.category, args.note, operator(), settings.exclusions))
-    write_config(settings.configs_dir, args.id, source_config.scaffold(args.id, args.host.lower(), args.category))
-    print(f"{args.host.lower()} approved as {args.id}; fill in {path}, then run golive {args.id}")
-
-
-def approve_mirror(settings: Settings, args: argparse.Namespace) -> None:
-    async def approve(table: SourceTable, store: RecordStore):
-        host = approvable(args.host, args.note, settings.exclusions)
-        source = await table.get(args.mirror_of)
-        if source is None:
-            raise RefusedChange(f"no source {args.mirror_of}")
-        if args.category not in (None, source["category"]):
-            raise RefusedChange(f"{args.mirror_of} is {source['category']}, and a mirror takes its source's category")
-        # The config edit is proven before the approval is written, so a refusal changes neither.
-        try:
-            text = source_config.with_hosts(config_path(settings.configs_dir, args.mirror_of).read_text(), [host])
-        except (OSError, ConfigError) as exc:
-            raise RefusedChange(f"{args.mirror_of}'s config: {exc}") from None
-        await table.add_mirror(host, args.mirror_of, args.note, operator(), settings.exclusions)
-        return host, source["state"], text
-
-    host, state, text = with_stores(settings, approve)
-    path = write_config(settings.configs_dir, args.mirror_of, text)
-    print(f"{host} approved as a mirror of {args.mirror_of}, which stays {state}; added to {path}")
-
-
-def decline_command(settings: Settings, args: argparse.Namespace) -> None:
-    with_stores(settings, lambda table, store: table.decline(args.host, args.reason, operator()))
-    print(f"{args.host.lower()} declined")
-
-
 def sources_command(settings: Settings, args: argparse.Namespace) -> None:
     async def read(table: SourceTable):
         hosts = [] if args.state in lifecycle.SOURCE_STATES else await table.hosts(args.state)
@@ -193,6 +125,11 @@ def disable_command(settings: Settings, args: argparse.Namespace) -> None:
 def reapprove_command(settings: Settings, args: argparse.Namespace) -> None:
     with_stores(settings, lambda table, store: table.reapprove(args.id, args.note, operator()))
     print(f"{args.id} approved again; run golive {args.id}")
+
+
+def note_command(settings: Settings, args: argparse.Namespace) -> None:
+    line = with_stores(settings, lambda table, store: table.append_note(args.id, args.append, operator()))
+    print(f"{args.id}: {line}")
 
 
 def merge_command(settings: Settings, args: argparse.Namespace) -> None:

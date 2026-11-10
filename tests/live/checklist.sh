@@ -47,8 +47,15 @@ expected_output_chain() {
     echo "-A OUTPUT -o lo -j ACCEPT"
     echo "-A OUTPUT -p tcp -m tcp --sport 22 -m conntrack --ctstate ESTABLISHED -j ACCEPT"
     for n in 1 2 3 4 5 6; do
+        echo "-A OUTPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m conntrack --ctstate NEW -m owner --uid-owner $(id -u "_tor-crawl$n") -j CONNMARK --set-xmark 0x746f72/0xffffffff"
+    done
+    for n in 1 2 3 4 5 6; do
         echo "-A OUTPUT -m owner --uid-owner $(id -u "_tor-crawl$n") -j ACCEPT"
     done
+    device=$(ip -4 route show default | awk '{print $5; exit}')
+    subnet=$(ip -4 route show dev "$device" proto kernel scope link | awk '{print $1; exit}')
+    echo "-A OUTPUT -d $subnet -o $device -p udp -m udp --sport 68 --dport 67 -m owner --uid-owner $(id -u systemd-network) -j ACCEPT"
+    echo "-A OUTPUT -p tcp -m connmark --mark 0x746f72 -j ACCEPT"
     echo "-A OUTPUT -j DROP"
 }
 
@@ -62,7 +69,9 @@ saved_output_rules() {
         for n in 1 2 3 4 5 6; do
             rule=${rule//--uid-owner _tor-crawl$n /--uid-owner $(id -u "_tor-crawl$n") }
         done
-        echo "$rule"
+        rule=${rule//--uid-owner systemd-network /--uid-owner $(id -u systemd-network) }
+        # iptables -S prints a rule's destination before its interface.
+        echo "$rule" | sed -E 's/^-A OUTPUT (-o [^ ]+) (-d [^ ]+) /-A OUTPUT \2 \1 /'
     done
 }
 
@@ -96,7 +105,7 @@ check "crawler has no sudo" crawler_has_no_sudo
 check "analyst owns data/ with mode 700" data_dir_locked
 check "six tor@crawlN running: ClientOnly, SafeLogging, IsolateSOCKSAuth, SOCKS on loopback only" tor_instances_hardened
 check "control password file mode 600, owned by crawler, outside any repo" password_file_locked
-check "iptables OUTPUT: lo, SSH replies, six Tor UIDs, DROP; ip6tables OUTPUT policy DROP" kill_switch_live
+check "iptables OUTPUT: lo, SSH replies, six Tor SYN marks, six Tor UIDs, DHCP renewal, marked TCP, DROP; ip6tables OUTPUT policy DROP" kill_switch_live
 check "kill switch persisted and loaded at boot" kill_switch_persisted
 check "no proxy variables in the environment" no_proxy_env
 check "no NTP client (hypervisor sets the clock)" no_ntp

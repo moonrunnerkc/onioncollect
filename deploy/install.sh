@@ -1,9 +1,9 @@
 #!/bin/bash
 # make deploy's guest half, as root, from the staging copy: the crawler's working copy, the root-owned copy the
-# systemd units run, the units, the writer (started here, so the leak tests and the first crawl find it), the
-# collection configs (none ever deleted without PRUNE_CONFIGS=1 and a typed yes) and a new deploy stamp. The crawl
-# timer is left stopped: make deploy runs the leak tests next and starts it only if they pass, and a crawl refuses
-# a leak test result older than this stamp anyway.
+# systemd units run (each user's settings loaded with it first, or nothing is swapped in), the units, the writer
+# (started here, so the leak tests and the first crawl find it), the collection configs (none ever deleted without
+# PRUNE_CONFIGS=1 and a typed yes) and a new deploy stamp. The crawl timer is left stopped: make deploy runs the leak
+# tests next and starts it only if they pass, and a crawl refuses a leak test result older than this stamp anyway.
 set -euo pipefail
 STAGE=$1
 APP=/home/crawler/app
@@ -34,6 +34,19 @@ rm -rf "$OPT/app.new" && install -d -m 755 -o root -g root "$OPT/app.new"
 cp -r "$STAGE/onioncollect" "$STAGE/tests" "$STAGE/tools" "$OPT/app.new/"
 find "$OPT/app.new" -name __pycache__ -prune -exec rm -rf {} +
 chown -R root:root "$OPT/app.new" && chmod -R u=rwX,go=rX "$OPT/app.new"
+
+# Triage refuses an excluded host, so the analyst keeps its own copy of the crawler's list.
+install -m 600 -o analyst -g analyst /home/crawler/exclusions.txt /home/analyst/exclusions.txt
+
+# Each user's settings load as its commands load them, with the code about to run, before anything is swapped in or
+# restarted. An empty exclusion list or a stale patterns file stops the deploy here, with the crawl timer stopped.
+settings_check() {
+    (cd / && runuser -u "$1" -- "$OPT/venv/bin/python" -s -E "$OPT/app.new/tools/settings_check.py" "${@:2}") ||
+        { echo "deploy: $1's settings refused; nothing restarted and the crawl timer is stopped" >&2; exit 1; }
+}
+settings_check crawler --crawl /home/crawler/settings.toml
+settings_check analyst /home/analyst/settings.toml
+
 rm -rf "$OPT/app" && mv "$OPT/app.new" "$OPT/app"
 
 install -m 644 -o root -g root "$STAGE"/deploy/systemd/* /etc/systemd/system/
@@ -42,8 +55,14 @@ systemctl enable $TIMERS onioncollect-ui.service onioncollect-writer.service >/d
 systemctl start onioncollect-retention.timer onioncollect-leak-test.timer
 systemctl restart onioncollect-writer.service onioncollect-ui.service
 
-# Triage refuses an excluded host, so the analyst keeps its own copy of the crawler's list.
-install -m 600 -o analyst -g analyst /home/crawler/exclusions.txt /home/analyst/exclusions.txt
+# The analyst units load testonion's credential by id from the credstore. The file stays where config.py reads it;
+# the credstore holds a link, present exactly while the file is, since a dangling link fails those units.
+install -d -m 700 -o root -g root /etc/credstore
+if [ -f /etc/onioncollect/testonion.env ]; then
+    ln -sfn /etc/onioncollect/testonion.env /etc/credstore/testonion.env
+else
+    rm -f /etc/credstore/testonion.env
+fi
 
 if [ -d "$STAGE/configs" ]; then
     bash "$STAGE/deploy/sync_configs.sh" "$STAGE/configs" "$CONFIGS"

@@ -27,8 +27,8 @@ def main(argv: list[str] | None = None) -> None:
         try:
             stores.rows(name, "SELECT count(*) FROM sqlite_master")
         except sqlite3.Error as exc:
-            raise SystemExit(f"onioncollect: {name} unreadable ({type(exc).__name__}); the crawler's first command"
-                             " creates it") from None
+            raise SystemExit(f"onioncollect: {name} unreadable ({type(exc).__name__}); the writer creates it when"
+                             " it starts (onioncollect-writer.service)") from None
     ui.configure_logging(Path.home() / "ui.log")
     server = ui.UIServer(args.data_dir, args.configs_dir, args.port)
     ui.log.info("ui listening on port %d", server.server_address[1])

@@ -1,12 +1,19 @@
 import re
 from dataclasses import dataclass
 
+from onioncollect.onion import is_v3_onion
+
 LOCAL_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._%+-")
 MAX_LOCAL = 64
 DOMAIN = re.compile(r"[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}(?![A-Za-z0-9-])")
 DOMAIN_WINDOW = 300
-PAIR_SEPARATORS = (":", ";", "|")
-PASSWORD = re.compile(r"\S{1,128}")
+# A dump writes "a@b.c:pw", "a@b.c : pw" or "a@b.c\t|\tpw". A spaced pair must end its line (or meet a tag),
+# since contact prose puts more words after a spaced separator ("bob@acme.com | PGP key below").
+SEPARATOR = re.compile(r"([ \t]{0,4})[:;|]([ \t]{0,4})")
+SEPARATOR_WINDOW = 9
+LINE_END = re.compile(r"[ \t]{0,4}(?:\r?\n|<|\Z)")
+# Stops at a <br> tag, so entries a dump joins with <br> on one line stay separate pairs.
+PASSWORD = re.compile(r"(?:(?!<[bB][rR]\b)\S){1,128}")
 USER_PAIR = re.compile(r"^([\w.-]{3,64})[:;|](?!//)\S{4,128}$", re.MULTILINE)
 CARD = re.compile(r"(?<![\d-])\d(?:[ -]?\d){12,18}(?!\d)")
 NATIONAL_IDS = (
@@ -16,6 +23,11 @@ NATIONAL_IDS = (
 TOKEN_RUN = re.compile(r"[A-Za-z0-9_\-+/=.$]{24,}")
 HEX = re.compile(r"[0-9a-fA-F]{32,}")
 UPPER, LOWER, DIGIT = re.compile("[A-Z]"), re.compile("[a-z]"), re.compile("[0-9]")
+MIN_TOKEN = 24
+ONION_SUFFIX = ".onion"
+ONION_LABEL = 56
+BASE32 = frozenset("abcdefghijklmnopqrstuvwxyz234567")
+HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 
 
 @dataclass(frozen=True)
@@ -29,15 +41,24 @@ class Span:
 
 
 def find(text: str) -> list[Span]:
-    # Highest priority first. A span overlapping one already taken is dropped; the storage layer reruns
-    # this on what the redaction gate wrote, so anything a drop leaves exposed fails closed there.
+    # Highest priority first. A span overlapping one already taken keeps only its uncovered parts: dropping
+    # it whole would leave whatever runs past the earlier span in the text, and a password tail does not trip
+    # this again when the storage layer reruns it. A cut part has no whole key, so key_end = start (no hash).
     candidates = [*addresses(text), *user_pairs(text), *cards(text), *national_ids(text), *tokens(text)]
     taken = bytearray(len(text))
     spans = []
     for span in candidates:
-        if taken.find(1, span.start, span.end) == -1:
-            taken[span.start:span.end] = b"\x01" * (span.end - span.start)
-            spans.append(span)
+        cursor = span.start
+        while cursor < span.end:
+            free = taken.find(0, cursor, span.end)
+            if free == -1:
+                break
+            stop = taken.find(1, free, span.end)
+            stop = span.end if stop == -1 else stop
+            taken[free:stop] = b"\x01" * (stop - free)
+            whole = free == span.start and stop == span.end
+            spans.append(span if whole else Span(free, stop, span.kind, free))
+            cursor = stop
     return sorted(spans, key=lambda span: span.start)
 
 
@@ -57,7 +78,10 @@ def addresses(text: str) -> list[Span]:
         domain = DOMAIN.match(text, at + 1, at + 1 + DOMAIN_WINDOW) if start < at else None
         if domain:
             end = domain.end()
-            password = PASSWORD.match(text, end + 1, end + 129) if text[end:end + 1] in PAIR_SEPARATORS else None
+            separator = SEPARATOR.match(text, end, end + SEPARATOR_WINDOW)
+            password = separator and PASSWORD.match(text, separator.end(), separator.end() + 128)
+            if password and (separator.group(1) or separator.group(2)) and not LINE_END.match(text, password.end()):
+                password = None
             if password:
                 found.append(Span(start, password.end(), "email_password", end))
             else:
@@ -81,10 +105,28 @@ def national_ids(text: str) -> list[Span]:
 def tokens(text: str) -> list[Span]:
     found = []
     for m in TOKEN_RUN.finditer(text):
-        run = m.group()
-        if HEX.fullmatch(run) or (UPPER.search(run) and LOWER.search(run) and DIGIT.search(run)):
+        rest = without_onion_hosts(m.group())
+        if len(rest) >= MIN_TOKEN and (HEX.fullmatch(rest) or (UPPER.search(rest) and LOWER.search(rest)
+                                                              and DIGIT.search(rest))):
             found.append(Span(m.start(), m.end(), "token", m.end()))
     return found
+
+
+def without_onion_hosts(run: str) -> str:
+    # A link's onion host is 56 lowercase letters and digits, so one capital in its path made the whole link a
+    # token. Only a host that passes the v3 checksum and stands alone is taken out, and what is left is still
+    # judged. Anchored on each ".onion" and bounded to the label before it, as addresses() is on "@".
+    kept, cursor = [], 0
+    lowered = run.lower()
+    dot = lowered.find(ONION_SUFFIX)
+    while dot != -1:
+        start, end = dot - ONION_LABEL, dot + len(ONION_SUFFIX)
+        if (start >= cursor and (start == 0 or lowered[start - 1] not in BASE32)
+                and (end == len(run) or run[end] not in HOST_CHARS) and is_v3_onion(run[start:end])):
+            kept.append(run[cursor:start])
+            cursor = end
+        dot = lowered.find(ONION_SUFFIX, dot + 1)
+    return "".join(kept) + run[cursor:] if cursor else run
 
 
 def luhn_valid(candidate: str) -> bool:

@@ -142,6 +142,18 @@ class FrontierContainmentTest(CrawlerTestCase):
         self.assertEqual([tuple(row) for row in queued],
                          [("news", "/articles/"), ("news", "/articles/1"), ("news", "/articles/2")])
 
+    async def test_with_a_host_prefix_off_source_links_are_still_candidates_only(self):
+        (self.root / "configs" / "news.toml").write_text(
+            NEWS_CONFIG.replace('cadence = "6h"', 'cadence = "6h"\nhost_prefix = "www"'))
+        links = "".join(f"<a href='http://{host}/x'>x</a>" for host in (AHMIA, f"www.{OFF_SOURCE}", f"www.{NEWS}"))
+        page = listing_page("A", "B", extra=links)
+        await self.crawl({"/articles/": page, "/articles/1": detail_page("one"), "/articles/2": detail_page("two")})
+        candidates = await self.stores.sources.hosts(lifecycle.CANDIDATE)
+        self.assertEqual({row["host"] for row in candidates}, {AHMIA, OFF_SOURCE})
+        queued = await self.rows("SELECT source_id, path FROM urls ORDER BY path")
+        self.assertEqual([tuple(row) for row in queued],
+                         [("news", "/articles/"), ("news", "/articles/1"), ("news", "/articles/2")])
+
     async def test_redirect_off_the_source_is_recorded_not_followed(self):
         moved = FetchResult("news", "/articles/", host=NEWS, status=302, error="redirect",
                             redirect_to=f"http://{OFF_SOURCE}/articles/")

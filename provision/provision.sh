@@ -338,23 +338,49 @@ EOF
     fi
 }
 
+# The connection mark of a TCP connection a Tor instance opened ("tor" in ASCII). tests/live/leak_analyze.py reads
+# the same value from the conntrack table; tests/test_provision.py holds the two together.
+TOR_MARK=0x746f72
+
+# kill_switch_rules SUBNET DEVICE: the IPv4 rules, printed. tests/test_provision.py holds them line for line.
+kill_switch_rules() {
+    local subnet=$1 device=$2
+    echo "*filter"
+    echo ":INPUT ACCEPT [0:0]"
+    echo ":FORWARD ACCEPT [0:0]"
+    echo ":OUTPUT ACCEPT [0:0]"
+    echo "-A OUTPUT -o lo -j ACCEPT"
+    echo "-A OUTPUT -p tcp -m tcp --sport 22 -m conntrack --ctstate ESTABLISHED -j ACCEPT"
+    # A connection is marked by the SYN a Tor instance opens it with, and by nothing else. Once Tor closes its
+    # socket the kernel still has to answer the relay (the last ACKs, a RST), and those packets have no owner: the
+    # owner rules below never match them, so they were dropped and the relay kept retransmitting into the next
+    # leak test. The mark rule below the owner rules passes them, for marked TCP connections only.
+    for n in $INSTANCES; do
+        echo "-A OUTPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m conntrack --ctstate NEW -m owner --uid-owner _tor-crawl$n -j CONNMARK --set-xmark $TOR_MARK/0xffffffff"
+    done
+    for n in $INSTANCES; do
+        echo "-A OUTPUT -m owner --uid-owner _tor-crawl$n -j ACCEPT"
+    done
+    # The DHCP lease renewal, unicast from the network daemon to the gateway's subnet and nowhere else. Dropped, the
+    # client fell back each hour to a raw-socket broadcast from 0.0.0.0:68, which iptables never sees, and leak
+    # test 3 failed whenever its window caught one.
+    if [ -n "$subnet" ] && [ -n "$device" ]; then
+        echo "-A OUTPUT -o $device -d $subnet -p udp -m udp --sport 68 --dport 67 -m owner --uid-owner systemd-network -j ACCEPT"
+    fi
+    echo "-A OUTPUT -p tcp -m connmark --mark $TOR_MARK -j ACCEPT"
+    echo "-A OUTPUT -j DROP"
+    echo "COMMIT"
+}
+
 install_kill_switch() {
     install -d -m 755 /etc/iptables
-    local before
+    local before device subnet=""
     before=$(cat /etc/iptables/rules.v4 /etc/iptables/rules.v6 2>/dev/null | sha256sum)
-    {
-        echo "*filter"
-        echo ":INPUT ACCEPT [0:0]"
-        echo ":FORWARD ACCEPT [0:0]"
-        echo ":OUTPUT ACCEPT [0:0]"
-        echo "-A OUTPUT -o lo -j ACCEPT"
-        echo "-A OUTPUT -p tcp -m tcp --sport 22 -m conntrack --ctstate ESTABLISHED -j ACCEPT"
-        for n in $INSTANCES; do
-            echo "-A OUTPUT -m owner --uid-owner _tor-crawl$n -j ACCEPT"
-        done
-        echo "-A OUTPUT -j DROP"
-        echo "COMMIT"
-    } > /etc/iptables/rules.v4
+    device=$(ip -4 route show default | awk '{print $5; exit}')
+    if [ -n "$device" ]; then
+        subnet=$(ip -4 route show dev "$device" proto kernel scope link | awk '{print $1; exit}')
+    fi
+    kill_switch_rules "$subnet" "$device" > /etc/iptables/rules.v4
     printf '*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT DROP [0:0]\nCOMMIT\n' > /etc/iptables/rules.v6
     chmod 600 /etc/iptables/rules.v4 /etc/iptables/rules.v6
     systemctl enable netfilter-persistent >/dev/null 2>&1

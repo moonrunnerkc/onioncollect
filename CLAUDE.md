@@ -19,6 +19,7 @@ Violating any of these is a bug, not a judgment call:
 - `golive` refuses a form-session config: the source goes live on its public pages with `auth.type = "none"` and moves to form-session once live. `golive.recheck` logs in only on the active host.
 - Every httpx client sets `trust_env=False`, `follow_redirects=False`, `http2=False`, `rdns=True`, and its SOCKS username is the target host on every request (per-host circuit isolation).
 - Redirects are recorded, never followed. A target on the source's own hosts is queued as its own fetch, another onion becomes a candidate, anything else is dropped.
+- `host_prefix` is a config key with one legal value, `"www"`, refused on a form-session source. It changes the request line only: `Fetcher._get` asks for `onion.with_label(url, prefix)`, and `onion.without_label` maps a link or a redirect on `www.<one of the source's hosts>` back to the bare host before `normalize` sees it. The host set, approval, exclusions, `result.host`, `result.url` and the SOCKS username stay the bare address, and a prefixed name on any other address is still refused.
 - `onion.normalize` and `is_v3_onion` are the only URL and host gates. `SourceConfig.path_for` is the only way a link becomes a frontier path, and it accepts only the source's own hosts. Every other onion host a page names goes to `SourceTable.add_candidates` and nowhere else.
 - A host is fetched only after a human approves it (`triage approve`: a category from `lifecycle.CATEGORIES`, a reviewer note, never a host on the exclusion list), and collected only after `golive` passes. Declined is final; rediscovery never resurrects a host.
 - A host joins another source's host set only by a human decision: `triage approve --as-mirror-of X`, `golive --as-mirror-of X`, or `sources merge A --into X` (seed fingerprints within `MIRROR_MAX_BITS`, or `--force` with a note). Clustering reads stored seed-page fingerprints and writes `sources.cluster_id`, nothing else; it never fetches and never changes a host set or a state. A config's `hosts` array is edited only by `source_config.with_hosts`, which proves the edit by reading it back.
@@ -40,7 +41,13 @@ Violating any of these is a bug, not a judgment call:
 - The analyst owns the stores (`/home/analyst/data`, mode 700, umask 077). The crawler never opens a store file: every write and every store read of `crawl run`, `golive` and the fixed and mirror-swapped dispositions goes through `writer_client.Writer` over `/run/onioncollect/writer.sock` to `writer.py`, run as the analyst, which admits the crawler's uid alone (SO_PEERCRED, root refused) before reading a byte, takes one op from `writer_ops.OPS` per line, checks every field against the op's spec, and runs `RecordStore`, so the second detector runs as the analyst. The crawler keeps its frontier (`urls`, paths and scheduling only) in its own state dir. `test_writer` and `test_writer_boundary` hold this; a new op is a reviewed change to `writer_ops.OPS`. Reader commands (`reader=True`: search, sources list and export, triage list, health and its runs and log) open both stores read-only, need no secret file, and never create a store. `Database.close` leaves empty `-wal` and `-shm` files so a read-only reader can open a WAL database the crawler has closed.
 - `make deploy` never deletes a guest config unless `PRUNE_CONFIGS=1` and a typed `yes` (`deploy/sync_configs.sh`). No timer runs golive, triage, sources, a disposition or a deploy; `test_deploy` reads every unit's `User=` and `ExecStart=`.
 
+- The kill switch accepts by owner: loopback, SSH replies, the six Tor uids, the DHCP renewal. Its one accept by connection is TCP on a connection carrying `TOR_MARK`, which only the SYN of a new connection from a Tor instance's uid sets (`provision.sh` `kill_switch_rules`, held line for line by `test_provision`). It passes the kernel's own last packets for a connection Tor has closed, which have no owner. No generic ESTABLISHED rule, no UDP by mark, IPv6 policy DROP. Leak test 3 credits a packet by its exact connection: owned only by Tor uids, or carrying the mark with no other owner ever seen; a marked connection any other uid was on fails the test.
+
 If you touch fetcher.py, the torrc files, or the firewall, rerun the four Tor leak tests (`make leak-test`) before committing and before the next golive. testonion/torrc is the second VM's, not the crawler's, and is not covered by this rule.
+
+## Known limits
+
+- A hex-only token inside a URL path is not detected: `detect.tokens` judges a whole run of token characters, and with the slashes of the path in it the run is not all hex. A mixed-case token in a path or query is detected. Recorded 2026-11-10, not fixed.
 
 ## Stack
 
@@ -71,7 +78,7 @@ onioncollect/
   schema.py         CREATE TABLE and CREATE INDEX statements
   db.py             Database helper; the crawler's Frontier (its own state dir), Task and PageMetric
   sources.py        SourceTable: candidates, approve, mirror approve, fold and merge, decline, state changes,
-                    cluster ids, redirect evidence, active host, reapprove; PinnedHost
+                    cluster ids, redirect evidence, active host, reapprove, note corrections (append only); PinnedHost
   runs.py           RunLog: run totals, page metrics, per-field hits, uptime and probes, visited paths (writer side)
   health_queue.py   HealthQueue: items, dispositions, snoozes, run summaries and per-run metrics
   records.py        RecordStore: records, host sightings, cluster dedup and merge, FTS, snapshots and baselines,
@@ -94,10 +101,12 @@ onioncollect/
   config_cli.py     config validate / test, the latest snapshot against the golive baseline (analyst)
   ui.py             the read-only search UI on 127.0.0.1, standard library, as the analyst
   ui_main.py        the UI's own entry point: arguments, the user check, the stores opened read-only; never cli.py
-  cli.py            triage / sources / records / mirrors / search / retention (analyst)
+  triage_cli.py     triage list / approve / decline / request (analyst); a request is a candidate row, never a fetch
+  cli.py            sources / records / mirrors / search / retention (analyst), and the entry point
 configs/            one reviewed TOML file per source, committed
 deploy/             make deploy's guest half (install.sh), the config sync, and the systemd units it installs
-tools/              writeup_check.py (markers left in the write-up) and writeup_capture.py (the guest's evidence, stripped)
+tools/              writeup_check.py (markers left in the write-up), writeup_capture.py (the guest's evidence, stripped)
+                    and settings_check.py (make deploy's preflight: each user's settings load, or nothing restarts)
 docs/writeup.md     the write-up; every number is a [PASTE: ...] marker until it comes from the guest
 testonion/          section 15's self-hosted onion for its own VM (testonion-vm): the stdlib app, its torrc,
                     systemd unit, setup script and Lima file, and the stage 1 and stage 2 configs

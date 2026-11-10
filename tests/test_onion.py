@@ -2,7 +2,8 @@ import base64
 import hashlib
 import unittest
 
-from onioncollect.onion import find_onions_in_text, host_of, is_v3_onion, normalize, path_of
+from onioncollect.onion import (find_onions_in_text, host_of, is_v3_onion, normalize, path_of, with_label,
+                                without_label)
 
 AHMIA = "juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion"
 DUCKDUCKGO = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion"
@@ -160,6 +161,23 @@ class PathOfTest(unittest.TestCase):
     def test_fragment_dropped(self):
         self.assertEqual(path_of(f"http://{AHMIA}/a#frag"), "/a")
 
+
+class LabelTest(unittest.TestCase):
+    def test_a_label_goes_before_the_host_and_none_changes_nothing(self):
+        self.assertEqual(with_label(f"https://{AHMIA}/a?b=//c", "www"), f"https://www.{AHMIA}/a?b=//c")
+        self.assertEqual(with_label(f"http://{AHMIA}/", None), f"http://{AHMIA}/")
+
+    def test_a_label_comes_off_only_one_of_the_hosts(self):
+        hosts = (AHMIA,)
+        self.assertEqual(without_label(f"HTTPS://WWW.{AHMIA.upper()}:8443/a?b=1#c", "www", hosts),
+                         f"https://{AHMIA}:8443/a?b=1#c")
+        for url in (f"http://www.{DUCKDUCKGO}/", f"http://www.www.{AHMIA}/", f"http://m.{AHMIA}/",
+                    f"http://www{AHMIA}/", f"http://www.{AHMIA}.example.com/", f"http://{AHMIA}@www.example.com/",
+                    f"http://www.{AHMIA}:99999/", "http://[bad/", f"http://{AHMIA}/", "/relative"):
+            with self.subTest(url=url):
+                self.assertEqual(without_label(url, "www", hosts), url)
+        self.assertEqual(without_label(f"http://www.{AHMIA}/", None, hosts), f"http://www.{AHMIA}/")
+        self.assertEqual(without_label(f"http://user@www.{AHMIA}/", "www", hosts), f"http://{AHMIA}/")
 
 
 if __name__ == "__main__":

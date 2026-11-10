@@ -1,12 +1,13 @@
 # The four Tor leak tests, daily, as root, so golive check 3 and the crawl gate always have a result under 36 h
 # old. It adds and removes an iptables LOG rule, captures with tcpdump, reads the kernel log and runs parts as the
 # crawler (runuser, so NoNewPrivileges holds), which rules out ProtectSystem=strict and the ProtectKernel* set.
+# Root by default, with no User= line: an explicit User=root, together with NoNewPrivileges and the syscall filters
+# below, leaves CAP_SETUID out of the effective set (systemd 257), and runuser to the crawler then fails with EPERM.
 [Unit]
 Description=onioncollect Tor leak tests
 
 [Service]
 Type=oneshot
-User=root
 ExecStart=/bin/bash /opt/onioncollect/app/tests/live/leak_test.sh
 TimeoutStartSec=20min
 NoNewPrivileges=yes

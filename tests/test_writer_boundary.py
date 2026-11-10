@@ -123,7 +123,7 @@ class StartGateTest(CliTestCase):
         with self.assertRaises(SystemExit) as caught:
             self.cli("crawl", "run", "--until-idle")
         self.assertNotIn(caught.exception.code, (0, None))
-        self.assertIn(why, str(caught.exception))
+        self.assertRegex(str(caught.exception), why)
         self.assertEqual(self.built, [])
         self.assertFalse(any(pool.started for pool in self.pools))
 
@@ -135,7 +135,10 @@ class StartGateTest(CliTestCase):
         try:
             self.settings_path.write_text(self.settings_path.read_text().replace(
                 str(self.root / "no-writer.sock"), str(writer.socket)))
-            self.assert_refused_before_tor("closed the connection on ping unanswered")
+            # The writer closes on a peer it refuses without reading its line. The crawler sees the close as an
+            # empty reply on macOS and as a reset on Linux, where the guest and CI run.
+            self.assert_refused_before_tor(r"crawl refused, the writer (closed the connection on ping unanswered"
+                                           r"|did not answer ping \(ConnectionResetError\))")
         finally:
             writer.stop()
 

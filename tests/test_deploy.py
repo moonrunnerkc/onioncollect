@@ -63,7 +63,13 @@ class UnitFilesTest(unittest.TestCase):
         for name, (user, command) in EXPECTED.items():
             with self.subTest(unit=name):
                 service = unit(name)["Service"]
-                self.assertEqual(service["User"], user)
+                if user == "root":
+                    # Root by systemd's default. An explicit User=root, with NoNewPrivileges and the syscall
+                    # filters, leaves CAP_SETUID out of the effective set, so the leak test's runuser to the
+                    # crawler failed with EPERM and every scheduled run failed all four tests.
+                    self.assertNotIn("User", service)
+                else:
+                    self.assertEqual(service["User"], user)
                 self.assertEqual(service["ExecStart"], command)
                 if user != "root":
                     self.assertEqual(service["Group"], user)
@@ -130,6 +136,12 @@ class UnitFilesTest(unittest.TestCase):
         self.assertEqual((service["SocketBindAllow"], service["SocketBindDeny"]), (f"tcp:{ui.PORT}", "any"))
         self.assertEqual(service["RestrictAddressFamilies"], "AF_INET AF_UNIX")
 
+    def test_the_crawl_may_bind_no_port(self):
+        service = unit("onioncollect-crawl.service")["Service"]
+        self.assertEqual(service["SocketBindDeny"], "any")
+        self.assertNotIn("SocketBindAllow", service)
+        self.assertEqual(service["RestrictAddressFamilies"], "AF_INET AF_UNIX")
+
     def test_the_ui_starts_from_its_own_entry_point_and_never_through_the_cli(self):
         for path in sorted(UNITS.glob("*.service")):
             command = unit(path.name)["Service"]["ExecStart"].split()
@@ -147,11 +159,26 @@ class UnitFilesTest(unittest.TestCase):
                          ("onioncollect", "onioncollect-ipc"))
         self.assertEqual(writer["Install"]["WantedBy"], "multi-user.target", "enabled at boot")
 
+    def test_the_ui_starts_after_the_writer_that_creates_the_stores(self):
+        ui_unit = unit("onioncollect-ui.service")["Unit"]
+        self.assertIn("onioncollect-writer.service", ui_unit["After"].split())
+        self.assertEqual(ui_unit["Wants"], "onioncollect-writer.service")
+
     def test_the_credential_reaches_the_analyst_units_through_systemd_only(self):
+        # The bare id makes systemd search its credstore, where a missing credential falls back to SetCredential.
+        # A missing file named by an absolute path fails the unit instead (status 243, systemd 257), so the audit
+        # never ran on a guest without testonion's credential.
         for name in ("onioncollect-log-audit.service", "onioncollect-capture.service"):
             service = unit(name)["Service"]
-            self.assertEqual(service["LoadCredential"], "testonion.env:/etc/onioncollect/testonion.env")
+            self.assertEqual(service["LoadCredential"], "testonion.env")
             self.assertEqual(service["SetCredential"], "testonion.env:")
+        # The credential itself stays at /etc/onioncollect; the credstore holds only a link to it, which must
+        # exist exactly when the file does (a dangling link fails the unit like a missing path).
+        install = (ROOT / "deploy" / "install.sh").read_text()
+        self.assertIn("ln -sfn /etc/onioncollect/testonion.env /etc/credstore/testonion.env", install)
+        self.assertIn("rm -f /etc/credstore/testonion.env", install)
+        make = (ROOT / "Makefile").read_text()
+        self.assertIn("ln -sfn /etc/onioncollect/testonion.env /etc/credstore/testonion.env", make)
         crawl = unit("onioncollect-crawl.service")["Unit"]
         self.assertEqual((crawl["OnSuccess"], crawl["OnFailure"]), ("onioncollect-log-audit.service",) * 2)
 
@@ -167,6 +194,18 @@ class UnitFilesTest(unittest.TestCase):
         self.assertEqual(deploy.strip().splitlines()[1:], [
             "\tlimactl shell $(VM) sudo bash /opt/onioncollect/app/tests/live/leak_test.sh",
             "\tlimactl shell $(VM) sudo systemctl start onioncollect-crawl.timer"])
+
+    def test_install_loads_each_users_settings_before_anything_is_swapped_in_or_restarted(self):
+        install = (ROOT / "deploy" / "install.sh").read_text()
+        check = 'runuser -u "$1" -- "$OPT/venv/bin/python" -s -E "$OPT/app.new/tools/settings_check.py" "${@:2}"'
+        order = ["systemctl stop onioncollect-crawl.timer",
+                 "install -m 600 -o analyst -g analyst /home/crawler/exclusions.txt /home/analyst/exclusions.txt",
+                 check, "settings_check crawler --crawl /home/crawler/settings.toml",
+                 "settings_check analyst /home/analyst/settings.toml", 'mv "$OPT/app.new" "$OPT/app"',
+                 "systemctl restart onioncollect-writer.service", "deploy-stamp"]
+        self.assertEqual([install.count(step) for step in order[:-1]], [1] * (len(order) - 1))
+        positions = [install.index(step) for step in order]
+        self.assertEqual(positions, sorted(positions))
 
 
 class ConfigSyncTest(unittest.TestCase):
@@ -200,7 +239,7 @@ class ConfigSyncTest(unittest.TestCase):
         self.assertEqual(self.guest_files(), {"news.toml": "old news\n", "testonion.toml": "hand-installed\n"})
         self.assertIn("would run: install -m 640", out)
         self.assertIn("kept; PRUNE_CONFIGS=1", out)
-        self.assertNotIn("rm", out)
+        self.assertNotIn("would run: rm", out)
 
     def test_a_dry_run_with_prune_and_yes_still_deletes_nothing(self):
         out = self.sync("yes\n", DRY_RUN="1", PRUNE_CONFIGS="1")

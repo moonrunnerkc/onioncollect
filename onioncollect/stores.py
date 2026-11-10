@@ -48,4 +48,5 @@ def reading(settings: Settings, action):
     try:
         return with_stores(settings, action, read_only=True)
     except FileNotFoundError as exc:
-        raise SystemExit(f"onioncollect: no {exc.args[0]} yet; the crawler's first command creates it") from None
+        raise SystemExit(f"onioncollect: no {exc.args[0]} yet; the writer creates it when it starts"
+                         " (onioncollect-writer.service)") from None

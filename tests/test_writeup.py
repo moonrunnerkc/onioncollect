@@ -1,5 +1,5 @@
 """The write-up tooling: writeup-check fails while a [PASTE: ...] marker is left, and writeup-capture writes a
-bundle with no testonion address, no credential value and no host IP, or writes nothing at all."""
+bundle with no testonion address, no credential value, no login name and no host IP, or writes nothing at all."""
 import asyncio
 import importlib.util
 import io
@@ -19,6 +19,8 @@ from tests.fixtures import (CANDIDATE, DECLINED, TESTONION, TESTONION_PASSWORD, 
 
 TOOLS = Path(__file__).resolve().parent.parent / "tools"
 PLANTED_IPS = ("192.168.5.15", "10.0.2.2", "fe80::5055:55ff:fe12:3456", "2001:db8::42")
+# The operator's login in the guest, as an older leak test recorded it in run_by, and a second account.
+PLANTED_USERS = {"mallory", "al"}
 
 
 def load(name: str):
@@ -66,28 +68,59 @@ class WriteupCheckTest(unittest.TestCase):
 
 class StripTest(unittest.TestCase):
     TIME_AND_VERSION = "2026-11-08 12:30:45.123 python 3.13.1 hit 0.95"
+    # Words that only contain a login name, and the role accounts, are not logins.
+    WORDS_KEPT = "all journalism-publishing mallorys analyst crawler"
 
     def planted(self) -> dict[str, str]:
         return {"sources-export.jsonl": json.dumps({"host": TESTONION, "note": f"login {TESTONION_USER}"}) + "\n",
-                "leak-test.json": json.dumps({"guest": PLANTED_IPS[0], "gateway": PLANTED_IPS[1],
+                "leak-test.json": json.dumps({"guest": PLANTED_IPS[0], "gateway": PLANTED_IPS[1], "run_by": "mallory",
                                               "v6": [PLANTED_IPS[2], PLANTED_IPS[3]]}),
+                "health-log.txt": f"{self.WORDS_KEPT} by mallory, /home/mallory.linux/x, uid=al(501)\n",
                 "tor-lines.txt": f"{self.TIME_AND_VERSION} {TESTONION.removesuffix('.onion')} {TESTONION_PASSWORD}\n"}
 
     def test_nothing_planted_survives_and_nothing_else_is_touched(self):
         with tempfile.TemporaryDirectory() as out:
-            target = capture.write_bundle(Path(out), self.planted(), {TESTONION}, {TESTONION_USER, TESTONION_PASSWORD})
-            written = "".join(path.read_text() for path in target.iterdir())
+            target = capture.write_bundle(Path(out), self.planted(), {TESTONION}, {TESTONION_USER, TESTONION_PASSWORD},
+                                          PLANTED_USERS)
+            files = {path.name: path.read_text() for path in target.iterdir()}
+            written = "".join(files.values())
         for planted in (TESTONION, TESTONION.removesuffix(".onion"), TESTONION_USER, TESTONION_PASSWORD, *PLANTED_IPS):
             self.assertNotIn(planted, written)
         self.assertIn(self.TIME_AND_VERSION, written)
-        self.assertIn("replaced: [testonion address] x2, [credential] x2, [ip] x4", written)
+        self.assertIn('"run_by": "[user]"', files["leak-test.json"])
+        self.assertEqual(files["health-log.txt"], f"{self.WORDS_KEPT} by [user], /home/[user].linux/x, uid=[user](501)\n")
+        self.assertIn("replaced: [testonion address] x2, [credential] x2, [user] x4, [ip] x4", written)
+
+    def test_the_names_stripped_are_the_home_accounts_but_the_roles(self):
+        def account(name, home):
+            return mock.Mock(pw_name=name, pw_dir=home)
+        with mock.patch.object(capture.pwd, "getpwall", return_value=[
+                account("root", "/root"), account("crawler", "/home/crawler"), account("analyst", "/home/analyst"),
+                account("mallory", "/home/mallory.linux"), account("_tor-crawl1", "/var/lib/tor-instances/crawl1")]):
+            self.assertEqual(capture.login_names(), {"mallory"})
+        self.assertIsNone(capture.user_pattern(set()))
 
     def test_if_anything_survives_nothing_is_written(self):
         with tempfile.TemporaryDirectory() as out, \
-                mock.patch.object(capture, "strip", lambda texts, hosts, secrets: (texts, {})):
+                mock.patch.object(capture, "strip", lambda texts, hosts, secrets, users: (texts, {})):
             with self.assertRaisesRegex(SystemExit, "nothing written, still present after stripping"):
-                capture.write_bundle(Path(out), self.planted(), {TESTONION}, {TESTONION_PASSWORD})
+                capture.write_bundle(Path(out), self.planted(), {TESTONION}, {TESTONION_PASSWORD}, set())
             self.assertEqual(list(Path(out).iterdir()), [])
+            with self.assertRaisesRegex(SystemExit, "still present after stripping: leak-test.json: user, health-log.txt: user"):
+                capture.write_bundle(Path(out), {name: text for name, text in self.planted().items()
+                                                 if name in ("leak-test.json", "health-log.txt")}, set(), set(),
+                                     PLANTED_USERS)
+            self.assertEqual(list(Path(out).iterdir()), [])
+
+
+class RunByTest(unittest.TestCase):
+    def test_the_leak_test_records_a_role_and_reads_no_login_name(self):
+        script = (TOOLS.parent / "tests" / "live" / "leak_test.sh").read_text()
+        self.assertIn('RUN_BY=operator\n[ -z "${INVOCATION_ID:-}" ] || RUN_BY=unit\n', script)
+        self.assertEqual(script.count("RUN_BY="), 2)
+        self.assertIn('"$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" "$RUN_BY" ', script)
+        for login in ("SUDO_USER", "LOGNAME", "$USER", "whoami", "logname", "id -un"):
+            self.assertNotIn(login, script)
 
 
 class CaptureTest(unittest.TestCase):
@@ -101,7 +134,8 @@ class CaptureTest(unittest.TestCase):
             directory.mkdir()
         (self.creds / "testonion.env").write_text(f"username={TESTONION_USER}\npassword={TESTONION_PASSWORD}\n")
         leak = write_leak_result(root / "leak-test.json")
-        result = json.loads(leak.read_text()) | {"guest_address": PLANTED_IPS[0], "route": PLANTED_IPS[3]}
+        result = json.loads(leak.read_text()) | {"guest_address": PLANTED_IPS[0], "route": PLANTED_IPS[3],
+                                                 "run_by": "mallory"}
         leak.write_text(json.dumps(result))
         self.settings = root / "settings.toml"
         self.settings.write_text(f'data_dir = "{self.data}"\nconfigs_dir = "{root / "configs"}"\n'
@@ -133,7 +167,8 @@ class CaptureTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_the_bundle_has_the_evidence_and_none_of_the_three(self):
-        with redirect_stdout(io.StringIO()), mock.patch.object(capture.Path, "home", return_value=self.data):
+        with redirect_stdout(io.StringIO()), mock.patch.object(capture.Path, "home", return_value=self.data), \
+                mock.patch.object(capture, "login_names", return_value=PLANTED_USERS):
             self.assertEqual(capture.main(["--settings", str(self.settings), "--credentials", str(self.creds),
                                            "--out", str(self.out)]), 0)
         (bundle,) = self.out.iterdir()
@@ -143,8 +178,9 @@ class CaptureTest(unittest.TestCase):
                               "leak-test.json", "tor-lines.txt", "log-audit.txt", "MANIFEST.txt"}, set(files))
         everything = "".join(files.values())
         for planted in (TESTONION, TESTONION.removesuffix(".onion"), TESTONION_USER, TESTONION_PASSWORD,
-                        PLANTED_IPS[0], PLANTED_IPS[1], PLANTED_IPS[3]):
+                        PLANTED_IPS[0], PLANTED_IPS[1], PLANTED_IPS[3], "mallory"):
             self.assertNotIn(planted, everything)
+        self.assertIn('"run_by": "[user]"', files["leak-test.json"])
         self.assertIn("[testonion address]", files["sources-export.jsonl"])
         self.assertIn("[credential]", files["sources-export.jsonl"])
         self.assertIn('"guest_address": "[ip]"', files["leak-test.json"])
