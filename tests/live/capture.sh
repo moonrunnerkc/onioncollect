@@ -28,7 +28,7 @@ capture_start() {
     echo "capture: tcpdump -i $DEV 'not port 22' for $1, guest address $LOCAL_IP"
     tcpdump -i "$DEV" -nn -Z root -w "$WORK/cap.pcap" 'not port 22' 2>"$WORK/tcpdump.err" &
     TCPDUMP=$!
-    ( while :; do echo "sample $(date +%s)"; ss -tnpH state established; sleep 1; done ) > "$WORK/ss.txt" &
+    ( while :; do echo "sample $(date +%s)"; ss -tnpeH state established; sleep 1; done ) > "$WORK/ss.txt" &
     SAMPLER=$!
     iptables -I "${LOG_RULE[@]:0:1}" 1 "${LOG_RULE[@]:1}"
     sleep 2

@@ -2,8 +2,9 @@
 
 Usage (guest, as crawler): leak_analyze.py CAPTURE_TXT SS_SAMPLES FLOW_LOG LOCAL_IP PASSWORD_FILE
 CAPTURE_TXT is `tcpdump -r cap.pcap -nn -q -tt` output. FLOW_LOG is the kernel's LOG --log-uid line for
-every new outbound flow during the window. SS_SAMPLES (repeated `ss -tnpH state established`) covers
-connections Tor opened before the window started.
+every new outbound flow during the window. SS_SAMPLES (repeated `ss -tnpeH state established`) covers
+connections Tor opened before the window started. A window in which no packet left from a Tor UID fails: it saw
+no fetch, so it proves nothing about the fetcher.
 """
 import ipaddress
 import pwd
@@ -14,7 +15,9 @@ from pathlib import Path
 
 from stem.control import Controller
 
-SS_LINE = re.compile(r"\S+\s+\S+\s+(\S+):(\d+)\s+(\S+):(\d+)\s+users:\(\(\"([^\"]+)\"")
+SS_LINE = re.compile(r"\S+\s+\S+\s+(\S+):(\d+)\s+(\S+):(\d+)\s+users:\(\(")
+# ss -e prints a socket's uid only when it is not root's.
+SS_UID = re.compile(r"\buid:(\d+)")
 FLOW_LINE = re.compile(r"DST=(\S+) .*?PROTO=(\w+)(?: SPT=\d+ DPT=(\d+))?.*?UID=(\d+)")
 DHCP_PORTS = {67, 68}
 TOR_UIDS = {pwd.getpwnam(f"_tor-crawl{n}").pw_uid for n in range(1, 7)}
@@ -42,13 +45,14 @@ def parse_capture(path: Path, local_ip: str):
     return packets
 
 
-def parse_sockets(path: Path, local_ip: str):
-    owners: dict[tuple[str, int], set[str]] = {}
-    for match in SS_LINE.finditer(path.read_text()):
-        local, _, peer, peer_port, process = match.groups()
-        if local != local_ip:
+def parse_sockets(path: Path, local_ip: str) -> dict[tuple[str, int], set[int]]:
+    owners: dict[tuple[str, int], set[int]] = {}
+    for line in path.read_text().splitlines():
+        match = SS_LINE.match(line.strip())
+        if not match or match[1] != local_ip:
             continue
-        owners.setdefault((peer, int(peer_port)), set()).add(process)
+        uid = SS_UID.search(line)
+        owners.setdefault((match[3], int(match[4])), set()).add(int(uid[1]) if uid else 0)
     return owners
 
 
@@ -76,11 +80,11 @@ def main(capture: Path, samples: Path, flow_log: Path, local_ip: str, password_f
     subnet = ipaddress.ip_network(f"{local_ip}/24", strict=False)
 
     failures = []
-    non_tor = {endpoint: procs for endpoint, procs in owners.items() if procs != {"tor"}}
-    for endpoint, procs in non_tor.items():
-        failures.append(f"socket to {endpoint[0]}:{endpoint[1]} owned by {sorted(procs)}")
+    non_tor = {endpoint: uids for endpoint, uids in owners.items() if not uids <= TOR_UIDS}
+    for endpoint, uids in non_tor.items():
+        failures.append(f"socket to {endpoint[0]}:{endpoint[1]} owned by uid {sorted(uids - TOR_UIDS)}")
 
-    dhcp, ipv6, attributed = 0, 0, Counter()
+    dhcp, ipv6, from_tor, attributed = 0, 0, 0, Counter()
     for packet in packets:
         host, port = packet["remote"]
         if packet["family"] == "IP6":
@@ -90,11 +94,11 @@ def main(capture: Path, samples: Path, flow_log: Path, local_ip: str, password_f
         if port in DHCP_PORTS and ipaddress.ip_address(host) in subnet:
             dhcp += 1
             continue
-        flow_uids = flows.get((host, port))
-        if flow_uids is not None and flow_uids <= TOR_UIDS:
+        # A new flow is judged by the uid the kernel logged for it; one Tor opened before the window, by ss.
+        uids = flows.get((host, port), owners.get((host, port)))
+        if uids and uids <= TOR_UIDS:
             attributed[(host, port)] += 1
-        elif flow_uids is None and owners.get((host, port)) == {"tor"}:
-            attributed[(host, port)] += 1
+            from_tor += packet["outbound"]
         else:
             failures.append(f"{packet['protocol']} packet {'to' if packet['outbound'] else 'from'} {host}:{port} not on a tor socket")
 
@@ -104,6 +108,7 @@ def main(capture: Path, samples: Path, flow_log: Path, local_ip: str, password_f
     in_consensus = endpoints & relays
     outbound = sum(1 for p in packets if p["outbound"])
     print(f"captured packets: {len(packets)} ({outbound} outbound, {len(packets) - outbound} inbound)")
+    print(f"outbound packets from the Tor UIDs: {from_tor}")
     print(f"remote endpoints: {len(endpoints)}, all on tor-owned sockets: {not failures}")
     print(f"endpoints listed in the Tor consensus as relays: {len(in_consensus)}/{len(endpoints)}")
     print(f"remote ports: {dict(Counter(port for _, port in endpoints).most_common())}")
@@ -116,7 +121,9 @@ def main(capture: Path, samples: Path, flow_log: Path, local_ip: str, password_f
         print(f"blocked before the wire: uid {pwd.getpwuid(uid).pw_name} -> {dst}:{port}")
     for failure in sorted(set(failures))[:20]:
         print(f"  LEAK? {failure}")
-    return 1 if failures else 0
+    if not from_tor:
+        print("  NO FETCH: no packet left the guest from a Tor UID, so the window proves nothing about the fetcher")
+    return 1 if failures or not from_tor else 0
 
 
 if __name__ == "__main__":
