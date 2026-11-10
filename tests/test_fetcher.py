@@ -207,6 +207,53 @@ class RefusalTest(FetcherTestCase):
         self.assertEqual({host for _, host in self.served_by}, {NEWS})
 
 
+class HostPrefixTest(FetcherTestCase):
+    """A source whose site answers only under www: the request names www.<address>, and everything that decides
+    or isolates (the host set, the circuit, the result) still names the bare address."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.configs["news"] = news_config(NEWS_CONFIG.replace('cadence = "6h"', 'cadence = "6h"\nhost_prefix = "www"'))
+        self.www = f"www.{NEWS}"
+
+    async def test_the_request_is_prefixed_and_the_circuit_and_result_are_not(self):
+        self.route("/a?b=1", host=self.www)
+        result = await self.fetcher.fetch("news", "/a?b=1")
+        self.assertEqual((result.error, result.host, result.url), (None, NEWS, f"http://{NEWS}/a?b=1"))
+        self.assertEqual(self.served_by, [(NEWS, self.www)])
+        self.assertEqual([kwargs["username"] for kwargs in self.transport_kwargs], [NEWS])
+
+    async def test_a_redirect_to_the_prefixed_address_is_the_sources_own(self):
+        for path, location, target in (("/1", f"http://{self.www}/c?d=1", f"http://{NEWS}/c?d=1"), ("/2", "/c", f"http://{NEWS}/c"),
+                                       ("/3", f"http://{OFF_SOURCE}/x", f"http://{OFF_SOURCE}/x"),
+                                       ("/4", f"http://www.{OFF_SOURCE}/x", None), ("/5", f"http://www.{self.www}/x", None),
+                                       ("/6", f"http://{self.www}.example.com/x", None), ("/7", "https://www.example.com/", None)):
+            with self.subTest(location=location):
+                self.route(path, status=301, headers={"location": location}, host=self.www)
+                result = await self.fetcher.fetch("news", path)
+                self.assertEqual((result.error, result.redirect_to), ("redirect", target))
+        self.assertEqual(len(self.requests), 7, "none followed")
+
+    async def test_a_prefixed_url_never_resolves_outside_the_sources_address(self):
+        paths = ("//evil.com/", "/@evil.com", f"//{OFF_SOURCE}/x", f"/x?next=http://{OFF_SOURCE}/", "/a://b")
+        for path in paths:
+            self.route(path, host=self.www)
+            await self.fetcher.fetch("news", path)
+        for path in ("@evil.com/", f".{OFF_SOURCE}/", ":81/", "http://evil.com/", ""):
+            with self.subTest(path=path):
+                self.assertEqual((await self.fetcher.fetch("news", path)).error, "bad_path")
+        self.assertEqual(set(self.served_by), {(NEWS, self.www)})
+        self.assertEqual(len(self.requests), len(paths))
+
+    async def test_the_checks_still_read_the_bare_address(self):
+        fetcher = Fetcher(throwaway_settings(exclusions=frozenset({NEWS})), self.tor, self.table, self.configs,
+                          lifecycle.COLLECTING)
+        self.assertEqual((await fetcher.fetch("news", "/")).error, "excluded")
+        await self.table.change_state("news", lifecycle.DISABLED, "test")
+        self.assertEqual((await self.fetcher.fetch("news", "/")).error, "not_approved")
+        self.assertEqual(self.requests, [])
+
+
 class BodyTest(FetcherTestCase):
     async def test_non_text_body_never_read(self):
         stream = TrackingStream([b"\x89PNG" * 100])

@@ -128,6 +128,33 @@ class PathForTest(unittest.TestCase):
             self.assertIsNone(config.path_for(url), url)
 
 
+class HostPrefixTest(unittest.TestCase):
+    WWW = edited('cadence = "6h"', 'cadence = "6h"\nhost_prefix = "www"')
+
+    def test_www_is_the_only_value_the_schema_takes(self):
+        self.assertEqual(parse(self.WWW, "news").host_prefix, "www")
+        self.assertIsNone(news_config().host_prefix)
+        self.assertEqual(parse(self.WWW, "news").hosts, (NEWS,), "the host set is still the bare address")
+        for value in ('"m"', '"WWW"', '"www."', '"www2"', '""', '"www.cdn"', '" www"', "1", "true", '["www"]',
+                      f'"{OFF_SOURCE}"'):
+            with self.subTest(value=value), self.assertRaisesRegex(ConfigError, "host_prefix can only be"):
+                parse(edited('cadence = "6h"', f'cadence = "6h"\nhost_prefix = {value}'), "news")
+
+    def test_never_on_the_source_that_logs_in(self):
+        with self.assertRaisesRegex(ConfigError, "never on a form-session source"):
+            testonion_config(TESTONION_CONFIG.replace('cadence = "6h"', 'cadence = "6h"\nhost_prefix = "www"'))
+
+    def test_a_prefixed_link_is_a_path_only_on_the_sources_own_address(self):
+        config = parse(self.WWW, "news")
+        self.assertEqual(config.path_for(f"https://www.{NEWS}/a?b=1#c"), "/a?b=1")
+        self.assertEqual(config.path_for(f"http://{NEWS}/a"), "/a")
+        for url in (f"http://www.{OFF_SOURCE}/a", f"http://www.www.{NEWS}/a", f"http://m.{NEWS}/a",
+                    f"http://www.{NEWS}.example.com/a", f"http://www.{NEWS}@example.com/a", "https://www.example.com/"):
+            with self.subTest(url=url):
+                self.assertIsNone(config.path_for(url))
+        self.assertIsNone(news_config().path_for(f"http://www.{NEWS}/a"), "no prefix in the config, no www links")
+
+
 class ScaffoldTest(unittest.TestCase):
     def test_scaffold_fails_until_filled_in(self):
         text = scaffold("new-source", NEWS, "directories")
