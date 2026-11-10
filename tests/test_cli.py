@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import io
 import json
@@ -197,6 +198,52 @@ class TriageTest(CliTestCase):
         self.assertIn("already reviewed", self.refused(
             "triage", "approve", CANDIDATE, "--as", "x1", "--category", "directories", "--note", "n"))
         self.assertIn("(sells account data)", self.cli("sources", "list", "--state", "declined"))
+
+
+class TriageRequestTest(CliTestCase):
+    def test_a_request_is_a_candidate_with_where_it_was_seen(self):
+        out = self.cli("triage", "request", f"  {CANDIDATE.upper()} ", "--found-at", " publisher's  footer,\n 2026-11-10 ")
+        self.assertIn(f"{CANDIDATE} added as a candidate", out)
+        self.assertIn(f"{CANDIDATE}  found on request: publisher's footer, 2026-11-10", self.cli("triage", "list"))
+        self.assertIn("approved as docs", self.cli("triage", "approve", CANDIDATE, "--as", "docs", "--category",
+                                                   "software-infrastructure", "--note", "n"))
+
+    def test_only_a_checksum_valid_bare_v3_host_is_taken(self):
+        label = CANDIDATE.removesuffix(".onion")
+        flipped = ("b" if CANDIDATE[0] != "b" else "c") + CANDIDATE[1:]
+        for host in (flipped, label, f"www.{CANDIDATE}", f"http://{CANDIDATE}/", f"{CANDIDATE}/x", "example.com",
+                     "expyuzz4wqqyqhjn.onion", ""):
+            with self.subTest(host=host):
+                self.assertIn("not a v3 onion host", self.refused("triage", "request", host, "--found-at", "x"))
+        self.assertEqual(self.cli("triage", "list").strip(), "0 candidates")
+
+    def test_an_excluded_host_and_a_bad_found_at_are_refused(self):
+        self.assertIn("exclusion list", self.refused("triage", "request", EXCLUDED, "--found-at", "x"))
+        for text in ("", "  \n ", "x" * 201, f"listed beside {OFF_SOURCE}"):
+            with self.subTest(text=text[:20]):
+                self.assertIn("--found-at is 1 to 200", self.refused("triage", "request", CANDIDATE, "--found-at", text))
+        self.assertEqual(self.table_do(lambda table: table.hosts()), [])
+
+    def test_a_host_already_known_is_left_as_it_was(self):
+        self.cli("triage", "decline", CANDIDATE, "--reason", "sells account data")
+        self.assertIn("already known; nothing changed", self.cli("triage", "request", CANDIDATE, "--found-at", "again"))
+        (row,) = self.table_do(lambda table: table.hosts())
+        self.assertEqual((row["state"], row["found_on"], row["reason"]), (lifecycle.DECLINED, None, "sells account data"))
+
+    def test_it_is_the_analysts_and_it_cannot_fetch(self):
+        with mock.patch("os.geteuid", return_value=os.geteuid() + 1):
+            self.assertIn("not owned by this user", self.refused("triage", "request", CANDIDATE, "--found-at", "x"))
+        tree = ast.parse((Path(cli.__file__).parent / "triage_cli.py").read_text())
+        imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+        imported |= {f"{node.module}.{alias.name}" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+                     for alias in node.names}
+        self.assertEqual(imported, {
+            "argparse", "onioncollect.lifecycle", "onioncollect.matching", "onioncollect.mirrors", "onioncollect.onion",
+            "onioncollect.safety", "onioncollect.source_config", "onioncollect.config.Settings",
+            "onioncollect.config.config_path", "onioncollect.config.write_config", "onioncollect.records.RecordStore",
+            "onioncollect.source_config.ConfigError", "onioncollect.sources.RefusedChange",
+            "onioncollect.sources.SourceTable", "onioncollect.sources.approvable", "onioncollect.stores.operator",
+            "onioncollect.stores.reading", "onioncollect.stores.with_stores"})
 
 
 class SourcesTest(CliTestCase):
