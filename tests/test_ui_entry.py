@@ -149,6 +149,8 @@ class RefusalTest(unittest.TestCase):
             finally:
                 data.chmod(0o750)
         self.assertIn("collect.db unreadable", str(caught.exception))
+        self.assertIn("the writer creates it when it starts", str(caught.exception))
+        self.assertNotIn("crawler", str(caught.exception))
 
 
 if __name__ == "__main__":

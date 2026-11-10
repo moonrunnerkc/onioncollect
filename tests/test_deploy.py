@@ -153,6 +153,11 @@ class UnitFilesTest(unittest.TestCase):
                          ("onioncollect", "onioncollect-ipc"))
         self.assertEqual(writer["Install"]["WantedBy"], "multi-user.target", "enabled at boot")
 
+    def test_the_ui_starts_after_the_writer_that_creates_the_stores(self):
+        ui_unit = unit("onioncollect-ui.service")["Unit"]
+        self.assertIn("onioncollect-writer.service", ui_unit["After"].split())
+        self.assertEqual(ui_unit["Wants"], "onioncollect-writer.service")
+
     def test_the_credential_reaches_the_analyst_units_through_systemd_only(self):
         # The bare id makes systemd search its credstore, where a missing credential falls back to SetCredential.
         # A missing file named by an absolute path fails the unit instead (status 243, systemd 257), so the audit

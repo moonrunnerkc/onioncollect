@@ -86,7 +86,7 @@ class CliTestCase(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
-        # In the guest the crawler's first command creates both stores; readers never create one.
+        # In the guest the writer creates both stores when it starts; readers never create one.
         self.table_do(lambda table: asyncio.sleep(0))
         self.store_do(lambda store: asyncio.sleep(0))
 
@@ -144,7 +144,7 @@ class MainTest(CliTestCase):
         with mock.patch("os.geteuid", return_value=os.geteuid() + 1):
             self.assertIn("0 candidates", self.cli("triage", "list"))
         (self.data / "records.db").unlink()
-        self.assertIn("records.db yet; the crawler's first command creates it", self.refused("sources", "export"))
+        self.assertIn("records.db yet; the writer creates it when it starts", self.refused("sources", "export"))
         self.assertFalse((self.data / "records.db").exists())
 
     def test_bad_settings_is_a_clean_exit(self):
