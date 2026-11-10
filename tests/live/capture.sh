@@ -20,6 +20,13 @@ report() {
 }
 # runuser, not sudo: root drops to the crawler with no setuid binary, so the daily timer's NoNewPrivileges holds.
 as_crawler() { runuser -u crawler -- env HOME=/home/crawler "$@"; }
+# stop_within PID: TERM, then KILL if it is still running 5 s later. runuser takes about 2 s to end its child.
+stop_within() {
+    kill "$1" 2>/dev/null || return 0
+    for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$1" 2>/dev/null || return 0; sleep 0.5; done
+    kill -KILL "$1" 2>/dev/null
+    echo "      pid $1 ignored TERM for 5 s and was killed"
+}
 drop_count() { iptables -L OUTPUT -v -n -x | awk '$3 == "DROP" {print $1}'; }
 # Counts packets in the finished capture that match a tcpdump filter.
 captured() { tcpdump -r "$WORK/cap.pcap" -nn "$1" 2>/dev/null | wc -l; }
@@ -32,10 +39,11 @@ capture_start() {
     TCPDUMP=$!
     ( while :; do echo "sample $(date +%s)"; ss -tnpeH state established; sleep 1; done ) > "$WORK/ss.txt" &
     SAMPLER=$!
-    # Each Tor instance's own list of its relay connections, for one the flow log and ss both miss. A kill of
-    # runuser reaches the sampler too.
-    as_crawler "$PY" -I "$APP/tests/live/orconn_sample.py" /home/crawler/control-password > "$WORK/orconn.txt" \
-        2>"$WORK/orconn.err" &
+    # Each Tor instance's own list of its relay connections, for one the flow log and ss both miss. runuser is
+    # started directly, not through as_crawler: a backgrounded function is a subshell, $! would name it, and
+    # killing it would leave runuser and the sampler running. A kill of runuser reaches the sampler.
+    runuser -u crawler -- env HOME=/home/crawler "$PY" -I "$APP/tests/live/orconn_sample.py" \
+        /home/crawler/control-password > "$WORK/orconn.txt" 2>"$WORK/orconn.err" &
     ORCONN=$!
     iptables -I "${LOG_RULE[@]:0:1}" 1 "${LOG_RULE[@]:1}"
     sleep 2
@@ -52,7 +60,8 @@ capture_stop() {
     else
         ORCONN_RUN="stopped early: $(tail -1 "$WORK/orconn.err" | head -c 120)"
     fi
-    kill "$SAMPLER" "$ORCONN" 2>/dev/null
+    kill "$SAMPLER" 2>/dev/null
+    stop_within "$ORCONN"
     kill -INT "$TCPDUMP" && wait "$TCPDUMP" 2>/dev/null
     TCPDUMP= SAMPLER= ORCONN=
     tcpdump -r "$WORK/cap.pcap" -nn -q -tt 2>/dev/null > "$WORK/cap.txt"

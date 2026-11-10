@@ -6,6 +6,7 @@ established sockets, so one that never shows as established while the window is 
 Tor still lists it. Each line is `UID ADDRESS PORT`: the instance's uid and the relay's address and ORPort,
 from the consensus. A relay the consensus does not name is left out, so its packets stay unattributed.
 """
+import os
 import pwd
 import sys
 import time
@@ -36,12 +37,14 @@ def relay_endpoint(controller, server_id: str, cache: dict) -> tuple[str, int] |
 
 def main(password_file: Path) -> None:
     password = password_file.read_text().strip()
+    # Started by runuser for the capture window; once runuser is gone, nothing will read another sample.
+    parent = os.getppid()
     instances = []
     for n in INSTANCES:
         controller = Controller.from_port(address="127.0.0.1", port=CONTROL_PORT_BASE + n)
         controller.authenticate(password=password)
         instances.append((pwd.getpwnam(f"_tor-crawl{n}").pw_uid, controller, {}))
-    while True:
+    while os.getppid() == parent:
         print(f"sample {int(time.time())}")
         for uid, controller, cache in instances:
             try:
