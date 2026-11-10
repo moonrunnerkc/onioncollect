@@ -8,6 +8,8 @@ FAILED=0
 # new outbound flow, so attribution never depends on catching a short-lived socket with ss.
 LOG_RULE=(OUTPUT ! -o lo -m conntrack --ctstate NEW -j LOG --log-prefix "onioncrawl-lt3: " --log-uid)
 capture_cleanup() {
+    # A run that stops before capture_stop leaves no capture or sampler behind; capture_stop clears these pids.
+    [ -z "${TCPDUMP:-}${SAMPLER:-}${ORCONN:-}" ] || kill ${TCPDUMP:-} ${SAMPLER:-} ${ORCONN:-} 2>/dev/null
     iptables -D "${LOG_RULE[@]}" 2>/dev/null
     rm -rf "$WORK"
 }
@@ -30,6 +32,11 @@ capture_start() {
     TCPDUMP=$!
     ( while :; do echo "sample $(date +%s)"; ss -tnpeH state established; sleep 1; done ) > "$WORK/ss.txt" &
     SAMPLER=$!
+    # Each Tor instance's own list of its relay connections, for one the flow log and ss both miss. A kill of
+    # runuser reaches the sampler too.
+    as_crawler "$PY" -I "$APP/tests/live/orconn_sample.py" /home/crawler/control-password > "$WORK/orconn.txt" \
+        2>"$WORK/orconn.err" &
+    ORCONN=$!
     iptables -I "${LOG_RULE[@]:0:1}" 1 "${LOG_RULE[@]:1}"
     sleep 2
     STARTED=$(date +%s)
@@ -40,11 +47,18 @@ capture_stop() {
     DROPS_AFTER=$(drop_count)
     iptables -D "${LOG_RULE[@]}"
     journalctl -k --since "@$((STARTED - 2))" -o cat --no-pager | grep "onioncrawl-lt3: " > "$WORK/flows.txt"
-    kill "$SAMPLER" 2>/dev/null
+    if kill -0 "$ORCONN" 2>/dev/null; then
+        ORCONN_RUN="sampled the whole window"
+    else
+        ORCONN_RUN="stopped early: $(tail -1 "$WORK/orconn.err" | head -c 120)"
+    fi
+    kill "$SAMPLER" "$ORCONN" 2>/dev/null
     kill -INT "$TCPDUMP" && wait "$TCPDUMP" 2>/dev/null
+    TCPDUMP= SAMPLER= ORCONN=
     tcpdump -r "$WORK/cap.pcap" -nn -q -tt 2>/dev/null > "$WORK/cap.txt"
-    chmod 755 "$WORK" && chmod 644 "$WORK/cap.txt" "$WORK/ss.txt" "$WORK/flows.txt"
+    chmod 755 "$WORK" && chmod 644 "$WORK/cap.txt" "$WORK/ss.txt" "$WORK/flows.txt" "$WORK/orconn.txt"
     echo "      capture closed after $(( $(date +%s) - STARTED ))s"
+    echo "      Tor's own connection list: $(grep -c '^sample ' "$WORK/orconn.txt") samples, $ORCONN_RUN"
     echo "      kill switch DROP counter: $DROPS_BEFORE -> $DROPS_AFTER (blocked attempts never reach the wire)"
     echo "      ss -tnp | grep -v 127.0.0.1, at the end of the window:"
     ss -tnpH | grep -v 127.0.0.1 | awk '{print "        " $1, $4, $5, $6}' | head -12
@@ -61,7 +75,7 @@ socks_peaks() {
 
 capture_judge() {
     if as_crawler "$PY" "$APP/tests/live/leak_analyze.py" "$WORK/cap.txt" "$WORK/ss.txt" "$WORK/flows.txt" \
-            "$LOCAL_IP" /home/crawler/control-password | sed 's/^/      /'; then
+            "$LOCAL_IP" /home/crawler/control-password "$WORK/orconn.txt" | sed 's/^/      /'; then
         report "$1" pass
     else
         report "$1" fail
