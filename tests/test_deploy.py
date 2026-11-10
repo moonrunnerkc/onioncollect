@@ -189,6 +189,18 @@ class UnitFilesTest(unittest.TestCase):
             "\tlimactl shell $(VM) sudo bash /opt/onioncollect/app/tests/live/leak_test.sh",
             "\tlimactl shell $(VM) sudo systemctl start onioncollect-crawl.timer"])
 
+    def test_install_loads_each_users_settings_before_anything_is_swapped_in_or_restarted(self):
+        install = (ROOT / "deploy" / "install.sh").read_text()
+        check = 'runuser -u "$1" -- "$OPT/venv/bin/python" -s -E "$OPT/app.new/tools/settings_check.py" "${@:2}"'
+        order = ["systemctl stop onioncollect-crawl.timer",
+                 "install -m 600 -o analyst -g analyst /home/crawler/exclusions.txt /home/analyst/exclusions.txt",
+                 check, "settings_check crawler --crawl /home/crawler/settings.toml",
+                 "settings_check analyst /home/analyst/settings.toml", 'mv "$OPT/app.new" "$OPT/app"',
+                 "systemctl restart onioncollect-writer.service", "deploy-stamp"]
+        self.assertEqual([install.count(step) for step in order[:-1]], [1] * (len(order) - 1))
+        positions = [install.index(step) for step in order]
+        self.assertEqual(positions, sorted(positions))
+
 
 class ConfigSyncTest(unittest.TestCase):
     """deploy/sync_configs.sh on a fake guest tree: a guest config the checkout lacks is never deleted unless

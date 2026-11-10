@@ -97,7 +97,8 @@ onioncollect/
   cli.py            triage / sources / records / mirrors / search / retention (analyst)
 configs/            one reviewed TOML file per source, committed
 deploy/             make deploy's guest half (install.sh), the config sync, and the systemd units it installs
-tools/              writeup_check.py (markers left in the write-up) and writeup_capture.py (the guest's evidence, stripped)
+tools/              writeup_check.py (markers left in the write-up), writeup_capture.py (the guest's evidence, stripped)
+                    and settings_check.py (make deploy's preflight: each user's settings load, or nothing restarts)
 docs/writeup.md     the write-up; every number is a [PASTE: ...] marker until it comes from the guest
 testonion/          section 15's self-hosted onion for its own VM (testonion-vm): the stdlib app, its torrc,
                     systemd unit, setup script and Lima file, and the stage 1 and stage 2 configs
