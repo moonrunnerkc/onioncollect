@@ -28,9 +28,13 @@ judged() {
     FAILED=$(( before | FAILED ))
 }
 
+# Who ran it, as a role and never a login name: the result is evidence that goes into the write-up. systemd gives
+# every unit it starts an invocation id; anything else is a person running make deploy or make leak-test.
+RUN_BY=operator
+[ -z "${INVOCATION_ID:-}" ] || RUN_BY=unit
 write_result() {
     printf '{"run_at": "%s", "run_by": "%s", "deploy_stamp": "%s", "tests": [%s]}\n' \
-        "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" "${SUDO_USER:-root}" "$(tr -cd '0-9A-Za-z:. -' < "$STAMP_FILE" 2>/dev/null)" \
+        "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" "$RUN_BY" "$(tr -cd '0-9A-Za-z:. -' < "$STAMP_FILE" 2>/dev/null)" \
         "$TESTS" > "$WORK/result.json"
     install -d -m 755 -o root -g root "$(dirname "$RESULT_FILE")"
     install -m 644 -o root -g root "$WORK/result.json" "$RESULT_FILE"

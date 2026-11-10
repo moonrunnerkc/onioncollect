@@ -2,10 +2,12 @@
 bundle under OUT/<UTC time>/. Every file comes from a read-only command or query; the crawl log contributes only
 its Tor instance lines, and nothing else from the data dir goes in raw. Before anything is written, every file is
 stripped of the testonion address, any section 15 credential value (read from the *.env files in --credentials,
-as log_audit does) and every IP address, then checked again: if anything survived, nothing is written."""
+as log_audit does), every IP address and the login name of every account with a home under /home but the two
+role accounts, then checked again: if anything survived, nothing is written."""
 import argparse
 import ipaddress
 import json
+import pwd
 import re
 import sqlite3
 import subprocess
@@ -22,7 +24,19 @@ from tests.live.log_audit import credentials  # noqa: E402
 TESTONION = "testonion"
 TOR_LINE = re.compile(r" onioncollect\.tor_pool: tor \d+: (rotated circuits|success |no circuit after )")
 IP_CANDIDATE = re.compile(r"(?<![\w.:])[0-9A-Fa-f.:]*[.:][0-9A-Fa-f.:]+(?![\w.:])")
-HIDDEN = {"testonion": "[testonion address]", "credential": "[credential]", "ip": "[ip]"}
+HIDDEN = {"testonion": "[testonion address]", "credential": "[credential]", "user": "[user]", "ip": "[ip]"}
+# The accounts whose names are roles, the same on every deployment. Any other login name says who the operator is.
+ROLES = frozenset({"crawler", "analyst"})
+
+
+def login_names() -> set[str]:
+    return {entry.pw_name for entry in pwd.getpwall() if entry.pw_dir.startswith("/home/")} - ROLES
+
+
+def user_pattern(users: set[str]) -> re.Pattern | None:
+    """A login name as a whole word, so a name that is also part of a longer word leaves that word alone."""
+    names = "|".join(re.escape(name) for name in sorted(users, key=len, reverse=True) if name)
+    return re.compile(rf"(?<![\w-])(?:{names})(?![\w-])") if names else None
 
 
 def is_ip(candidate: str) -> bool:
@@ -43,30 +57,37 @@ def needles(hosts: set[str], secrets: set[str]) -> dict[str, set[str]]:
     return {"testonion": {needle for needle in hosts | labels if needle}, "credential": {s for s in secrets if s}}
 
 
-def strip(texts: dict[str, str], hosts: set[str], secrets: set[str]) -> tuple[dict[str, str], dict[str, int]]:
+def strip(texts: dict[str, str], hosts: set[str], secrets: set[str],
+          users: set[str]) -> tuple[dict[str, str], dict[str, int]]:
     counts = dict.fromkeys(HIDDEN, 0)
     found = needles(hosts, secrets)
+    named = user_pattern(users)
     stripped = {}
     for name, text in texts.items():
         for kind in ("credential", "testonion"):
             for needle in sorted(found[kind], key=len, reverse=True):
                 counts[kind] += text.count(needle)
                 text = text.replace(needle, HIDDEN[kind])
+        if named:
+            text, hits = named.subn(HIDDEN["user"], text)
+            counts["user"] += hits
         counts["ip"] += len(ip_spans(text))
         stripped[name] = IP_CANDIDATE.sub(lambda m: HIDDEN["ip"] if is_ip(m.group(0)) else m.group(0), text)
     return stripped, counts
 
 
-def survivors(texts: dict[str, str], hosts: set[str], secrets: set[str]) -> list[str]:
+def survivors(texts: dict[str, str], hosts: set[str], secrets: set[str], users: set[str]) -> list[str]:
     found = needles(hosts, secrets)
-    return [f"{name}: {kind}" for name, text in texts.items() for kind in ("testonion", "credential")
-            if any(needle in text for needle in found[kind])] + [f"{name}: ip" for name, text in texts.items()
-                                                                 if ip_spans(text)]
+    named = user_pattern(users)
+    return ([f"{name}: {kind}" for name, text in texts.items() for kind in ("testonion", "credential")
+             if any(needle in text for needle in found[kind])]
+            + [f"{name}: user" for name, text in texts.items() if named and named.search(text)]
+            + [f"{name}: ip" for name, text in texts.items() if ip_spans(text)])
 
 
-def write_bundle(out: Path, texts: dict[str, str], hosts: set[str], secrets: set[str]) -> Path:
-    stripped, counts = strip(texts, hosts, secrets)
-    left = survivors(stripped, hosts, secrets)
+def write_bundle(out: Path, texts: dict[str, str], hosts: set[str], secrets: set[str], users: set[str]) -> Path:
+    stripped, counts = strip(texts, hosts, secrets, users)
+    left = survivors(stripped, hosts, secrets, users)
     if left:
         raise SystemExit(f"writeup-capture: nothing written, still present after stripping: {', '.join(left)}")
     target = out / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -138,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
     hosts = {row["host"] for row in rows(settings.data_dir / "collect.db",
                                          "SELECT host FROM hosts WHERE source_id = ?", (TESTONION,))}
     target = write_bundle(args.out, gather(args.settings, settings, args.credentials), hosts,
-                          credentials(args.credentials))
+                          credentials(args.credentials), login_names())
     print(f"writeup-capture: {target}")
     return 0
 
