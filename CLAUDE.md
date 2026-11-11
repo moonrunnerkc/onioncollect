@@ -22,7 +22,7 @@ Violating any of these is a bug, not a judgment call:
 - `host_prefix` is a config key with one legal value, `"www"`, refused on a form-session source. It changes the request line only: `Fetcher._get` asks for `onion.with_label(url, prefix)`, and `onion.without_label` maps a link or a redirect on `www.<one of the source's hosts>` back to the bare host before `normalize` sees it. The host set, approval, exclusions, `result.host`, `result.url` and the SOCKS username stay the bare address, and a prefixed name on any other address is still refused.
 - `onion.normalize` and `is_v3_onion` are the only URL and host gates. `SourceConfig.path_for` is the only way a link becomes a frontier path, and it accepts only the source's own hosts. Every other onion host a page names goes to `SourceTable.add_candidates` and nowhere else.
 - A host is fetched only after a human approves it (`triage approve`: a category from `lifecycle.CATEGORIES`, a reviewer note, never a host on the exclusion list), and collected only after `golive` passes. Declined is final; rediscovery never resurrects a host.
-- A host joins another source's host set only by a human decision: `triage approve --as-mirror-of X`, `golive --as-mirror-of X`, or `sources merge A --into X` (seed fingerprints within `MIRROR_MAX_BITS`, or `--force` with a note). Clustering reads stored seed-page fingerprints and writes `sources.cluster_id`, nothing else; it never fetches and never changes a host set or a state. A config's `hosts` array is edited only by `source_config.with_hosts`, which proves the edit by reading it back.
+- A host joins another source's host set only by a human decision: `triage approve --as-mirror-of X`, `golive --as-mirror-of X`, or `sources merge A --into X` (seed fingerprints within `MIRROR_MAX_BITS`, or `--force` with a note). Clustering reads stored seed-page fingerprints and writes `sources.cluster_id`, nothing else; it never fetches and never changes a host set or a state. A config's `hosts` array is edited only by `config_text.with_hosts`, which proves the edit by reading it back.
 - `golive` refuses a source whose seed pages match another source's until the analyst passes `--confirm-new-source` or `--as-mirror-of`.
 - `golive` refuses before any fetch (check 3), and `crawl run` refuses before Tor or a client exists, unless `settings.leak_test_result`, written as root by `make leak-test`, is owned by root, is writable by nobody but its owner, names all four leak tests as passed, is under `LEAK_TEST_MAX_AGE` (36 h) old, and records the deploy stamp `make deploy` wrote beside it (`golive.DEPLOY_STAMP`, also root's). Code deployed after the last leak test never fetches; `make deploy` ends by running the leak tests.
 - `crawl run` loads every collecting source's config through the loader before Tor starts and refuses to run if any fails, then logs the form-session sources by id. A config can change with no golive (testonion's switch to form-session), so this is its gate.
@@ -63,7 +63,8 @@ onioncollect/
   safety.py         host exclusions, child-safety body check (pure)
   detect.py         secret spans: credential pairs, emails, cards, IDs, tokens (pure)
   lifecycle.py      source and host states, policy categories, transitions (pure)
-  source_config.py  collection config schema, TOML parsing, the approval scaffold (pure)
+  source_config.py  collection config schema, TOML parsing (pure)
+  config_text.py    a config file as text: the approval scaffold, the hosts array edit proved by reading it back (pure)
   extractor.py      records, hit rate, next page and follows from one page (pure)
   redact.py         text to tags, counts and keyed hashes (pure)
   parser.py         links, discovered hosts, gate detection, visible text (pure)

@@ -4,7 +4,7 @@ import os
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-from onioncollect import config_cli, crawl_cli, health, health_cli, lifecycle, matching, mirrors, source_config, triage_cli
+from onioncollect import config_cli, config_text, crawl_cli, health, health_cli, lifecycle, matching, mirrors, triage_cli
 from onioncollect.config import Settings, config_path, write_config
 from onioncollect.health_queue import HealthQueue
 from onioncollect.records import RecordStore
@@ -147,7 +147,7 @@ def merge_command(settings: Settings, args: argparse.Namespace) -> None:
                                 f" {args.into}'s (see mirrors {args.id}); --force --note to merge anyway")
         # Proven before anything changes, as in the fold.
         try:
-            text = source_config.with_hosts(config_path(settings.configs_dir, args.into).read_text(),
+            text = config_text.with_hosts(config_path(settings.configs_dir, args.into).read_text(),
                                             sorted((await table.resolve(args.id)).hosts))
         except (OSError, ConfigError) as exc:
             raise RefusedChange(f"{args.into}'s config: {exc}") from None

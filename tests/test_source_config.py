@@ -1,8 +1,11 @@
+import ast
 import unittest
 from datetime import timedelta
+from pathlib import Path
 
 from onioncollect import source_config
-from onioncollect.source_config import ConfigError, Selector, parse, scaffold, with_hosts
+from onioncollect.config_text import scaffold, with_hosts
+from onioncollect.source_config import ConfigError, Selector, parse
 from tests.fixtures import (NEWS, NEWS_CONFIG, NEWS_MIRROR, OFF_SOURCE, TESTONION, TESTONION_CONFIG, news_config,
                             testonion_config)
 from tests.test_onion import AHMIA, flip_char
@@ -156,6 +159,14 @@ class HostPrefixTest(unittest.TestCase):
 
 
 class ScaffoldTest(unittest.TestCase):
+    def test_the_text_module_imports_the_schema_and_nothing_that_can_fetch(self):
+        tree = ast.parse((Path(source_config.__file__).parent / "config_text.py").read_text())
+        imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+        imported |= {f"{node.module}.{alias.name}" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+                     for alias in node.names}
+        self.assertEqual(imported, {"re", "tomllib", "onioncollect.source_config.ConfigError",
+                                    "onioncollect.source_config.parse_hosts"})
+
     def test_scaffold_fails_until_filled_in(self):
         text = scaffold("new-source", NEWS, "directories")
         with self.assertRaises(ConfigError):

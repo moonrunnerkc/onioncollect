@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from onioncollect import lifecycle, matching, onion, source_config
+from onioncollect import config_text, lifecycle, matching, onion
 from onioncollect.config import Settings, config_path
 from onioncollect.db import LISTING
 from onioncollect.fetcher import Fetcher
@@ -187,7 +187,7 @@ async def fold(source: Source, mirror_of: str, near: tuple[int, int] | None, set
         return
     # The new config text is proven before anything changes, so a refusal leaves both sources as they were.
     try:
-        text = source_config.with_hosts(config_path(settings.configs_dir, mirror_of).read_text(), sorted(source.hosts))
+        text = config_text.with_hosts(config_path(settings.configs_dir, mirror_of).read_text(), sorted(source.hosts))
     except (OSError, ConfigError) as exc:
         report.check(False, f"mirror: {mirror_of}'s config: {exc}")
         return
