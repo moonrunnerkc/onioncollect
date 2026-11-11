@@ -10,9 +10,7 @@ Three ideas define the design, and every later section serves them:
 2. Collection is the product. Each source gets a declarative config (seeds, selectors, pagination, cadence) that turns pages into structured records. Records persist, are indexed, and are searchable. Health of every config is measured on every run.
 3. Operator safety is a hard boundary. All egress is Tor, enforced by the firewall, not by the code. A redaction gate runs before every write so that even an approved page can't put a credential or a person's data on disk.
 
-The output is a running system you can point a hiring manager at: a source list with lifecycle states, configs with hit-rate history, a searchable index of extracted records, a health queue with dispositions, and a test suite that proves the boundaries hold.
-
-This replaces the earlier breach-exposure-monitor plan. The Tor plumbing carries over intact. The feeds-first strategy, the client target list, and the match-gated storage are gone; they were designed for a product sold to clients, and this project is built to demonstrate collection capability instead.
+The output is a running system: a source list with lifecycle states, configs with hit-rate history, a searchable index of extracted records, a health queue with dispositions, and a test suite that proves the boundaries hold.
 
 ## 2. Hard non-goals, enforced in code
 
@@ -62,7 +60,7 @@ Component responsibilities:
 
 - Source list: every known onion host with a lifecycle state (section 7), its config, its policy category, and its mirror cluster.
 - Scheduler: picks which live sources are due, by cadence and by health, and hands source ids to workers.
-- Tor pool and fetcher: carried over from the original plan (sections 5 and 9). Fetches only what a source id resolves to.
+- Tor pool and fetcher: sections 5 and 9. Fetches only what a source id resolves to.
 - Extractor: runs the source's config against the page, emits structured records and a selector hit-rate report.
 - Redaction gate: strips credential- and PII-looking spans before anything is written.
 - Records DB and FTS index: persistence plus full-text search over extracted records.
@@ -71,9 +69,9 @@ Component responsibilities:
 - Health queue: failed or degraded sources, ordered by priority and age, with dispositions.
 - Go-live checks: the gate between `approved` and `live`.
 
-## 5. Operator safety (carried over)
+## 5. Operator safety
 
-Every anonymity control from the original plan stays. Accessing onion services exposes the operator's network position, and the point of this section is that the operator never has to think about it.
+Accessing onion services exposes the operator's network position, and the point of this section is that the operator never has to think about it.
 
 - Dedicated, full-disk-encrypted VM; two users (`crawler` for collection, `analyst` for triage, health, and search); snapshot after setup.
 - Six to ten Tor instances via `tor-instance-create`, each `ClientOnly 1`, `SafeLogging 1`, `IsolateSOCKSAuth`, per-instance system user.
@@ -81,7 +79,7 @@ Every anonymity control from the original plan stays. Accessing onion services e
 - Pinned reproducible dependencies with hashes.
 - Data directory on the encrypted disk, mode 700, owned by `analyst`; the crawler writes through a small local socket service so it never holds the DB file open. Analyst tooling never needs the crawler's circuits.
 
-The full environment setup (sections 3.1 to 3.4 of the original plan) is unchanged.
+The full environment setup is in `provision/`, described in `provision/README.md`.
 
 ## 6. Collection configs
 
@@ -142,7 +140,7 @@ Every onion host the system has ever seen is a row in the source table with one 
 - `disabled`: taken out of rotation by a human, with a reason. Not fetched.
 - `declined`: reviewed and rejected, with a policy reason. Never fetched, and re-discovery doesn't resurrect it.
 
-Discovery runs on every fetched page: extract v3 onion hosts from links and text, drop anything already in the table, insert the rest as `candidate` with the referring source and first-seen time. That's the whole discovery feature. It never queues a fetch, never expands the frontier, never auto-approves. It exists so triage has a steady stream of real sourcing requests to work, which is the first responsibility in the posting.
+Discovery runs on every fetched page: extract v3 onion hosts from links and text, drop anything already in the table, insert the rest as `candidate` with the referring source and first-seen time. That's the whole discovery feature. It never queues a fetch, never expands the frontier, never auto-approves. It exists so triage has a steady stream of real sourcing requests to work.
 
 Triage is a CLI session under the `analyst` user: show candidates by age, show where each was found, show its mirror cluster if any (section 8), approve with a category and note, or decline with a reason. The approve action also scaffolds a config file for the analyst to fill in.
 
@@ -156,16 +154,16 @@ Legitimate onion services run multiple addresses, rotate them, and get listed un
 - In the health queue, when a live source fails reachability, show the cluster's other hosts with their last-seen status and offer a mirror swap as a disposition.
 - Dedup extracted records across a cluster by content hash so the index doesn't carry the same article from three addresses.
 
-## 9. The fetcher and Tor pool (carried over)
+## 9. The fetcher and Tor pool
 
-Mechanically this is the original `tor_pool` / `fetcher` design. What carries over unchanged: the Tor pool with per-instance health and NEWNYM rotation; the anonymity-critical client config (SOCKS5 with `rdns=True`, per-host SOCKS username for circuit isolation, `http2=False`, `follow_redirects=False`, `trust_env=False`, fixed Tor Browser headers, cookies cleared in a `finally`); the 45 s budget, 2 MB cap, and Content-Type allowlist; WAL-mode SQLite frontier that survives crashes.
+The base `tor_pool` / `fetcher` design: the Tor pool with per-instance health and NEWNYM rotation; the anonymity-critical client config (SOCKS5 with `rdns=True`, per-host SOCKS username for circuit isolation, `http2=False`, `follow_redirects=False`, `trust_env=False`, fixed Tor Browser headers, cookies cleared in a `finally`); the 45 s budget, 2 MB cap, and Content-Type allowlist; WAL-mode SQLite frontier that survives crashes.
 
-Two changes:
+Two rules on top of it:
 
 1. The fetcher's public interface takes a source id and a path, never a bare URL. It resolves the source, checks state, checks the host set, builds the URL, and only then opens a circuit. There is no code path that fetches an arbitrary URL.
 2. Scheduling is cadence-driven with a health multiplier: a source that's failing is retried sooner for a bounded number of attempts, then handed to the health queue and slowed down. Uptime history is kept per host for mirror selection.
 
-The `onion.py` validation gate stays exactly as speced; it's still the only thing that lets a host into the table at all:
+The `onion.py` validation gate is the only thing that lets a host into the table at all:
 
 ```python
 def is_v3_onion(host):
@@ -192,7 +190,7 @@ Runs the source's config against a fetched page and produces two things: records
 
 ## 11. The redaction gate
 
-Carried over from the earlier plan and repositioned as defense in depth. With a benign source set it should almost never fire, which is exactly why it has to be there: if it does fire, something about the source or the policy is wrong, and you want to know before the data is on disk.
+Defense in depth. With a benign source set it should almost never fire, which is exactly why it has to be there: if it does fire, something about the source or the policy is wrong, and the operator needs to know before the data is on disk.
 
 - Every record field and every page snapshot passes through the detector before write. Detected spans (email:password and user:password pairs, long credential-shaped tokens, card-number patterns, national-ID patterns, bulk email lists) are replaced with a type tag, a count, and a salted hash.
 - Any redaction event on a live source raises a health-queue item at top priority, because a source that's publishing credentials doesn't belong in the approved set.
@@ -215,7 +213,7 @@ Every run writes metrics per source: reachability, status code, timing, selector
 
 A source enters the queue when it fails reachability past the retry budget, falls below `min_items_per_page`, loses a required field across a run, or trips the redaction gate. Queue ordering is priority then age, where priority is derived from category weight and how far below expectation the source fell.
 
-Dispositions, each recorded with a note: `fixed` (config updated, passed go-live again), `mirror-swapped` (host set changed to a cluster sibling), `disabled` (with reason), `watching` (snoozed for N runs). Dispositions are the audit trail of how collections were kept healthy, which is most of what the posting describes.
+Dispositions, each recorded with a note: `fixed` (config updated, passed go-live again), `mirror-swapped` (host set changed to a cluster sibling), `disabled` (with reason), `watching` (snoozed for N runs). Dispositions are the audit trail of how collections were kept healthy.
 
 ## 14. Go-live checks
 
@@ -229,18 +227,18 @@ A single command that gates a source from `approved` to `live`. It's the only th
 6. Mirror check: if the fingerprints match an existing cluster, require the analyst to confirm "new source" vs "add as mirror."
 7. Write the first snapshot as the known-good baseline and flip state to `live`.
 
-Any step failing leaves the source `approved` and prints what to fix. The posting's "complete go-live checks before collection begins" is this command.
+Any step failing leaves the source `approved` and prints what to fix. No source collects until this command passes.
 
 ## 15. Authenticated collection against a self-hosted onion
 
-The posting calls out sites that require authentication. The only lawful way to demonstrate that is against a service you own, so host one.
+Some sites require authentication. The only lawful way to exercise that is against a service the operator owns, so the project hosts one.
 
 - Stand up a v3 onion service on a separate box or container (not the crawler VM): a small web app with a login form, a session cookie, and a few pages that are only visible when logged in.
 - Add `auth.type = "form-session"` to the config schema with fields for the login path, the username and password field names, a success selector, and a credential reference (a secrets file, never in the config).
 - The fetcher's auth step is allowlisted by source id to this one onion. The allowlist is a constant in code, the auth step asserts membership before building the request, and the no-auth invariant test (section 17) greps for any other use.
 - The session cookie lives in memory for the duration of one source run and is cleared in the existing `finally`.
 
-This proves you can build, tune, and troubleshoot an authenticated collection config, which is the hard case in the job, without ever logging into a site that isn't yours. Personas, forum access, and chat-platform collection stay out of the repo entirely; that's interview conversation drawn from your own experience, not something a portfolio project should contain.
+This covers building, tuning, and troubleshooting an authenticated collection config, the hardest collection case, without ever logging into a site the operator doesn't own. Personas, forum access, and chat-platform collection are out of scope and stay out of the repo entirely.
 
 ## 16. CLI
 
@@ -272,7 +270,7 @@ If any test fails, stop. The firewall, the approval gate, and the redaction gate
 
 ## 18. Build order
 
-1. Environment hardening and Tor pool (section 5), with the four original leak tests passing. Nothing else starts until these do.
+1. Environment hardening and Tor pool (section 5), with the four leak tests passing. Nothing else starts until these do.
 2. Source table, lifecycle states, `is_v3_onion`, and the fetcher with its source-id-only interface. Prove the approval gate and frontier containment tests here, before a second source exists.
 3. Config schema, loader, and extractor against two or three approved sources. Hit-rate metrics from the first run.
 4. Redaction gate, records DB, FTS index, snapshot store, retention sweep. Prove the redaction and storage refusal tests.
@@ -281,15 +279,15 @@ If any test fails, stop. The firewall, the approval gate, and the redaction gate
 7. Self-hosted onion with login, `form-session` auth, auth containment test.
 8. Search UI, scheduling, and the write-up.
 
-Steps 1 through 4 give you a running collector with provable boundaries. Steps 5 and 6 are the collections-analyst workflow. Step 7 is the hard case the posting names. Step 8 is what you hand over.
+Steps 1 through 4 produce a running collector with provable boundaries. Steps 5 and 6 are the collections-analyst workflow. Step 7 is the authenticated case. Step 8 is what a reader of the repo sees first.
 
 ## 19. Presenting it
 
-The repo should answer the posting's bullets without a cover letter. Make these easy to find:
+The repo should carry its own evidence. These should be easy to find:
 
 - The source policy and a triage log with real approve and decline decisions, including declines with reasons.
 - A few configs with their hit-rate history, and at least one health item that went from `degraded` to `fixed` or `mirror-swapped` with the diff that fixed it.
 - The go-live command's output for a source that failed a check and then passed.
 - The auth config for the self-hosted onion and the containment test that bounds it.
 - The leak tests and boundary tests, green in CI.
-- A short write-up of what collecting from benign onion services taught you about mirror churn, layout drift, and circuit health. That's the "share what we're seeing" expectation, met with data you can publish.
+- A short write-up of what collecting from benign onion services showed about mirror churn, layout drift, and circuit health, with data that's safe to publish.
