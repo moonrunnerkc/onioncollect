@@ -15,17 +15,81 @@ The full design is [docs/build-guide.md](docs/build-guide.md). What collecting t
 | What | Where |
 | --- | --- |
 | Source policy | [docs/build-guide.md, section 3](docs/build-guide.md#3-source-policy); enforced by `lifecycle.CATEGORIES` and `triage approve` / `triage decline` in [onioncollect/cli.py](onioncollect/cli.py) |
-| Triage log, approvals and declines with reasons | `sources export` writes every host with its state, reviewer and reason; [PASTE: excerpt of sources-export.jsonl with at least two declines and their reasons] |
+| Triage log, approvals and declines with reasons | `sources export` writes every host with its state, reviewer and reason; excerpt under [Evidence from the guest](#evidence-from-the-guest) |
 | Configs with hit-rate history | Reviewed TOML configs under `configs/` (kept in the guest until the first real set is copied back) and [testonion/config-public.toml](testonion/config-public.toml); history from `health runs <id>` and the search UI's source page. [PASTE: health runs for two sources] |
 | A health item that went degraded to fixed or mirror-swapped, with the diff | `health log` records every disposition; [PASTE: health log line for the item, and the config diff that fixed it] |
-| A go-live that failed a check, then passed | Every `golive` report is kept (`golive_reports`); [PASTE: golive output for one source, the failing run then the passing one] |
+| A go-live that failed a check, then passed | Every `golive` report is kept (`golive_reports`); bbc-news under [Evidence from the guest](#evidence-from-the-guest) |
 | The self-hosted onion's auth config | [testonion/config-session.toml](testonion/config-session.toml), the app in [testonion/app.py](testonion/app.py), its VM setup in [testonion/setup.sh](testonion/setup.sh) |
 | The containment test that bounds it | `AuthContainmentTest` in [tests/test_network_boundary.py](tests/test_network_boundary.py); behaviour in [tests/test_fetcher_auth.py](tests/test_fetcher_auth.py) and [tests/test_session.py](tests/test_session.py). The auth step is `Fetcher.log_in`, `Fetcher._post_form` and `Fetcher._session_for` in [onioncollect/fetcher.py](onioncollect/fetcher.py) |
-| Leak tests | The four Tor leak tests run live in the guest: [tests/live/leak_test.sh](tests/live/leak_test.sh), daily on a timer and at the end of every deploy. A crawl and `golive` both refuse a result older than 36 hours or older than the current deploy. [PASTE: latest leak-test.json from the capture bundle] |
+| Leak tests | The four Tor leak tests run live in the guest: [tests/live/leak_test.sh](tests/live/leak_test.sh), daily on a timer and at the end of every deploy. A crawl and `golive` both refuse a result older than 36 hours or older than the current deploy. The latest result is under [Evidence from the guest](#evidence-from-the-guest) |
 | Boundary tests | Section 17's five, mapped to their tests in the docstring of [tests/test_network_boundary.py](tests/test_network_boundary.py), plus `UIContainmentTest` for the search UI |
 | CI | [.github/workflows/ci.yml](.github/workflows/ci.yml) runs the whole unit and boundary suite. [PASTE: CI badge or link to a green run] |
 | Search UI | [onioncollect/ui.py](onioncollect/ui.py) and [onioncollect/views.py](onioncollect/views.py): read-only, standard library, 127.0.0.1 only. Started by its own entry point, [onioncollect/ui_main.py](onioncollect/ui_main.py), never through the CLI, so the process loads no network library ([tests/test_ui_entry.py](tests/test_ui_entry.py)) |
 | Write-up | [docs/writeup.md](docs/writeup.md) |
+
+## Evidence from the guest
+
+From the `make writeup-capture` bundle captured 2026-11-11 00:46 UTC.
+
+Two declines from `sources-export.jsonl`, with the address left out:
+
+```
+{"kind": "host", "state": "declined", "found_on": "bbc-news", "first_seen": "2026-11-10 21:59:40.796", "decided_at": "2026-11-11 00:36:29.720", "decided_by": "analyst", "reason": "operator could not be verified from the publisher's own pages (decided by the build agent under the operator's written rules, 2026-11-10)"}
+{"kind": "host", "state": "declined", "found_on": "request: SecureDrop directory entry for The New York Times", "first_seen": "2026-11-11 00:36:29.819", "decided_at": "2026-11-11 00:36:29.918", "decided_by": "analyst", "reason": "submission form only, nothing to collect, and a tip intake should not be polled (decided by the build agent under the operator's written rules, 2026-11-10)"}
+```
+
+A go-live that failed a check, then passed (bbc-news, after its listing selector was rewritten for the layout the
+onion serves):
+
+```
+golive bbc-news at 2026-11-10 21:59: failed
+PASS  state is approved (found approved)
+PASS  hosts: 1 valid v3, all approved for this source
+PASS  policy: journalism-publishing, reviewer note on file
+PASS  leak tests: all 4 passed 0 h ago, run by unit
+PASS  reachability: 2 of 2 instances
+PASS  seed 1: status 200
+FAIL  seed 1: 0 complete items of 10 expected, hit rate 0.00, redaction events 0
+
+golive bbc-news at 2026-11-11 00:24: passed
+PASS  state is approved (found approved)
+PASS  hosts: 1 valid v3, all approved for this source
+PASS  policy: journalism-publishing, reviewer note on file
+PASS  leak tests: all 4 passed 1 h ago, run by unit
+PASS  reachability: 2 of 2 instances
+PASS  seed 1: status 200
+PASS  seed 1: 53 complete items of 10 expected, hit rate 0.70, redaction events 0
+PASS  mirror: no other source matches
+PASS  baseline: 1 snapshots written, bbc-news is live
+```
+
+The latest `leak-test.json`:
+
+```json
+{
+  "run_at": "2026-11-11T00:44:05+00:00",
+  "run_by": "unit",
+  "deploy_stamp": "2026-11-11T00:29:12Z 8b72ab0bc835",
+  "tests": [
+    {
+      "name": "dns-block",
+      "passed": true
+    },
+    {
+      "name": "redirect-trap",
+      "passed": true
+    },
+    {
+      "name": "clearnet-block",
+      "passed": true
+    },
+    {
+      "name": "packet-capture",
+      "passed": true
+    }
+  ]
+}
+```
 
 ## Running it
 
