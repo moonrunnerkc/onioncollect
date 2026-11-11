@@ -1,57 +1,148 @@
-# onioncollect
+<p align="center">
+  <img src="docs/cover.svg" alt="onioncollect: approved onion sites, collected over Tor, kept searchable" width="100%">
+</p>
 
-A collection platform for benign public onion services, built by one operator as a working sample for a
-collections analyst role. It takes a source from candidate to live collection over Tor, extracts structured
-records with a reviewed config per source, keeps them redacted and searchable, and measures every source's health.
-The sources are news organizations' onion mirrors, SecureDrop instances, software projects, privacy services and
-the directories that list them. It never logs in anywhere but one onion service the operator hosts, never submits a
-form, posts, buys or messages, and never stores an unredacted credential.
+<h1 align="center">onioncollect</h1>
 
-The full design is [docs/build-guide.md](docs/build-guide.md). What collecting taught me is
-[docs/writeup.md](docs/writeup.md).
+<p align="center">Collects public pages from approved onion sites over Tor and makes them searchable.</p>
 
-## Where to find each piece
+<p align="center">
+  <a href="https://github.com/moonrunnerkc/onioncollect/actions/workflows/ci.yml"><img src="https://github.com/moonrunnerkc/onioncollect/actions/workflows/ci.yml/badge.svg?branch=main" alt="ci"></a>
+  <img src="https://img.shields.io/badge/python-3.13-3776AB?logo=python&logoColor=white" alt="Python 3.13">
+  <img src="https://img.shields.io/badge/network-Tor%20only-7D4698?logo=torproject&logoColor=white" alt="Tor only">
+  <img src="https://img.shields.io/badge/dependencies-5-555" alt="5 dependencies">
+</p>
 
-| What | Where |
+<p align="center">
+  <a href="#what-it-does">What it does</a> ·
+  <a href="#setup">Setup</a> ·
+  <a href="#running-commands">Running commands</a> ·
+  <a href="#add-a-source">Add a source</a> ·
+  <a href="#everyday-use">Everyday use</a> ·
+  <a href="#search">Search</a> ·
+  <a href="#what-it-will-not-do">Limits</a> ·
+  <a href="#more-docs">More docs</a>
+</p>
+
+## What it does
+
+You give it an onion address. A person approves it, writes a small config that says what to pull from the page,
+and the crawler takes over from there.
+
+- **Sources are safe, public ones.** News sites' onion mirrors, SecureDrop directory pages, the Tor Project,
+  Debian, privacy services.
+- **Nothing is fetched until a human approves it** and it passes a go-live check.
+- **Everything goes through Tor.** A firewall in the VM drops anything that tries to go around it.
+- **Secrets are removed before anything is stored.** Emails, passwords, card numbers and tokens are redacted,
+  then checked a second time on write.
+- **Every source has a health score.** If a site changes its layout and records stop coming, you get a queue
+  item to deal with.
+
+One operator, one VM, one Python process. Built as a work sample for a collections analyst role.
+
+## Setup
+
+You need a Mac with [Lima](https://lima-vm.io), Python 3.13, and FileVault turned on.
+
+```bash
+make venv        # local virtualenv, pinned and hash-checked
+make test        # unit and boundary tests, no network needed
+make provision   # builds the VM: Debian 13, six Tor instances, the firewall
+```
+
+Before the first deploy, put two files in the repo root. Both are gitignored, and the crawler refuses to start
+without them:
+
+| File | What goes in it |
 | --- | --- |
-| Source policy | [docs/build-guide.md, section 3](docs/build-guide.md#3-source-policy); enforced by `lifecycle.CATEGORIES` and `triage approve` / `triage decline` in [onioncollect/cli.py](onioncollect/cli.py) |
-| Triage log, approvals and declines with reasons | `sources export` writes every host with its state, reviewer and reason; excerpt under [Evidence from the guest](#evidence-from-the-guest) |
-| Configs with hit-rate history | Reviewed TOML configs under `configs/` (kept in the guest until the first real set is copied back) and [testonion/config-public.toml](testonion/config-public.toml); history from `health runs <id>` and the search UI's source page. [PASTE: health runs for two sources] |
-| A health item that went degraded to fixed or mirror-swapped, with the diff | `health log` records every disposition; [PASTE: health log line for the item, and the config diff that fixed it] |
-| A go-live that failed a check, then passed | Every `golive` report is kept (`golive_reports`); bbc-news under [Evidence from the guest](#evidence-from-the-guest) |
-| The self-hosted onion's auth config | [testonion/config-session.toml](testonion/config-session.toml), the app in [testonion/app.py](testonion/app.py), its VM setup in [testonion/setup.sh](testonion/setup.sh) |
-| The containment test that bounds it | `AuthContainmentTest` in [tests/test_network_boundary.py](tests/test_network_boundary.py); behaviour in [tests/test_fetcher_auth.py](tests/test_fetcher_auth.py) and [tests/test_session.py](tests/test_session.py). The auth step is `Fetcher.log_in`, `Fetcher._post_form` and `Fetcher._session_for` in [onioncollect/fetcher.py](onioncollect/fetcher.py) |
-| Leak tests | The four Tor leak tests run live in the guest: [tests/live/leak_test.sh](tests/live/leak_test.sh), daily on a timer and at the end of every deploy. A crawl and `golive` both refuse a result older than 36 hours or older than the current deploy. The latest result is under [Evidence from the guest](#evidence-from-the-guest) |
-| Boundary tests | Section 17's five, mapped to their tests in the docstring of [tests/test_network_boundary.py](tests/test_network_boundary.py), plus `UIContainmentTest` for the search UI |
-| CI | [.github/workflows/ci.yml](.github/workflows/ci.yml) runs the whole unit and boundary suite. [![ci](https://github.com/moonrunnerkc/onioncollect/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/moonrunnerkc/onioncollect/actions/workflows/ci.yml) |
-| Search UI | [onioncollect/ui.py](onioncollect/ui.py) and [onioncollect/views.py](onioncollect/views.py): read-only, standard library, 127.0.0.1 only. Started by its own entry point, [onioncollect/ui_main.py](onioncollect/ui_main.py), never through the CLI, so the process loads no network library ([tests/test_ui_entry.py](tests/test_ui_entry.py)) |
-| Write-up | [docs/writeup.md](docs/writeup.md) |
+| `exclusions.txt` | Onion hosts that must never be fetched, one per line |
+| `safety-patterns.txt` | Patterns that shut a source off if its page matches |
 
-## Evidence from the guest
+Then deploy:
 
-From the `make writeup-capture` bundle captured 2026-11-11 00:46 UTC.
-
-Two declines from `sources-export.jsonl`, with the address left out:
-
-```
-{"kind": "host", "state": "declined", "found_on": "bbc-news", "first_seen": "2026-11-10 21:59:40.796", "decided_at": "2026-11-11 00:36:29.720", "decided_by": "analyst", "reason": "operator could not be verified from the publisher's own pages (decided by the build agent under the operator's written rules, 2026-11-10)"}
-{"kind": "host", "state": "declined", "found_on": "request: SecureDrop directory entry for The New York Times", "first_seen": "2026-11-11 00:36:29.819", "decided_at": "2026-11-11 00:36:29.918", "decided_by": "analyst", "reason": "submission form only, nothing to collect, and a tip intake should not be polled (decided by the build agent under the operator's written rules, 2026-11-10)"}
+```bash
+make deploy      # installs the code, runs the four leak tests, starts the crawl timer
+make checklist   # confirms the VM is locked down
 ```
 
-A go-live that failed a check, then passed (bbc-news, after its listing selector was rewritten for the layout the
-onion serves):
+Wait about 15 minutes between `make provision` and `make deploy`. The leak tests can fail on leftover package
+download traffic until then.
 
+After that it runs itself. The crawl fires every 15 minutes and only fetches what is due.
+
+## Running commands
+
+There are two users in the VM. Each one can only do its own job.
+
+| User | Does | Open a shell |
+| --- | --- | --- |
+| `analyst` | Approves sources, searches, works the health queue | `limactl shell node1 sudo -iu analyst` |
+| `crawler` | Fetches over Tor, runs go-live | `make shell` |
+
+Once you are in, set a shortcut. The rest of this page uses it:
+
+```bash
+cd /opt/onioncollect/app
+alias oc='/opt/onioncollect/venv/bin/python -m onioncollect --settings ~/settings.toml'
+oc --help
 ```
-golive bbc-news at 2026-11-10 21:59: failed
-PASS  state is approved (found approved)
-PASS  hosts: 1 valid v3, all approved for this source
-PASS  policy: journalism-publishing, reviewer note on file
-PASS  leak tests: all 4 passed 0 h ago, run by unit
-PASS  reachability: 2 of 2 instances
-PASS  seed 1: status 200
-FAIL  seed 1: 0 complete items of 10 expected, hit rate 0.00, redaction events 0
 
-golive bbc-news at 2026-11-11 00:24: passed
+## Add a source
+
+**1. Put the address in the queue** (analyst). Nothing is fetched yet.
+
+```bash
+oc triage request <address>.onion --found-at "linked from debian.org"
+oc triage list
+```
+
+**2. Approve or decline it** (analyst). A decline is final.
+
+```bash
+oc triage approve <address>.onion --as debian --category software-infrastructure --note "official Debian mirror"
+oc triage decline <address>.onion --reason "could not confirm who runs it"
+```
+
+Categories: `journalism-publishing`, `software-infrastructure`, `privacy-services`, `directories`, `self-hosted`.
+
+**3. Fill in the config** (analyst). Approving creates a starter file in `/var/lib/onioncollect/configs`.
+Tell it which pages to start on and which CSS selectors hold the data:
+
+```toml
+id = "debian"
+hosts = ["<address>.onion"]
+category = "software-infrastructure"
+cadence = "12h"
+seeds = ["/debian/dists/"]
+
+[listing]
+item = 'tr:has(img[alt="[DIR]"])'
+
+[listing.fields]
+release = "td a"
+last_modified = 'td[align="right"]'
+
+[expect]
+min_items_per_page = 10
+required_fields = ["release", "last_modified"]
+
+[auth]
+type = "none"
+```
+
+```bash
+oc config validate debian
+```
+
+**4. Go live** (crawler). This fetches the seed pages once and checks that the config really finds records.
+
+```bash
+oc golive debian
+```
+
+A pass looks like this. Any `FAIL` line tells you what to fix, and the source stays off until it passes.
+
+```text
 PASS  state is approved (found approved)
 PASS  hosts: 1 valid v3, all approved for this source
 PASS  policy: journalism-publishing, reviewer note on file
@@ -63,53 +154,88 @@ PASS  mirror: no other source matches
 PASS  baseline: 1 snapshots written, bbc-news is live
 ```
 
-The latest `leak-test.json`:
+Copy the finished config back into `configs/` and commit it. That folder is the reviewed record of what gets
+collected.
 
-```json
-{
-  "run_at": "2026-11-11T00:44:05+00:00",
-  "run_by": "unit",
-  "deploy_stamp": "2026-11-11T00:29:12Z 8b72ab0bc835",
-  "tests": [
-    {
-      "name": "dns-block",
-      "passed": true
-    },
-    {
-      "name": "redirect-trap",
-      "passed": true
-    },
-    {
-      "name": "clearnet-block",
-      "passed": true
-    },
-    {
-      "name": "packet-capture",
-      "passed": true
-    }
-  ]
-}
+## Everyday use
+
+As the analyst:
+
+```bash
+oc sources list                 # every source and its state
+oc health                       # what needs attention, most urgent first
+oc health runs debian           # one source's recent runs and hit rates
+oc health log                   # every decision made on a health item
 ```
 
-## Running it
+As the crawler:
 
-Everything runs in a hardened Lima VM (section 5 of the guide). `make provision` builds it, `make deploy` installs
-the code and the systemd units and ends by running the leak tests, and the crawl then runs on a quarter-hour timer
-that fetches only what each source's cadence says is due. The search UI runs as the `analyst` user on 127.0.0.1:8470
-inside the guest, started by `onioncollect-ui.service` as
-`python -m onioncollect.ui_main --data-dir DIR --configs-dir DIR --port 8470`. It has its own entry point, not a
-CLI subcommand, so the UI process imports only the UI, its views and search, and the standard library. Reach it
-with an SSH forward through Lima's ssh config:
-
+```bash
+oc crawl status                 # queue sizes and Tor health
 ```
+
+When a health item shows up, fix the cause and then close it with a note. There are four ways to close one:
+
+| Disposition | Use it when | Run as |
+| --- | --- | --- |
+| `fixed` | You repaired the config. The source is re-checked before it closes. | crawler |
+| `mirror-swapped` | The host is down and another approved host is up. Add `--to <host>`. | crawler |
+| `watching` | It may be a blip. Add `--runs 5` to wait five runs. | analyst |
+| `disabled` | The source should stop being collected. | analyst |
+
+```bash
+oc health resolve 12 --disposition fixed --note "listing selector updated for the new layout"
+```
+
+Useful `make` targets from the Mac:
+
+| Command | What it does |
+| --- | --- |
+| `make deploy` | Ship code and config changes. Always ends with the leak tests. |
+| `make leak-test` | Run the four Tor leak tests now |
+| `make snapshot` | Save a copy of the VM disk to roll back to |
+| `make test` | Run the test suite locally |
+
+If the leak tests are older than 36 hours, or older than the last deploy, the crawler will not fetch.
+
+## Search
+
+From the command line, as the analyst:
+
+```bash
+oc search "trixie"
+oc search "release" --source debian --since 2026-11-01
+```
+
+Or in a browser. The search page only listens inside the VM, so forward the port from your Mac:
+
+```bash
 ssh -F ~/.lima/node1/ssh.config -N -L 8470:127.0.0.1:8470 lima-node1
 ```
 
-then open http://127.0.0.1:8470/.
+Then open <http://127.0.0.1:8470/>. It is read-only: it cannot write to the stores or reach the network.
 
-The crawler never opens a store. Every write it makes goes over a unix socket to `onioncollect.writer`, a
-standard-library-and-aiosqlite process running as the analyst, which owns the stores (mode 700). The writer
-admits the crawler's uid alone, takes one op from a fixed list per line, and runs the storage layer's secret
-detector itself, so the redaction gate and the second detector run under two different users. The crawler keeps
-only its frontier, in its own state dir. [provision/README.md](provision/README.md) has the layout. `make test` runs the suite locally; `make writeup-capture` gathers the
-write-up's evidence in the guest; `make writeup-check` lists any write-up marker still waiting for data.
+## What it will not do
+
+These are fixed in code and held by tests, not left to settings.
+
+- Fetch a host nobody approved, or follow a redirect
+- Log in, submit a form, solve a captcha, post, message or buy anything
+- Download files. HTML and plain text only, 2 MB at most.
+- Store a password, email, card number or token in the clear
+- Send a single packet outside Tor
+- Try to identify or locate anyone
+
+The one exception is a test onion site the operator hosts on a second VM (`make testonion`). The crawler logs
+in there, with the operator's own account, to prove the login code is fenced in.
+
+## More docs
+
+| Read this | For |
+| --- | --- |
+| [docs/build-guide.md](docs/build-guide.md) | The full design and the source policy |
+| [docs/writeup.md](docs/writeup.md) | What collecting taught me |
+| [provision/README.md](provision/README.md) | How the VM is built, every `make` target, file layout |
+| [testonion/](testonion/) | The self-hosted test site and its two configs |
+| [tests/test_network_boundary.py](tests/test_network_boundary.py) | The boundary tests that hold the rules above |
+| [tests/live/leak_test.sh](tests/live/leak_test.sh) | The four Tor leak tests |
