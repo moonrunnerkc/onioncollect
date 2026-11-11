@@ -3,8 +3,7 @@ import re
 from onioncollect import onion
 
 EXCLUDING = "child_exploitation"
-# The old crawler excluded hosts for these. A watched leak source carries them by design, and the
-# redaction gate's built-in detector strips them, so a pattern file still naming them is out of date.
+# Credential and card patterns are handled by the redaction gate, so a pattern file still naming them is out of date.
 MOVED_TO_REDACTION = ("credential_dump", "card_number")
 
 
