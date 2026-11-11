@@ -1,0 +1,22 @@
+id = "bbc-international"
+hosts = ["bbcweb3hytmzhn5d532owbu6oqadra5z3ar726vq5kgwwn6aucdccrad.onion"]
+category = "journalism-publishing"
+cadence = "6h"
+scheme = "https"
+host_prefix = "www"
+seeds = ["/"]
+
+[listing]
+item = '[data-testid="anchor-inner-wrapper"]:has([data-testid="card-headline"]), [data-testid="promo"]:has(h3 a:not([href*="?"]))'
+
+[listing.fields]
+headline = '[data-testid="card-headline"], h3 a'
+summary = '[data-testid="card-description"], h3 + p'
+link = "a@href"
+
+[expect]
+min_items_per_page = 10
+required_fields = ["headline", "link"]
+
+[auth]
+type = "none"
