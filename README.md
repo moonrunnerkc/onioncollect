@@ -11,6 +11,7 @@
   <img src="https://img.shields.io/badge/python-3.13-3776AB?logo=python&logoColor=white" alt="Python 3.13">
   <img src="https://img.shields.io/badge/network-Tor%20only-7D4698?logo=torproject&logoColor=white" alt="Tor only">
   <img src="https://img.shields.io/badge/dependencies-5-555" alt="5 dependencies">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
 </p>
 
 <p align="center">
@@ -38,7 +39,7 @@ and the crawler takes over from there.
 - **Every source has a health score.** If a site changes its layout and records stop coming, you get a queue
   item to deal with.
 
-One operator, one VM, one Python process. Built as a work sample for a collections analyst role.
+One operator, one VM, one Python process.
 
 ## Setup
 
@@ -239,3 +240,8 @@ in there, with the operator's own account, to prove the login code is fenced in.
 | [testonion/](testonion/) | The self-hosted test site and its two configs |
 | [tests/test_network_boundary.py](tests/test_network_boundary.py) | The boundary tests that hold the rules above |
 | [tests/live/leak_test.sh](tests/live/leak_test.sh) | The four Tor leak tests |
+
+## License
+
+MIT. See [LICENSE](LICENSE). The license covers the code, not what you collect with it:
+follow each site's terms and the law where you run it.
