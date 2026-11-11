@@ -18,6 +18,19 @@ def fake_controller(ready="1", newnym_available=True, newnym_wait=0.0):
     return controller
 
 
+def idle_tor():
+    """A control port as an idle Tor answers it: no circuit and a refused circuit request (stem reads the 551 as
+    a ProtocolError), until a SOCKS request makes it fetch what it lacks."""
+    controller = fake_controller("0")
+    controller.new_circuit.side_effect = tor_pool.stem.ProtocolError("EXTENDCIRCUIT returned unexpected response code: 551")
+
+    def socks_request():
+        controller.get_info.return_value = "1"
+        controller.new_circuit.side_effect = None
+    controller.socks_request = socks_request
+    return controller
+
+
 def settings(instances=2):
     pairs = tuple((10050 + n, 11050 + n) for n in range(1, instances + 1))
     return throwaway_settings(tor_instances=pairs)
@@ -106,16 +119,57 @@ class TorInstanceTest(unittest.IsolatedAsyncioTestCase):
 
 
 class TorPoolTest(unittest.IsolatedAsyncioTestCase):
-    async def test_start_drops_instances_that_never_get_a_circuit(self):
+    async def test_an_idle_instance_is_kept_and_a_fetch_wakes_it(self):
+        # What Tor 0.4.9 does: with no SOCKS request for about an hour it stops fetching descriptors, lacks one
+        # for a primary guard in time, and answers EXTENDCIRCUIT 0 with 551 until a SOCKS request arrives. The
+        # pool used to drop such an instance, so no request ever arrived and every later run dropped it again.
         pool = TorPool(settings(instances=3))
-        controllers = [fake_controller("1"), fake_controller("0"), fake_controller("1")]
+        controllers = [fake_controller("1"), idle_tor(), fake_controller("1")]
         with mock.patch.object(tor_pool.Controller, "from_port", side_effect=controllers), \
                 mock.patch.object(tor_pool, "READY_TIMEOUT", 0.05), mock.patch.object(tor_pool, "READY_POLL", 0.01):
             with self.assertLogs("onioncollect.tor_pool", "WARNING") as logs:
                 await pool.start()
-        self.assertEqual([instance.socks_port for instance in pool.instances], [10051, 10053])
-        controllers[1].close.assert_called_once()
-        self.assertIn("10052", logs.output[0])
+        self.assertEqual([instance.socks_port for instance in pool.instances], [10051, 10053, 10052],
+                         "kept, and after the ready ones, which golive and the rechecks take first")
+        controllers[1].close.assert_not_called()
+        self.assertEqual([line.split(":", 2)[2].strip() for line in logs.output], [
+            "tor 10052: circuit request refused (ProtocolError), left to the ready wait",
+            "tor 10052: no circuit after 0 s, kept in the pool for a fetch to wake"])
+        for line in logs.output:
+            self.assertTrue(any(shape.fullmatch(line.split(":", 2)[2]) for shape in log_audit.SHAPES.values()), line)
+        asleep = pool.assign(2)
+        self.assertEqual((asleep.socks_port, asleep.is_ready()), (10052, False))
+        controllers[1].socks_request()
+        self.assertTrue(asleep.is_ready())
+
+    async def test_a_tor_restarted_under_the_run_is_reconnected_not_read_as_unready(self):
+        # stem answers a query on a closed socket with the default, "0": a ready Tor read as one with no circuit.
+        pool = TorPool(settings(instances=2))
+        dead, fresh = fake_controller("0"), fake_controller("1")
+        dead.is_alive.return_value = False
+        with mock.patch.object(tor_pool.Controller, "from_port", side_effect=[fake_controller("1"), dead, fresh]), \
+                mock.patch.object(tor_pool, "READY_TIMEOUT", 0.05), mock.patch.object(tor_pool, "READY_POLL", 0.01):
+            with self.assertLogs("onioncollect.tor_pool", "WARNING") as logs:
+                await pool.start()
+        self.assertEqual([instance.socks_port for instance in pool.instances], [10051, 10052])
+        self.assertIs(pool.instances[1].controller, fresh)
+        dead.close.assert_called_once()
+        fresh.authenticate.assert_called_once_with(password=pool.instances[1]._password)
+        self.assertEqual(logs.output[0].split(":", 2)[2].strip(), "tor 10052: control connection lost, reconnected")
+        self.assertTrue(log_audit.SHAPES["tor"].fullmatch(logs.output[0].split(":", 2)[2].strip()))
+
+    async def test_a_control_port_that_stays_down_reads_as_unready_and_is_not_rotated(self):
+        instance = TorInstance(10051, 11051, "pw")
+        instance.controller = fake_controller("1")
+        instance.controller.is_alive.return_value = False
+        with mock.patch.object(tor_pool.Controller, "from_port", side_effect=tor_pool.SocketError("refused")):
+            self.assertFalse(instance.is_ready())
+            with self.assertLogs("onioncollect.tor_pool", "WARNING") as logs:
+                await instance.rotate()
+        message = logs.output[0].split(":", 2)[2].strip()
+        self.assertEqual(message, "tor 10051: control port unreachable (SocketError), not rotated")
+        self.assertTrue(log_audit.SHAPES["tor"].fullmatch(message))
+        self.assertIsNone(instance.last_rotation)
 
     async def test_start_wakes_every_instance(self):
         pool = TorPool(settings(instances=2))
