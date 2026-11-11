@@ -42,7 +42,9 @@ SHAPES = {
     "ui": re.compile(r"ui ((search|record|source|snapshot|not_found|wrong_host|method) status=\d{3} results=\d+"
                      r" elapsed=\d+\.\d{3}s|listening on port \d+|(search|record|source|snapshot) store unreadable: \w+)"),
     "tor": re.compile(r"tor \d+: (rotated circuits|success \d\.\d\d over \d+ fetches, last rotation (never|\d+s ago)"
-                      r"|no circuit after \d+ s, dropped from pool|circuit request refused \(\w+\), left to the ready wait)"),
+                      r"|no circuit after \d+ s, (dropped from pool|kept in the pool for a fetch to wake)"
+                      r"|circuit request refused \(\w+\), left to the ready wait"
+                      r"|control connection lost, reconnected|control port unreachable \(\w+\), not rotated)"),
 }
 MIN_FIELD_CHARS = 8
 

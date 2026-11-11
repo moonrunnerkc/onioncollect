@@ -48,7 +48,20 @@ class TorInstance:
             log.warning("tor %d: circuit request refused (%s), left to the ready wait", self.socks_port,
                         type(exc).__name__)
 
+    def reconnect_if_lost(self) -> None:
+        # A Tor restarted under a run leaves a closed socket, and stem answers every query on it with the default,
+        # so a ready Tor reads as one with no circuit.
+        if self.controller is not None and self.controller.is_alive():
+            return
+        self.close()
+        self.connect()
+        log.warning("tor %d: control connection lost, reconnected", self.socks_port)
+
     def is_ready(self) -> bool:
+        try:
+            self.reconnect_if_lost()
+        except CONTROL_ERRORS:
+            return False
         return self.controller.get_info("status/circuit-established", "0") == "1"
 
     def open_counts(self) -> tuple[int, int]:
@@ -68,6 +81,11 @@ class TorInstance:
         return sum(self.outcomes) / len(self.outcomes)
 
     async def rotate(self) -> None:
+        try:
+            self.reconnect_if_lost()
+        except CONTROL_ERRORS as exc:
+            log.warning("tor %d: control port unreachable (%s), not rotated", self.socks_port, type(exc).__name__)
+            return
         if not self.controller.is_newnym_available():
             await asyncio.sleep(self.controller.get_newnym_wait())
         self.controller.signal(Signal.NEWNYM)
@@ -96,12 +114,21 @@ class TorPool:
             if not waiting or time.monotonic() >= deadline:
                 break
             await asyncio.sleep(READY_POLL)
-        for instance in waiting:
-            log.warning("tor %d: no circuit after %.0f s, dropped from pool", instance.socks_port, READY_TIMEOUT)
-            instance.close()
-            self.instances.remove(instance)
-        if not self.instances:
+        if len(waiting) == len(self.instances):
+            for instance in waiting:
+                log.warning("tor %d: no circuit after %.0f s, dropped from pool", instance.socks_port, READY_TIMEOUT)
+                instance.close()
+            self.instances.clear()
             raise RuntimeError("no Tor instance became ready")
+        # Kept, not dropped. A Tor that has had no SOCKS request for about an hour stops fetching descriptors
+        # (dirclient_too_idle_to_fetch_descriptors), so in time it lacks one for a primary guard and answers the
+        # circuit request with 551. Only a SOCKS request ends that, and a pool that drops the instance never sends
+        # one: it stayed out of every later run until someone restarted it. Its workers' fetches are that request.
+        for instance in waiting:
+            log.warning("tor %d: no circuit after %.0f s, kept in the pool for a fetch to wake", instance.socks_port,
+                        READY_TIMEOUT)
+        # The ready ones first: golive and the rechecks take the first instances of the list.
+        self.instances.sort(key=lambda instance: instance in waiting)
 
     def assign(self, worker_id: int) -> TorInstance:
         return self.instances[worker_id % len(self.instances)]
