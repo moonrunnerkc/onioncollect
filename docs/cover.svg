@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" role="img" aria-labelledby="t d">
+  <title id="t">onioncollect</title>
+  <desc id="d">An onion drawn as nested layers beside the project name and the path a source takes: candidate, approved, live, records, search.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b1426"/>
+      <stop offset="1" stop-color="#0f0c16"/>
+    </linearGradient>
+    <path id="layer" d="M170 44 C188 92 264 122 264 184 C264 234 222 264 170 264 C118 264 76 234 76 184 C76 122 152 92 170 44 Z"/>
+  </defs>
+
+  <rect width="1200" height="300" rx="18" fill="url(#bg)"/>
+  <rect x="0.5" y="0.5" width="1199" height="299" rx="17.5" fill="none" stroke="#3a2c52"/>
+
+  <g fill="none" stroke-linejoin="round">
+    <use href="#layer" fill="#2a1d3d" stroke="#7d56c2" stroke-width="2.5"/>
+    <use href="#layer" transform="translate(170 264) scale(0.78) translate(-170 -264)" fill="#3a2757" stroke="#9a6fe0" stroke-width="2.8"/>
+    <use href="#layer" transform="translate(170 264) scale(0.56) translate(-170 -264)" fill="#4f3478" stroke="#b78cf5" stroke-width="3.4"/>
+    <use href="#layer" transform="translate(170 264) scale(0.34) translate(-170 -264)" fill="#6c47a3" stroke="#d6b8ff" stroke-width="4.5"/>
+  </g>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace">
+    <text x="330" y="128" font-size="58" font-weight="700" fill="#f3ecff" letter-spacing="-1">onioncollect</text>
+    <text x="332" y="168" font-size="19" fill="#b9a8d6">Approved onion sites, collected over Tor, kept searchable.</text>
+
+    <g font-size="15" text-anchor="middle">
+      <g fill="#241a35" stroke="#5b4285">
+        <rect x="332" y="204" width="110" height="36" rx="18"/>
+        <rect x="470" y="204" width="100" height="36" rx="18"/>
+        <rect x="598" y="204" width="64" height="36" rx="18"/>
+        <rect x="690" y="204" width="92" height="36" rx="18"/>
+      </g>
+      <rect x="810" y="204" width="84" height="36" rx="18" fill="#6c47a3" stroke="#d6b8ff"/>
+      <g fill="#d9ccf0">
+        <text x="387" y="227">candidate</text>
+        <text x="520" y="227">approved</text>
+        <text x="630" y="227">live</text>
+        <text x="736" y="227">records</text>
+      </g>
+      <text x="852" y="227" fill="#ffffff">search</text>
+      <g fill="#7d56c2" font-size="16">
+        <text x="456" y="227">&gt;</text>
+        <text x="584" y="227">&gt;</text>
+        <text x="676" y="227">&gt;</text>
+        <text x="796" y="227">&gt;</text>
+      </g>
+    </g>
+  </g>
+</svg>
