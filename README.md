@@ -38,7 +38,7 @@ and the crawler takes over from there.
 - **Every source has a health score.** If a site changes its layout and records stop coming, you get a queue
   item to deal with.
 
-One operator, one VM, one Python process. Built as a work sample for a collections analyst role.
+One operator, one VM, one Python process.
 
 ## Setup
 
