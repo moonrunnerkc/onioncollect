@@ -54,6 +54,21 @@ class FindTest(unittest.TestCase):
             ("user_password", "root:toor1234", "root"), ("user_password", "admin|letmein99", "admin"),
         ])
 
+    def test_a_redacted_link_is_not_a_pair_and_nothing_wider_is_let_through(self):
+        for text in ("http:[token]", "https:[token]?page=2", "HTTP:[token]", "seen\nhttps:[token]#top\nagain"):
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text), [])
+        for text in ("http:hunter2pass", "http:[token]:hunter2pass", "https:[token]|hunter2pass", "admin:[token]",
+                     "httpx:[token]", "http:[email]", "http;[token]", "http:x[token]"):
+            with self.subTest(text=text):
+                self.assertIn("user_password", [kind for kind, _, _ in kinds(text)])
+
+    def test_a_real_pair_inside_a_url_still_trips(self):
+        self.assertEqual(kinds("http://alice:s3cretpw@site.example/x"),
+                         [("email", "s3cretpw@site.example", "s3cretpw@site.example")])
+        self.assertEqual([kind for kind, _, _ in kinds("alice:s3cretpw@site.example")], ["user_password", "email"])
+        self.assertTrue(contains_secret("ftp://carol:pw123456@files.example/a"))
+
     def test_url_and_prose_lines_are_not_pairs(self):
         self.assertEqual(kinds(f"http://{AHMIA}/ok\nTitle: a forum\nPrice:abc"), [])
 
