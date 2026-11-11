@@ -7,11 +7,11 @@ host_prefix = "www"
 seeds = ["/"]
 
 [listing]
-item = '[data-testid="anchor-inner-wrapper"]:has([data-testid="card-headline"])'
+item = '[data-testid="anchor-inner-wrapper"]:has([data-testid="card-headline"]), [data-testid="promo"]:has(h3 a:not([href*="?"]))'
 
 [listing.fields]
-headline = '[data-testid="card-headline"]'
-summary = '[data-testid="card-description"]'
+headline = '[data-testid="card-headline"], h3 a'
+summary = '[data-testid="card-description"], h3 + p'
 link = "a@href"
 
 [expect]

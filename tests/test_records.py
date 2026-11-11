@@ -92,6 +92,16 @@ class OnionLinkTest(RecordStoreTestCase):
         self.assertEqual(await self.rows("SELECT * FROM records"), [])
         self.assertEqual(await self.rows("SELECT * FROM snapshots"), [])
 
+    async def test_the_same_link_once_redacted_is_stored(self):
+        fields, summary = redact.redact_fields({"url": f"http://{NEWS}/reset/sk_live_AbCdEf0123456789XyZaBcD"}, SALT)
+        self.assertEqual(fields, {"url": "http:[token]"})
+        self.assertTrue(await self.add(fields=record(**fields), summary=summary))
+        await self.store.save_snapshot("news", "/", "listing", "http:[token]\nhttps:[token]?page=2")
+        with self.assertRaises(RefusedWrite):
+            await self.add(fields=record(url="http:[token]:hunter2pass"))
+        self.assertEqual((len(await self.rows("SELECT * FROM records")), len(await self.rows("SELECT * FROM snapshots"))),
+                         (1, 1))
+
 
 class DetailAndSearchTest(RecordStoreTestCase):
     async def test_detail_merges_by_follow_path_and_reaches_the_index(self):

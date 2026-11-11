@@ -2,7 +2,7 @@
 approves it and golive passes."""
 import argparse
 
-from onioncollect import lifecycle, matching, mirrors, onion, safety, source_config
+from onioncollect import config_text, lifecycle, matching, mirrors, onion, safety
 from onioncollect.config import Settings, config_path, write_config
 from onioncollect.records import RecordStore
 from onioncollect.source_config import ConfigError
@@ -63,7 +63,7 @@ def approve_command(settings: Settings, args: argparse.Namespace) -> None:
         raise SystemExit(f"onioncollect: not changed, {path} already exists")
     with_stores(settings, lambda table, store: table.approve(
         args.host, args.id, args.category, args.note, operator(), settings.exclusions))
-    write_config(settings.configs_dir, args.id, source_config.scaffold(args.id, args.host.lower(), args.category))
+    write_config(settings.configs_dir, args.id, config_text.scaffold(args.id, args.host.lower(), args.category))
     print(f"{args.host.lower()} approved as {args.id}; fill in {path}, then run golive {args.id}")
 
 
@@ -77,7 +77,7 @@ def approve_mirror(settings: Settings, args: argparse.Namespace) -> None:
             raise RefusedChange(f"{args.mirror_of} is {source['category']}, and a mirror takes its source's category")
         # The config edit is proven before the approval is written, so a refusal changes neither.
         try:
-            text = source_config.with_hosts(config_path(settings.configs_dir, args.mirror_of).read_text(), [host])
+            text = config_text.with_hosts(config_path(settings.configs_dir, args.mirror_of).read_text(), [host])
         except (OSError, ConfigError) as exc:
             raise RefusedChange(f"{args.mirror_of}'s config: {exc}") from None
         await table.add_mirror(host, args.mirror_of, args.note, operator(), settings.exclusions)

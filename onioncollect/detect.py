@@ -14,7 +14,10 @@ SEPARATOR_WINDOW = 9
 LINE_END = re.compile(r"[ \t]{0,4}(?:\r?\n|<|\Z)")
 # Stops at a <br> tag, so entries a dump joins with <br> on one line stay separate pairs.
 PASSWORD = re.compile(r"(?:(?!<[bB][rR]\b)\S){1,128}")
-USER_PAIR = re.compile(r"^([\w.-]{3,64})[:;|](?!//)\S{4,128}$", re.MULTILINE)
+# Not a pair: a link whose "//" ran into a token redacts to "http:[token]", and the store reads that text again.
+# Only that shape is let through: the scheme, the tag, and no second separator after it.
+REDACTED_LINK = r"(?![hH][tT][tT][pP][sS]?:\[token\][^\s:;|]*$)"
+USER_PAIR = re.compile(rf"^{REDACTED_LINK}([\w.-]{{3,64}})[:;|](?!//)\S{{4,128}}$", re.MULTILINE)
 CARD = re.compile(r"(?<![\d-])\d(?:[ -]?\d){12,18}(?!\d)")
 NATIONAL_IDS = (
     re.compile(r"(?<![\d-])(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}(?![\d-])"),

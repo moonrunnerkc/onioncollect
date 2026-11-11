@@ -239,7 +239,7 @@ class TriageRequestTest(CliTestCase):
                      for alias in node.names}
         self.assertEqual(imported, {
             "argparse", "onioncollect.lifecycle", "onioncollect.matching", "onioncollect.mirrors", "onioncollect.onion",
-            "onioncollect.safety", "onioncollect.source_config", "onioncollect.config.Settings",
+            "onioncollect.safety", "onioncollect.config_text", "onioncollect.config.Settings",
             "onioncollect.config.config_path", "onioncollect.config.write_config", "onioncollect.records.RecordStore",
             "onioncollect.source_config.ConfigError", "onioncollect.sources.RefusedChange",
             "onioncollect.sources.SourceTable", "onioncollect.sources.approvable", "onioncollect.stores.operator",
