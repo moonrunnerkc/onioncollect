@@ -2,10 +2,10 @@
 
 Run after every crawl by onioncollect-log-audit.service as the analyst, over the crawl log and the search UI's
 log. Every line must be one of the known shapes, and no path or query string the crawl visited, and no extracted
-record text, may appear in any log. Section 15's credential values, read from the *.env files in DIR (default
-/etc/onioncollect; the unit passes the copy systemd hands it), may appear neither in a log nor in any file under
-DATA_DIR. A log that does not exist yet is skipped. Prints counts and line shapes only, never log content and
-never a credential.
+record text, may appear in any log, each line's own timestamp aside. Section 15's credential values, read from
+the *.env files in DIR (default /etc/onioncollect; the unit passes the copy systemd hands it), may appear neither
+in a log nor in any file under DATA_DIR. A log that does not exist yet is skipped. Prints counts and line shapes
+only, never log content and never a credential.
 """
 import argparse
 import json
@@ -22,6 +22,9 @@ ERRORS = (r"timeout|tor_unreachable|redirect|redirect_offsite|not_text|gated|not
           r"|bad_path|parse_refused|excluded_body|auth_refused|auth_rejected|credential_unreadable|other:\w+")
 HEALTH_KINDS = r"(redaction|unreachable|required-field-lost|below-expectation|parse-refused)"
 PREFIX = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} (\w+) (\S+): (.*)$")
+# A line's own timestamp is the logger's, never page content, and a record field can equal one to the minute
+# (a mirror listing's "last modified"). Only the stamp at the start of a line is set aside.
+STAMP = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} ", re.MULTILINE)
 SHAPES = {
     "fetched": re.compile(rf"{SOURCE} {KIND} status=\d{{3}} bytes=\d+ items=\d+ fields=\d+/\d+ new=\d+ redactions=\d+"
                           rf" discovered=\d+ elapsed=\d+\.\ds"),
@@ -92,7 +95,8 @@ def main(logs: list[Path], data_dir: Path, credentials_dir: Path) -> int:
 
     secrets = visited(data_dir / "collect.db") | record_text(data_dir / "records.db")
     text = "\n".join(texts)
-    leaked = sum(1 for secret in secrets if secret in text)
+    said = STAMP.sub("", text)
+    leaked = sum(1 for secret in secrets if secret in said)
     held = credentials(credentials_dir)
     stored = [path.read_bytes() for path in data_dir.rglob("*") if path.is_file()]
     exposed = sum(1 for value in held if value in text or any(value.encode() in blob for blob in stored))
