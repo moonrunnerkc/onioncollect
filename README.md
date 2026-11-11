@@ -6,6 +6,9 @@
 
 <p align="center">Collects public pages from approved onion sites over Tor and makes them searchable.</p>
 
+<p align="center">This is a demonstration project. It shows a lawful, single-operator onion collection pipeline whose
+safety boundaries are enforced in code and tests, not left to settings.</p>
+
 <p align="center">
   <a href="https://github.com/moonrunnerkc/onioncollect/actions/workflows/ci.yml"><img src="https://github.com/moonrunnerkc/onioncollect/actions/workflows/ci.yml/badge.svg?branch=main" alt="ci"></a>
   <img src="https://img.shields.io/badge/python-3.13-3776AB?logo=python&logoColor=white" alt="Python 3.13">
